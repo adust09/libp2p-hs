@@ -46,7 +46,8 @@ library core
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
     binary     >= 0.8.9 && < 0.9,
-    crypton    >= 1.0   && < 1.1
+    crypton    >= 1.0   && < 1.1,
+    memory     >= 0.18  && < 0.19
 
 -- Test suite
 test-suite libp2p-hs-test
