@@ -41,10 +41,12 @@ library core
   hs-source-dirs:  src
   exposed-modules:
     Network.LibP2P.Core.Varint
+    Network.LibP2P.Core.Multihash
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
-    binary     >= 0.8.9 && < 0.9
+    binary     >= 0.8.9 && < 0.9,
+    crypton    >= 1.0   && < 1.1
 
 -- Test suite
 test-suite libp2p-hs-test
@@ -54,6 +56,7 @@ test-suite libp2p-hs-test
   main-is:         Spec.hs
   other-modules:
     Test.Network.LibP2P.Core.VarintSpec
+    Test.Network.LibP2P.Core.MultihashSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
