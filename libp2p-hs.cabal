@@ -1,0 +1,64 @@
+cabal-version:   3.0
+name:            libp2p-hs
+version:         0.1.0.0
+synopsis:        Haskell implementation of the libp2p networking stack
+description:
+  A Haskell implementation of the libp2p modular peer-to-peer networking
+  stack. Implements transport, security, multiplexing, and application
+  protocols following the libp2p specification.
+license:         MIT
+license-file:    LICENSE
+author:          adust09
+maintainer:      adust09
+category:        Network
+build-type:      Simple
+extra-doc-files: README.md
+tested-with:     GHC == 9.14.1
+
+common warnings
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates
+               -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+
+common lang
+  default-language:   GHC2021
+  default-extensions:
+    OverloadedStrings
+    StrictData
+
+-- Main public library (re-exports from internal libraries)
+library
+  import:          warnings, lang
+  hs-source-dirs:  src
+  exposed-modules:
+    Network.LibP2P
+  build-depends:
+    base >= 4.18 && < 5
+
+-- Internal library: core primitives (varint, multihash)
+library core
+  import:          warnings, lang
+  visibility:      public
+  hs-source-dirs:  src
+  exposed-modules:
+    Network.LibP2P.Core.Varint
+  build-depends:
+    base       >= 4.18 && < 5,
+    bytestring >= 0.10 && < 0.13,
+    binary     >= 0.8.9 && < 0.9
+
+-- Test suite
+test-suite libp2p-hs-test
+  import:          warnings, lang
+  type:            exitcode-stdio-1.0
+  hs-source-dirs:  test
+  main-is:         Spec.hs
+  other-modules:
+    Test.Network.LibP2P.Core.VarintSpec
+  build-depends:
+    base       >= 4.18 && < 5,
+    bytestring >= 0.10 && < 0.13,
+    libp2p-hs:core,
+    hspec      >= 2.11 && < 2.12,
+    QuickCheck >= 2.14 && < 2.16
+  build-tool-depends:
+    hspec-discover:hspec-discover
