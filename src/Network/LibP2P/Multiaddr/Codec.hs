@@ -13,7 +13,8 @@ import Data.IP (IPv6, fromHostAddress6, toHostAddress6)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Word (Word16, Word32, Word64, Word8)
+import Data.Word (Word16, Word32, Word64)
+import Network.LibP2P.Core.Base58 (base58Decode, base58Encode)
 import Network.LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import Network.LibP2P.Multiaddr.Protocol
 
@@ -294,45 +295,3 @@ ipv6ToBytes :: IPv6 -> ByteString
 ipv6ToBytes ipv6 =
   let (w0, w1, w2, w3) = toHostAddress6 ipv6
    in word32BE w0 <> word32BE w1 <> word32BE w2 <> word32BE w3
-
--- Base58btc (Bitcoin alphabet) encoding/decoding
-base58Alphabet :: String
-base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
-base58Encode :: [Word8] -> String
-base58Encode bytes =
-  let leadingZeros = length (takeWhile (== 0) bytes)
-      n = foldl (\acc b -> acc * 256 + toInteger b) 0 bytes
-      encoded = encodeN n
-   in replicate leadingZeros '1' <> encoded
-  where
-    encodeN :: Integer -> String
-    encodeN 0 = ""
-    encodeN m =
-      let (q, r) = m `divMod` 58
-       in encodeN q <> [base58Alphabet !! fromIntegral r]
-
-base58Decode :: String -> Maybe ByteString
-base58Decode str =
-  let leadingOnes = length (takeWhile (== '1') str)
-   in do
-        n <- decodeChars str
-        let bytes = decodeN n
-        Just $ BS.pack (replicate leadingOnes 0 <> bytes)
-  where
-    decodeChars :: String -> Maybe Integer
-    decodeChars = foldl step (Just 0)
-      where
-        step Nothing _ = Nothing
-        step (Just acc) c = case charIndex c of
-          Nothing -> Nothing
-          Just i -> Just (acc * 58 + toInteger i)
-
-    charIndex :: Char -> Maybe Int
-    charIndex c = lookup c (zip base58Alphabet [0 ..])
-
-    decodeN :: Integer -> [Word8]
-    decodeN 0 = []
-    decodeN m =
-      let (q, r) = m `divMod` 256
-       in decodeN q <> [fromIntegral r]
