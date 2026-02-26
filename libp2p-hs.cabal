@@ -46,6 +46,8 @@ library
     Network.LibP2P.Mux.Yamux.Types
     Network.LibP2P.Mux.Yamux.Stream
     Network.LibP2P.Mux.Yamux.Session
+    Network.LibP2P.Transport.Transport
+    Network.LibP2P.Transport.TCP
     Network.LibP2P.Security.Noise.Framing
     Network.LibP2P.Security.Noise.Handshake
     Network.LibP2P.Security.Noise.Session
@@ -78,6 +80,7 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Mux.Yamux.FrameSpec
     Test.Network.LibP2P.Mux.Yamux.StreamSpec
     Test.Network.LibP2P.Mux.Yamux.SessionSpec
+    Test.Network.LibP2P.Transport.TCPSpec
     Test.Network.LibP2P.Security.Noise.HandshakeSpec
   build-depends:
     base       >= 4.18 && < 5,
