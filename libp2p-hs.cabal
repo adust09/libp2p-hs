@@ -35,6 +35,10 @@ library
     Network.LibP2P.Multiaddr.Multiaddr
     Network.LibP2P.Multiaddr.Protocol
     Network.LibP2P.Multiaddr.Codec
+    Network.LibP2P.Crypto.Key
+    Network.LibP2P.Crypto.Ed25519
+    Network.LibP2P.Crypto.Protobuf
+    Network.LibP2P.Crypto.PeerId
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
@@ -53,6 +57,7 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Core.VarintSpec
     Test.Network.LibP2P.Core.MultihashSpec
     Test.Network.LibP2P.Multiaddr.MultiaddrSpec
+    Test.Network.LibP2P.Crypto.PeerIdSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
