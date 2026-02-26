@@ -31,41 +31,30 @@ streamWrite stream payload
         _ -> writeChunked stream payload
 
 -- | Write payload in chunks respecting the send window.
+-- Uses STM retry to block when window is 0 — STM automatically watches
+-- ysSendWindow and re-evaluates when handleWindowUpdate writes to it.
 writeChunked :: YamuxStream -> ByteString -> IO (Either YamuxError ())
 writeChunked stream payload
   | BS.null payload = pure (Right ())
   | otherwise = do
       -- Wait for available send window (blocks via STM retry if 0)
-      chunk <- atomically $ do
+      result <- atomically $ do
         st <- readTVar (ysState stream)
         case st of
-          StreamReset -> pure BS.empty
-          StreamClosed -> pure BS.empty
+          StreamReset -> pure (Left YamuxStreamReset)
+          StreamClosed -> pure (Left YamuxStreamClosed)
           _ -> do
             window <- readTVar (ysSendWindow stream)
             if window == 0
-              then do
-                -- Block until WindowUpdate arrives
-                _ <- takeTMVar (ysSendNotify stream)
-                window' <- readTVar (ysSendWindow stream)
-                let chunkSize = min (fromIntegral window') (BS.length payload)
-                let (c, _) = BS.splitAt chunkSize payload
-                writeTVar (ysSendWindow stream) (window' - fromIntegral chunkSize)
-                pure c
+              then retry -- blocks until ysSendWindow changes
               else do
                 let chunkSize = min (fromIntegral window) (BS.length payload)
                 let (c, _) = BS.splitAt chunkSize payload
                 writeTVar (ysSendWindow stream) (window - fromIntegral chunkSize)
-                pure c
-      if BS.null chunk
-        then do
-          -- Re-check state to determine error
-          st <- readTVarIO (ysState stream)
-          case st of
-            StreamReset -> pure (Left YamuxStreamReset)
-            StreamClosed -> pure (Left YamuxStreamClosed)
-            _ -> pure (Right ()) -- shouldn't happen
-        else do
+                pure (Right c)
+      case result of
+        Left err -> pure (Left err)
+        Right chunk -> do
           -- Enqueue Data frame
           let hdr =
                 YamuxHeader

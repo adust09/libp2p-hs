@@ -268,9 +268,6 @@ handleWindowUpdate sess hdr = do
       Just stream -> atomically $ do
         w <- readTVar (ysSendWindow stream)
         writeTVar (ysSendWindow stream) (w + delta)
-        -- Signal waiting writers
-        _ <- tryPutTMVar (ysSendNotify stream) ()
-        pure ()
       Nothing -> pure ()
   -- Handle FIN flag
   when (flagFIN flags) $ do

@@ -1,6 +1,6 @@
 module Test.Network.LibP2P.Mux.Yamux.SessionSpec (spec) where
 
-import Control.Concurrent.Async (concurrently, concurrently_, withAsync)
+import Control.Concurrent.Async (async, concurrently, concurrently_, withAsync)
 import Control.Concurrent.STM
 import qualified Data.ByteString as BS
 import Network.LibP2P.Mux.Yamux.Frame
@@ -231,6 +231,54 @@ spec = do
           check (st == StreamClosed)
         stClient <- readTVarIO (ysState clientStream)
         stClient `shouldBe` StreamClosed
+
+  describe "Flow control integration" $ do
+    it "transfer data exceeding initial window (requires WindowUpdate exchange)" $ do
+      withSessionPair $ \(client, server) -> do
+        (clientStream, serverStream) <-
+          concurrently
+            (openStream client >>= \(Right s) -> pure s)
+            (acceptStream server >>= \(Right s) -> pure s)
+        atomically $ do
+          st <- readTVar (ysState clientStream)
+          check (st == StreamEstablished)
+        -- Set a small window (100 bytes) to force WindowUpdate exchange
+        atomically $ writeTVar (ysSendWindow clientStream) 100
+        -- Write and read concurrently: writer sends 250 bytes, reader accumulates
+        let totalData = BS.replicate 250 0xAB
+        (_, received) <-
+          concurrently
+            (streamWrite clientStream totalData)
+            (readAll serverStream 250)
+        received `shouldBe` totalData
+
+    it "concurrent read/write on 4 streams simultaneously" $ do
+      withSessionPair $ \(client, server) -> do
+        let numStreams = 4 :: Int
+            payload = BS.replicate 100 0xCC
+        concurrently_
+          ( do
+              streams <- mapM (\_ -> openStream client >>= \(Right s) -> pure s) [1 .. numStreams]
+              mapM_ (\s -> atomically (readTVar (ysState s) >>= \st -> check (st == StreamEstablished))) streams
+              -- Write to all streams concurrently
+              mapM_ (\s -> async (streamWrite s payload)) streams
+          )
+          ( do
+              streams <- mapM (\_ -> acceptStream server >>= \(Right s) -> pure s) [1 .. numStreams]
+              -- Read from all streams
+              results <- mapM (\s -> streamRead s >>= \(Right d) -> pure d) streams
+              mapM_ (\d -> BS.length d `shouldBe` 100) results
+          )
+
+-- | Read exactly n bytes from a stream by accumulating chunks.
+readAll :: YamuxStream -> Int -> IO BS.ByteString
+readAll stream n = go BS.empty
+  where
+    go acc
+      | BS.length acc >= n = pure (BS.take n acc)
+      | otherwise = do
+          Right chunk <- streamRead stream
+          go (acc <> chunk)
 
 -- | Helper to assert an Either is a Left with a specific error value.
 shouldBeLeft :: (Show e, Eq e) => e -> Either e a -> Expectation
