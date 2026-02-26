@@ -51,6 +51,7 @@ library
     Network.LibP2P.Switch.Types
     Network.LibP2P.Switch.ConnPool
     Network.LibP2P.Switch.Switch
+    Network.LibP2P.Switch.Upgrade
     Network.LibP2P.Security.Noise.Framing
     Network.LibP2P.Security.Noise.Handshake
     Network.LibP2P.Security.Noise.Session
@@ -86,6 +87,7 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Transport.TCPSpec
     Test.Network.LibP2P.Switch.ConnPoolSpec
     Test.Network.LibP2P.Switch.SwitchSpec
+    Test.Network.LibP2P.Switch.UpgradeSpec
     Test.Network.LibP2P.Security.Noise.HandshakeSpec
   build-depends:
     base       >= 4.18 && < 5,
