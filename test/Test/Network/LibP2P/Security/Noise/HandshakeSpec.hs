@@ -40,34 +40,40 @@ spec = do
 
   describe "Static key signing" $ do
     it "signStaticKey produces verifiable signature" $ do
-      kp <- generateKeyPair
+      Right kp <- generateKeyPair
       let noiseStaticPK = BS.replicate 32 0xAA -- simulated X25519 pubkey
-      let sig = signStaticKey (kpPrivate kp) noiseStaticPK
-      verifyStaticKey (kpPublic kp) noiseStaticPK sig `shouldBe` True
+      case signStaticKey (kpPrivate kp) noiseStaticPK of
+        Right sig -> verifyStaticKey (kpPublic kp) noiseStaticPK sig `shouldBe` True
+        Left err -> expectationFailure err
 
     it "verification fails with wrong static key" $ do
-      kp <- generateKeyPair
+      Right kp <- generateKeyPair
       let noiseStaticPK = BS.replicate 32 0xAA
-      let sig = signStaticKey (kpPrivate kp) noiseStaticPK
-      let wrongPK = BS.replicate 32 0xBB
-      verifyStaticKey (kpPublic kp) wrongPK sig `shouldBe` False
+      case signStaticKey (kpPrivate kp) noiseStaticPK of
+        Right sig -> do
+          let wrongPK = BS.replicate 32 0xBB
+          verifyStaticKey (kpPublic kp) wrongPK sig `shouldBe` False
+        Left err -> expectationFailure err
 
     it "verification fails with wrong identity key" $ do
-      kp1 <- generateKeyPair
-      kp2 <- generateKeyPair
+      Right kp1 <- generateKeyPair
+      Right kp2 <- generateKeyPair
       let noiseStaticPK = BS.replicate 32 0xAA
-      let sig = signStaticKey (kpPrivate kp1) noiseStaticPK
-      verifyStaticKey (kpPublic kp2) noiseStaticPK sig `shouldBe` False
+      case signStaticKey (kpPrivate kp1) noiseStaticPK of
+        Right sig -> verifyStaticKey (kpPublic kp2) noiseStaticPK sig `shouldBe` False
+        Left err -> expectationFailure err
 
   describe "NoisePayload protobuf" $ do
     it "encodes and decodes identity_key and identity_sig" $ do
-      kp <- generateKeyPair
+      Right kp <- generateKeyPair
       let identKey = encodePublicKey (kpPublic kp)
       let noiseStaticPK = BS.replicate 32 0xCC
-      let identSig = signStaticKey (kpPrivate kp) noiseStaticPK
-      let payload = NoisePayload identKey identSig
-      let encoded = encodeNoisePayload payload
-      decodeNoisePayload encoded `shouldBe` Right payload
+      case signStaticKey (kpPrivate kp) noiseStaticPK of
+        Right identSig -> do
+          let payload = NoisePayload identKey identSig
+          let encoded = encodeNoisePayload payload
+          decodeNoisePayload encoded `shouldBe` Right payload
+        Left err -> expectationFailure err
 
     it "round-trip with various sizes" $ do
       let key = BS.replicate 36 0x11

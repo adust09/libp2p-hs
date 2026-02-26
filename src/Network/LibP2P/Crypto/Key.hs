@@ -43,14 +43,15 @@ publicKey :: KeyPair -> PublicKey
 publicKey = kpPublic
 
 -- | Sign a message with a private key.
-sign :: PrivateKey -> ByteString -> ByteString
+-- Returns Left on invalid key bytes.
+sign :: PrivateKey -> ByteString -> Either String ByteString
 sign (PrivateKey Ed25519 skRaw) msg =
   case CE.eitherCryptoError (Ed.secretKey skRaw) of
-    Left err -> error $ "sign: invalid secret key: " <> show err
+    Left err -> Left $ "sign: invalid secret key: " <> show err
     Right sk ->
       let pk = Ed.toPublic sk
           sig = Ed.sign sk pk msg
-       in convert sig
+       in Right (convert sig)
 
 -- | Verify a signature against a public key and message.
 verify :: PublicKey -> ByteString -> ByteString -> Bool
