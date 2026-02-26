@@ -8,7 +8,7 @@ libp2p-hs is a Haskell implementation of the [libp2p](https://libp2p.io/) networ
 
 ## Current State
 
-Phases 0–4a are implemented: scaffolding, varint, multihash, multiaddr, peer identity (Ed25519), multistream-select, Yamux frame encoding, and Noise framing/payload/key-signing. 102+ tests pass across all modules. The project uses a single Cabal library (not internal libraries, due to linker issues with shared `hs-source-dirs`).
+Phases 0–4a + Noise XX handshake are implemented: scaffolding, varint, multihash, multiaddr, peer identity (Ed25519), multistream-select, Yamux frame encoding, Noise framing/payload/key-signing, and full Noise XX handshake (via cacophony) + post-handshake encrypted transport. 117 tests pass across all modules. The project uses a single Cabal library (not internal libraries, due to linker issues with shared `hs-source-dirs`).
 
 ## Documentation Reference
 
@@ -68,13 +68,14 @@ The **Switch** (ch.08) is the central coordinator that manages this pipeline, co
 
 ## Key Haskell Libraries
 
-- **Crypto**: `crypton` (Ed25519, X25519, ChaCha20-Poly1305) + `memory` (ByteArray conversion)
-- **Noise protocol**: `crypton` directly (not `cacophony` — incompatible with GHC 9.14.1 due to `lens`→`these`→`base-4.22` chain)
+- **Crypto**: `crypton` (Ed25519) + `memory` (ByteArray conversion)
+- **Noise protocol**: `cacophony` (Noise XX state machine, X25519 DH, ChaChaPoly1305 AEAD) — requires GHC 9.10.x (base < 4.22)
+- **Base58**: `ppad-base58` (Bitcoin alphabet encode/decode)
 - **Protobuf**: Manual encoding (libp2p protobufs are small, avoids `proto-lens` dependency)
 - **Networking**: `network`, `iproute` (IPv4/IPv6 address handling)
 - **Concurrency**: `stm`, `async`
 - **Binary parsing**: `binary`, `bytestring`
-- **Base encoding**: Self-contained Base58btc in `Core.Base58` (no external dependency)
+- **Binary helpers**: `Core.Binary` module for shared big-endian encoding (uses `bytestring` Builder + `binary` Get)
 - **ASN.1**: `asn1-encoding` (for RSA/ECDSA key formats, not yet used)
 
 ### Architecture note
