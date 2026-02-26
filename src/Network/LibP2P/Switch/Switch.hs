@@ -27,19 +27,23 @@ import Network.LibP2P.Transport.Transport (Transport (..))
 -- All internal state is initialized empty.
 newSwitch :: PeerId -> KeyPair -> IO Switch
 newSwitch pid kp = do
-  transportsVar <- newTVarIO []
-  poolVar       <- newTVarIO Map.empty
-  protosVar     <- newTVarIO Map.empty
-  eventsChan    <- newBroadcastTChanIO
-  closedVar     <- newTVarIO False
+  transportsVar   <- newTVarIO []
+  poolVar         <- newTVarIO Map.empty
+  protosVar       <- newTVarIO Map.empty
+  eventsChan      <- newBroadcastTChanIO
+  closedVar       <- newTVarIO False
+  backoffsVar     <- newTVarIO Map.empty
+  pendingDialsVar <- newTVarIO Map.empty
   pure Switch
-    { swLocalPeerId = pid
-    , swIdentityKey = kp
-    , swTransports  = transportsVar
-    , swConnPool    = poolVar
-    , swProtocols   = protosVar
-    , swEvents      = eventsChan
-    , swClosed      = closedVar
+    { swLocalPeerId  = pid
+    , swIdentityKey  = kp
+    , swTransports   = transportsVar
+    , swConnPool     = poolVar
+    , swProtocols    = protosVar
+    , swEvents       = eventsChan
+    , swClosed       = closedVar
+    , swDialBackoffs = backoffsVar
+    , swPendingDials = pendingDialsVar
     }
 
 -- | Register a transport with the switch.
