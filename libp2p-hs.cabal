@@ -42,6 +42,8 @@ library
     Network.LibP2P.MultistreamSelect.Wire
     Network.LibP2P.MultistreamSelect.Negotiation
     Network.LibP2P.Mux.Yamux.Frame
+    Network.LibP2P.Security.Noise.Framing
+    Network.LibP2P.Security.Noise.Handshake
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
@@ -64,6 +66,7 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Crypto.PeerIdSpec
     Test.Network.LibP2P.MultistreamSelect.NegotiationSpec
     Test.Network.LibP2P.Mux.Yamux.FrameSpec
+    Test.Network.LibP2P.Security.Noise.HandshakeSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
