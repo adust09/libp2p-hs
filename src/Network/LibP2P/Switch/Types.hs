@@ -11,10 +11,13 @@ module Network.LibP2P.Switch.Types
   , SwitchEvent (..)
   , StreamHandler
   , Switch (..)
+  , DialError (..)
+  , BackoffEntry (..)
   ) where
 
-import Control.Concurrent.STM (TChan, TVar)
+import Control.Concurrent.STM (TChan, TMVar, TVar)
 import Data.Map.Strict (Map)
+import Data.Time.Clock (UTCTime)
 import Network.LibP2P.Crypto.Key (KeyPair)
 import Network.LibP2P.Crypto.PeerId (PeerId)
 import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
@@ -70,16 +73,37 @@ data SwitchEvent
   | Disconnected !PeerId !Direction !Multiaddr  -- ^ Connection closed
   deriving (Show, Eq)
 
+-- | Errors that can occur during a dial operation (docs/08-switch.md §Dialing).
+data DialError
+  = DialBackoff               -- ^ Peer is in backoff period (recently failed)
+  | DialNoAddresses           -- ^ No addresses provided for dialing
+  | DialNoTransport !Multiaddr -- ^ No registered transport can handle this address
+  | DialAllFailed ![String]   -- ^ All dial attempts failed
+  | DialUpgradeFailed !String -- ^ Connection upgrade pipeline failed
+  | DialSwitchClosed          -- ^ Switch has been shut down
+  deriving (Show, Eq)
+
+-- | Per-peer dial backoff state (docs/08-switch.md §Dial Backoff).
+--
+-- After a failed dial, subsequent dials are rejected until the backoff
+-- expires. Duration doubles on each consecutive failure up to 300s max.
+data BackoffEntry = BackoffEntry
+  { beExpiry   :: !UTCTime  -- ^ When the backoff period ends
+  , beAttempts :: !Int      -- ^ Number of consecutive failures (for exponential calc)
+  } deriving (Show, Eq)
+
 -- | The Switch: central coordinator of the libp2p networking stack.
 --
 -- Manages transports, connection pool, protocol handlers, and events.
 -- All mutable state is STM-based for safe concurrent access.
 data Switch = Switch
-  { swLocalPeerId :: !PeerId                                    -- ^ This node's peer identity
-  , swIdentityKey :: !KeyPair                                   -- ^ This node's key pair
-  , swTransports  :: !(TVar [Transport])                        -- ^ Registered transports
-  , swConnPool    :: !(TVar (Map PeerId [Connection]))          -- ^ Active connections per peer
-  , swProtocols   :: !(TVar (Map ProtocolId StreamHandler))         -- ^ Protocol registry
-  , swEvents      :: !(TChan SwitchEvent)                       -- ^ Event broadcast channel
-  , swClosed      :: !(TVar Bool)                               -- ^ Whether the switch is shut down
+  { swLocalPeerId  :: !PeerId                                            -- ^ This node's peer identity
+  , swIdentityKey  :: !KeyPair                                           -- ^ This node's key pair
+  , swTransports   :: !(TVar [Transport])                                -- ^ Registered transports
+  , swConnPool     :: !(TVar (Map PeerId [Connection]))                  -- ^ Active connections per peer
+  , swProtocols    :: !(TVar (Map ProtocolId StreamHandler))             -- ^ Protocol registry
+  , swEvents       :: !(TChan SwitchEvent)                               -- ^ Event broadcast channel
+  , swClosed       :: !(TVar Bool)                                       -- ^ Whether the switch is shut down
+  , swDialBackoffs :: !(TVar (Map PeerId BackoffEntry))                  -- ^ Per-peer dial backoff state
+  , swPendingDials :: !(TVar (Map PeerId (TMVar (Either DialError Connection)))) -- ^ In-flight dials for dedup
   }
