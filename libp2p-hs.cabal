@@ -25,47 +25,25 @@ common lang
     OverloadedStrings
     StrictData
 
--- Main public library (re-exports from internal libraries)
 library
   import:          warnings, lang
   hs-source-dirs:  src
   exposed-modules:
     Network.LibP2P
-  build-depends:
-    base >= 4.18 && < 5
-
--- Internal library: core primitives (varint, multihash)
-library core
-  import:          warnings, lang
-  visibility:      public
-  hs-source-dirs:  src
-  exposed-modules:
     Network.LibP2P.Core.Varint
     Network.LibP2P.Core.Multihash
-  build-depends:
-    base       >= 4.18 && < 5,
-    bytestring >= 0.10 && < 0.13,
-    binary     >= 0.8.9 && < 0.9,
-    crypton    >= 1.0   && < 1.1,
-    memory     >= 0.18  && < 0.19
-
--- Internal library: multiaddr parsing/encoding
-library multiaddr
-  import:          warnings, lang
-  visibility:      public
-  hs-source-dirs:  src
-  exposed-modules:
     Network.LibP2P.Multiaddr.Multiaddr
     Network.LibP2P.Multiaddr.Protocol
     Network.LibP2P.Multiaddr.Codec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
+    binary     >= 0.8.9 && < 0.9,
     text       >= 1.2  && < 2.2,
-    iproute    >= 1.7  && < 1.8,
-    libp2p-hs:core
+    crypton    >= 1.0   && < 1.1,
+    memory     >= 0.18  && < 0.19,
+    iproute    >= 1.7  && < 1.8
 
--- Test suite
 test-suite libp2p-hs-test
   import:          warnings, lang
   type:            exitcode-stdio-1.0
@@ -79,8 +57,7 @@ test-suite libp2p-hs-test
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
     text       >= 1.2  && < 2.2,
-    libp2p-hs:core,
-    libp2p-hs:multiaddr,
+    libp2p-hs,
     hspec      >= 2.11 && < 2.12,
     QuickCheck >= 2.14 && < 2.16
   build-tool-depends:
