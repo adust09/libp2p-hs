@@ -90,6 +90,53 @@ spec = do
     it "fails on missing address for ip4" $
       textToProtocols "/ip4" `shouldSatisfy` isLeft
 
+  describe "UTF-8 multibyte DNS names" $ do
+    it "binary round-trip for multibyte UTF-8 DNS name" $ do
+      -- Japanese domain: テスト.jp (3-byte UTF-8 chars)
+      let ps = [DNS4 "\12486\12473\12488.jp", TCP 443]
+      decodeProtocols (encodeProtocols ps) `shouldBe` Right ps
+
+    it "binary round-trip for emoji DNS name" $ do
+      -- Emoji domain (4-byte UTF-8 char)
+      let ps = [DNS "\128640.example.com", TCP 80]
+      decodeProtocols (encodeProtocols ps) `shouldBe` Right ps
+
+    it "text round-trip for multibyte UTF-8 DNS name" $ do
+      let ps = [DNS4 "\12486\12473\12488.jp", TCP 443]
+      textToProtocols (protocolsToText ps) `shouldBe` Right ps
+
+  describe "IPv6 rendering and parsing" $ do
+    it "renders /ip6/::1 correctly" $ do
+      -- ::1 = 15 zero bytes followed by 0x01
+      let loopback = BS.pack (replicate 15 0x00 <> [0x01])
+      protocolsToText [IP6 loopback] `shouldBe` "/ip6/::1"
+
+    it "renders /ip6/fe80::1 correctly" $ do
+      -- fe80::1 = fe80 0000 0000 0000 0000 0000 0000 0001
+      let linkLocal = BS.pack [0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+                               , 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
+      protocolsToText [IP6 linkLocal] `shouldBe` "/ip6/fe80::1"
+
+    it "renders /ip6/2001:db8::1 correctly" $ do
+      let addr = BS.pack [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00
+                          , 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
+      protocolsToText [IP6 addr] `shouldBe` "/ip6/2001:db8::1"
+
+    it "parses /ip6/::1 correctly" $ do
+      let expected = BS.pack (replicate 15 0x00 <> [0x01])
+      textToProtocols "/ip6/::1" `shouldBe` Right [IP6 expected]
+
+    it "parses /ip6/fe80::1 correctly" $ do
+      let expected = BS.pack [0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+                              , 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
+      textToProtocols "/ip6/fe80::1" `shouldBe` Right [IP6 expected]
+
+    it "IPv6 text round-trip" $ do
+      let addr = BS.pack [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00
+                          , 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
+      let ps = [IP6 addr, TCP 4001]
+      textToProtocols (protocolsToText ps) `shouldBe` Right ps
+
   describe "Text round-trip" $ do
     it "textToProtocols(protocolsToText(ps)) == ps" $ do
       let ps = [IP4 0x0a000001, TCP 8080]
