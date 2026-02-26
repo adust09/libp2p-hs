@@ -6,11 +6,13 @@ module Network.LibP2P.Multiaddr.Codec
   , textToProtocols
   ) where
 
-import Data.Bits (shiftL, shiftR, (.&.))
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.IP (IPv6, fromHostAddress6, toHostAddress6)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Data.Word (Word16, Word32, Word64, Word8)
 import Network.LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import Network.LibP2P.Multiaddr.Protocol
@@ -45,7 +47,7 @@ encodeProtocols = BS.concat . map encodeOne
 
     encodeVarText :: Text -> ByteString
     encodeVarText t =
-      let bs = encodeUtf8 t
+      let bs = TE.encodeUtf8 t
        in encodeUvarint (fromIntegral (BS.length bs)) <> bs
 
 -- | Decode binary multiaddr format to a list of protocols.
@@ -98,10 +100,10 @@ decodeProtocols bs
 
     buildVarProtocol :: Word64 -> ByteString -> Maybe Protocol
     buildVarProtocol 421 mh = Just $ P2P mh
-    buildVarProtocol 53 bs' = Just $ DNS (decodeUtf8 bs')
-    buildVarProtocol 54 bs' = Just $ DNS4 (decodeUtf8 bs')
-    buildVarProtocol 55 bs' = Just $ DNS6 (decodeUtf8 bs')
-    buildVarProtocol 56 bs' = Just $ DNSAddr (decodeUtf8 bs')
+    buildVarProtocol 53 bs' = DNS <$> decodeUtf8Safe bs'
+    buildVarProtocol 54 bs' = DNS4 <$> decodeUtf8Safe bs'
+    buildVarProtocol 55 bs' = DNS6 <$> decodeUtf8Safe bs'
+    buildVarProtocol 56 bs' = DNSAddr <$> decodeUtf8Safe bs'
     buildVarProtocol _ _ = Nothing
 
     buildNoAddrProtocol :: Word64 -> Maybe Protocol
@@ -120,7 +122,7 @@ protocolsToText = T.concat . map renderOne
   where
     renderOne :: Protocol -> Text
     renderOne p@(IP4 w) = "/" <> protocolName p <> "/" <> renderIPv4 w
-    renderOne p@(IP6 _bs) = "/" <> protocolName p <> "/" <> "::1" -- TODO: proper IPv6 rendering
+    renderOne p@(IP6 bs) = "/" <> protocolName p <> "/" <> renderIPv6 bs
     renderOne p@(TCP port) = "/" <> protocolName p <> "/" <> T.pack (show port)
     renderOne p@(UDP port) = "/" <> protocolName p <> "/" <> T.pack (show port)
     renderOne p@(P2P mh) = "/" <> protocolName p <> "/" <> renderBase58 mh
@@ -137,6 +139,10 @@ protocolsToText = T.concat . map renderOne
           c = (w `shiftR` 8) .&. 0xff
           d = w .&. 0xff
        in T.pack $ show a <> "." <> show b <> "." <> show c <> "." <> show d
+
+    -- | Render 16-byte IPv6 address to RFC5952 text form.
+    renderIPv6 :: ByteString -> Text
+    renderIPv6 bs = T.pack $ show (bytesToIPv6 bs)
 
     -- Minimal base58btc encoding for PeerId display
     renderBase58 :: ByteString -> Text
@@ -217,8 +223,12 @@ textToProtocols input
                 + fromIntegral d
       _ -> Left $ "textToProtocols: invalid IPv4 address: " <> T.unpack t
 
+    -- | Parse IPv6 text (e.g. "::1", "fe80::1") to 16-byte ByteString.
     parseIPv6 :: Text -> Either String ByteString
-    parseIPv6 _ = Left "textToProtocols: IPv6 parsing not yet implemented"
+    parseIPv6 t =
+      case readMaybe (T.unpack t) :: Maybe IPv6 of
+        Just ipv6 -> Right (ipv6ToBytes ipv6)
+        Nothing -> Left $ "textToProtocols: invalid IPv6 address: " <> T.unpack t
 
     parsePort :: Text -> Either String Word16
     parsePort t = case readMaybe (T.unpack t) of
@@ -245,29 +255,45 @@ word32BE w =
     , fromIntegral w
     ]
 
+-- | Read big-endian Word16 using safe positional access.
 readWord16BE :: ByteString -> Word16
 readWord16BE bs =
-  let [a, b] = BS.unpack (BS.take 2 bs)
-   in (fromIntegral a `shiftL` 8) + fromIntegral b
+  (fromIntegral (BS.index bs 0) `shiftL` 8)
+    .|. fromIntegral (BS.index bs 1)
 
+-- | Read big-endian Word32 using safe positional access.
 readWord32BE :: ByteString -> Word32
 readWord32BE bs =
-  let [a, b, c, d] = BS.unpack (BS.take 4 bs)
-   in (fromIntegral a `shiftL` 24)
-        + (fromIntegral b `shiftL` 16)
-        + (fromIntegral c `shiftL` 8)
-        + fromIntegral d
+  (fromIntegral (BS.index bs 0) `shiftL` 24)
+    .|. (fromIntegral (BS.index bs 1) `shiftL` 16)
+    .|. (fromIntegral (BS.index bs 2) `shiftL` 8)
+    .|. fromIntegral (BS.index bs 3)
 
 readMaybe :: (Read a) => String -> Maybe a
 readMaybe s = case reads s of
   [(x, "")] -> Just x
   _ -> Nothing
 
-encodeUtf8 :: Text -> ByteString
-encodeUtf8 = BS.pack . map (fromIntegral . fromEnum) . T.unpack
+-- | Safely decode UTF-8 bytes to Text, returning Nothing on invalid input.
+decodeUtf8Safe :: ByteString -> Maybe Text
+decodeUtf8Safe bs = case TE.decodeUtf8' bs of
+  Right t -> Just t
+  Left _ -> Nothing
 
-decodeUtf8 :: ByteString -> Text
-decodeUtf8 = T.pack . map (toEnum . fromIntegral) . BS.unpack
+-- | Convert 16-byte ByteString to IPv6 address via HostAddress6 tuple.
+bytesToIPv6 :: ByteString -> IPv6
+bytesToIPv6 bs =
+  let w0 = readWord32BE bs
+      w1 = readWord32BE (BS.drop 4 bs)
+      w2 = readWord32BE (BS.drop 8 bs)
+      w3 = readWord32BE (BS.drop 12 bs)
+   in fromHostAddress6 (w0, w1, w2, w3)
+
+-- | Convert IPv6 address to 16-byte ByteString.
+ipv6ToBytes :: IPv6 -> ByteString
+ipv6ToBytes ipv6 =
+  let (w0, w1, w2, w3) = toHostAddress6 ipv6
+   in word32BE w0 <> word32BE w1 <> word32BE w2 <> word32BE w3
 
 -- Base58btc (Bitcoin alphabet) encoding/decoding
 base58Alphabet :: String
@@ -282,8 +308,8 @@ base58Encode bytes =
   where
     encodeN :: Integer -> String
     encodeN 0 = ""
-    encodeN n =
-      let (q, r) = n `divMod` 58
+    encodeN m =
+      let (q, r) = m `divMod` 58
        in encodeN q <> [base58Alphabet !! fromIntegral r]
 
 base58Decode :: String -> Maybe ByteString
@@ -307,6 +333,6 @@ base58Decode str =
 
     decodeN :: Integer -> [Word8]
     decodeN 0 = []
-    decodeN n =
-      let (q, r) = n `divMod` 256
+    decodeN m =
+      let (q, r) = m `divMod` 256
        in decodeN q <> [fromIntegral r]
