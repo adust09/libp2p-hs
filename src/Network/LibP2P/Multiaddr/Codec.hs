@@ -6,7 +6,7 @@ module Network.LibP2P.Multiaddr.Codec
   , textToProtocols
   ) where
 
-import Data.Bits (shiftL, shiftR, (.&.), (.|.))
+import Data.Bits (shiftL, shiftR, (.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IP (IPv6, fromHostAddress6, toHostAddress6)
@@ -14,7 +14,9 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word16, Word32, Word64)
+import Text.Read (readMaybe)
 import Network.LibP2P.Core.Base58 (base58Decode, base58Encode)
+import Network.LibP2P.Core.Binary (readWord16BE, readWord32BE, word16BE, word32BE)
 import Network.LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import Network.LibP2P.Multiaddr.Protocol
 
@@ -241,39 +243,6 @@ textToProtocols input
     parseBase58PeerId t = case base58Decode (T.unpack t) of
       Just bs -> Right bs
       Nothing -> Left $ "textToProtocols: invalid base58 peer ID: " <> T.unpack t
-
--- Helpers
-
-word16BE :: Word16 -> ByteString
-word16BE w = BS.pack [fromIntegral (w `shiftR` 8), fromIntegral w]
-
-word32BE :: Word32 -> ByteString
-word32BE w =
-  BS.pack
-    [ fromIntegral (w `shiftR` 24)
-    , fromIntegral (w `shiftR` 16)
-    , fromIntegral (w `shiftR` 8)
-    , fromIntegral w
-    ]
-
--- | Read big-endian Word16 using safe positional access.
-readWord16BE :: ByteString -> Word16
-readWord16BE bs =
-  (fromIntegral (BS.index bs 0) `shiftL` 8)
-    .|. fromIntegral (BS.index bs 1)
-
--- | Read big-endian Word32 using safe positional access.
-readWord32BE :: ByteString -> Word32
-readWord32BE bs =
-  (fromIntegral (BS.index bs 0) `shiftL` 24)
-    .|. (fromIntegral (BS.index bs 1) `shiftL` 16)
-    .|. (fromIntegral (BS.index bs 2) `shiftL` 8)
-    .|. fromIntegral (BS.index bs 3)
-
-readMaybe :: (Read a) => String -> Maybe a
-readMaybe s = case reads s of
-  [(x, "")] -> Just x
-  _ -> Nothing
 
 -- | Safely decode UTF-8 bytes to Text, returning Nothing on invalid input.
 decodeUtf8Safe :: ByteString -> Maybe Text

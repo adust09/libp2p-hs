@@ -8,10 +8,9 @@ module Network.LibP2P.Security.Noise.Framing
   , maxNoiseMessageSize
   ) where
 
-import Data.Bits (shiftL, shiftR, (.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Word (Word16)
+import Network.LibP2P.Core.Binary (readWord16BE, word16BE)
 
 -- | Maximum Noise message size (limited by 2-byte length prefix).
 maxNoiseMessageSize :: Int
@@ -33,10 +32,3 @@ decodeFrame bs
        in if BS.length rest < len
             then Left $ "decodeFrame: expected " <> show len <> " bytes but got " <> show (BS.length rest)
             else Right (BS.take len rest, BS.drop len rest)
-
--- Helpers
-word16BE :: Word16 -> ByteString
-word16BE w = BS.pack [fromIntegral (w `shiftR` 8), fromIntegral (w .&. 0xff)]
-
-readWord16BE :: ByteString -> Word16
-readWord16BE bs = fromIntegral (BS.index bs 0) `shiftL` 8 + fromIntegral (BS.index bs 1)

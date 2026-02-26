@@ -12,6 +12,7 @@ module Network.LibP2P.Crypto.Protobuf
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word64, Word8)
+import Numeric (showHex)
 import Network.LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import Network.LibP2P.Crypto.Key (KeyType (..), PublicKey (..))
 
@@ -59,13 +60,5 @@ decodePublicKey bs = do
     takeExpectedByte expected input msg
       | BS.null input = Left $ "decodePublicKey: " <> msg <> " (empty input)"
       | BS.head input /= expected =
-          Left $ "decodePublicKey: " <> msg <> " (got 0x" <> showHex (BS.head input) <> ")"
+          Left $ "decodePublicKey: " <> msg <> " (got 0x" <> showHex (BS.head input) ")"
       | otherwise = Right (expected, BS.tail input)
-
-    showHex :: Word8 -> String
-    showHex n = [hexDigit (n `div` 16), hexDigit (n `mod` 16)]
-
-    hexDigit :: Word8 -> Char
-    hexDigit d
-      | d < 10 = toEnum (fromIntegral d + fromEnum '0')
-      | otherwise = toEnum (fromIntegral d - 10 + fromEnum 'a')

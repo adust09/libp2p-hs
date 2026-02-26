@@ -13,6 +13,7 @@ import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word64)
+import Numeric (showHex)
 import Network.LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 
 -- | Supported hash functions for multihash encoding.
@@ -30,16 +31,7 @@ hashCode SHA256 = 0x12
 fromHashCode :: Word64 -> Either String HashFunction
 fromHashCode 0x00 = Right Identity
 fromHashCode 0x12 = Right SHA256
-fromHashCode c = Left $ "decodeMultihash: unknown hash function code 0x" <> showHex c
-  where
-    showHex :: Word64 -> String
-    showHex n
-      | n < 16 = "0" <> [hexDigit n]
-      | otherwise = map hexDigit [n `div` 16, n `mod` 16]
-    hexDigit :: Word64 -> Char
-    hexDigit d
-      | d < 10 = toEnum (fromIntegral d + fromEnum '0')
-      | otherwise = toEnum (fromIntegral d - 10 + fromEnum 'a')
+fromHashCode c = Left $ "decodeMultihash: unknown hash function code 0x" <> showHex c ""
 
 -- | Encode data as a multihash.
 -- For Identity: stores raw bytes. For SHA256: hashes first, stores digest.
