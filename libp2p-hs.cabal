@@ -31,6 +31,7 @@ library
   exposed-modules:
     Network.LibP2P
     Network.LibP2P.Core.Base58
+    Network.LibP2P.Core.Binary
     Network.LibP2P.Core.Varint
     Network.LibP2P.Core.Multihash
     Network.LibP2P.Multiaddr.Multiaddr
