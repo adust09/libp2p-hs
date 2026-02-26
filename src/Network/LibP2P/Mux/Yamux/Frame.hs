@@ -14,7 +14,7 @@ module Network.LibP2P.Mux.Yamux.Frame
   , initialWindowSize
   ) where
 
-import Data.Bits ((.&.), (.|.))
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word16, Word32, Word8)
@@ -101,20 +101,21 @@ word16ToFlags w =
 -- | Encode a Yamux header to 12 bytes.
 encodeHeader :: YamuxHeader -> ByteString
 encodeHeader (YamuxHeader ver typ flags sid len) =
-  BS.pack
-    [ ver
-    , frameTypeToWord8 typ
-    , fromIntegral (flagsToWord16 flags `div` 256) -- flags high byte
-    , fromIntegral (flagsToWord16 flags)            -- flags low byte
-    , fromIntegral (sid `div` 0x1000000)
-    , fromIntegral (sid `div` 0x10000)
-    , fromIntegral (sid `div` 0x100)
-    , fromIntegral sid
-    , fromIntegral (len `div` 0x1000000)
-    , fromIntegral (len `div` 0x10000)
-    , fromIntegral (len `div` 0x100)
-    , fromIntegral len
-    ]
+  let f = flagsToWord16 flags
+   in BS.pack
+        [ ver
+        , frameTypeToWord8 typ
+        , fromIntegral (f `shiftR` 8)
+        , fromIntegral f
+        , fromIntegral (sid `shiftR` 24)
+        , fromIntegral (sid `shiftR` 16)
+        , fromIntegral (sid `shiftR` 8)
+        , fromIntegral sid
+        , fromIntegral (len `shiftR` 24)
+        , fromIntegral (len `shiftR` 16)
+        , fromIntegral (len `shiftR` 8)
+        , fromIntegral len
+        ]
 
 -- | Decode a Yamux header from 12 bytes.
 decodeHeader :: ByteString -> Either String YamuxHeader
@@ -125,17 +126,17 @@ decodeHeader bs
       typ <- word8ToFrameType (BS.index bs 1)
       let flags =
             word16ToFlags
-              ( fromIntegral (BS.index bs 2) * 256
-                  + fromIntegral (BS.index bs 3)
+              ( (fromIntegral (BS.index bs 2) `shiftL` 8)
+                  .|. fromIntegral (BS.index bs 3)
               )
           sid =
-            fromIntegral (BS.index bs 4) * 0x1000000
-              + fromIntegral (BS.index bs 5) * 0x10000
-              + fromIntegral (BS.index bs 6) * 0x100
-              + fromIntegral (BS.index bs 7)
+            (fromIntegral (BS.index bs 4) `shiftL` 24)
+              .|. (fromIntegral (BS.index bs 5) `shiftL` 16)
+              .|. (fromIntegral (BS.index bs 6) `shiftL` 8)
+              .|. fromIntegral (BS.index bs 7)
           len =
-            fromIntegral (BS.index bs 8) * 0x1000000
-              + fromIntegral (BS.index bs 9) * 0x10000
-              + fromIntegral (BS.index bs 10) * 0x100
-              + fromIntegral (BS.index bs 11)
+            (fromIntegral (BS.index bs 8) `shiftL` 24)
+              .|. (fromIntegral (BS.index bs 9) `shiftL` 16)
+              .|. (fromIntegral (BS.index bs 10) `shiftL` 8)
+              .|. fromIntegral (BS.index bs 11)
       Right (YamuxHeader ver typ flags sid len)
