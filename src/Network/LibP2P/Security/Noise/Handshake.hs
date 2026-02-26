@@ -8,7 +8,7 @@ module Network.LibP2P.Security.Noise.Handshake
   ( -- * Handshake types
     HandshakeResult (..)
   , NoisePayload (..)
-  , HandshakeState
+  , HandshakeState (..)
     -- * Payload encoding
   , encodeNoisePayload
   , decodeNoisePayload
