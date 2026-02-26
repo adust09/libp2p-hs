@@ -13,9 +13,9 @@ module Network.LibP2P.Crypto.PeerId
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base58 as B58
 import Data.Text (Text)
-import qualified Data.Text as T
-import Network.LibP2P.Core.Base58 (base58Decode, base58Encode)
+import qualified Data.Text.Encoding as TE
 import Network.LibP2P.Core.Multihash (HashFunction (..), encodeMultihash)
 import Network.LibP2P.Crypto.Key (PublicKey)
 import Network.LibP2P.Crypto.Protobuf (encodePublicKey)
@@ -40,11 +40,11 @@ fromPublicKey pk =
 
 -- | Encode a Peer ID as base58btc text.
 toBase58 :: PeerId -> Text
-toBase58 (PeerId bs) = T.pack $ base58Encode (BS.unpack bs)
+toBase58 (PeerId bs) = TE.decodeUtf8 (B58.encode bs)
 
 -- | Decode a Peer ID from base58btc text.
 fromBase58 :: Text -> Either String PeerId
-fromBase58 t = case base58Decode (T.unpack t) of
+fromBase58 t = case B58.decode (TE.encodeUtf8 t) of
   Just bs -> Right (PeerId bs)
   Nothing -> Left "fromBase58: invalid base58 encoding"
 

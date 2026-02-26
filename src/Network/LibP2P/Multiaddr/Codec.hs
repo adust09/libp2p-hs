@@ -15,7 +15,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word16, Word32, Word64)
 import Text.Read (readMaybe)
-import Network.LibP2P.Core.Base58 (base58Decode, base58Encode)
+import qualified Data.ByteString.Base58 as B58
 import Network.LibP2P.Core.Binary (readWord16BE, readWord32BE, word16BE, word32BE)
 import Network.LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import Network.LibP2P.Multiaddr.Protocol
@@ -149,7 +149,7 @@ protocolsToText = T.concat . map renderOne
 
     -- Minimal base58btc encoding for PeerId display
     renderBase58 :: ByteString -> Text
-    renderBase58 = T.pack . base58Encode . BS.unpack
+    renderBase58 = TE.decodeUtf8 . B58.encode
 
 -- | Parse human-readable text form to a list of protocols.
 textToProtocols :: Text -> Either String [Protocol]
@@ -240,7 +240,7 @@ textToProtocols input
       _ -> Left $ "textToProtocols: invalid port: " <> T.unpack t
 
     parseBase58PeerId :: Text -> Either String ByteString
-    parseBase58PeerId t = case base58Decode (T.unpack t) of
+    parseBase58PeerId t = case B58.decode (TE.encodeUtf8 t) of
       Just bs -> Right bs
       Nothing -> Left $ "textToProtocols: invalid base58 peer ID: " <> T.unpack t
 
