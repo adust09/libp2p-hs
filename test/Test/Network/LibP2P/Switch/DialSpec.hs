@@ -57,8 +57,8 @@ mkDummyConnection pid = do
     , connSecurity   = "/noise"
     , connMuxer      = "/yamux/1.0.0"
     , connSession    = MuxerSession
-        { muxOpenStream   = error "dummy"
-        , muxAcceptStream = error "dummy"
+        { muxOpenStream   = fail "dummy: not connected"
+        , muxAcceptStream = fail "dummy: not connected"
         , muxClose        = pure ()
         }
     , connState      = stateVar
