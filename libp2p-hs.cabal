@@ -45,11 +45,13 @@ library
     Network.LibP2P.Mux.Yamux.Frame
     Network.LibP2P.Security.Noise.Framing
     Network.LibP2P.Security.Noise.Handshake
+    Network.LibP2P.Security.Noise.Session
   build-depends:
     base        >= 4.18 && < 5,
     bytestring  >= 0.10 && < 0.13,
     binary      >= 0.8.9 && < 0.9,
     text        >= 1.2  && < 2.2,
+    cacophony   >= 0.11 && < 0.12,
     crypton     >= 1.0   && < 1.1,
     memory      >= 0.18  && < 0.19,
     ppad-base58 >= 0.2  && < 0.3,
@@ -73,6 +75,7 @@ test-suite libp2p-hs-test
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
+    memory     >= 0.18 && < 0.19,
     text       >= 1.2  && < 2.2,
     libp2p-hs,
     async      >= 2.2 && < 2.3,
