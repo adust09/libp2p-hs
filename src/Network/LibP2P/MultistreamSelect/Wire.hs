@@ -12,7 +12,6 @@ module Network.LibP2P.MultistreamSelect.Wire
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Text (Text)
-import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Network.LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 
