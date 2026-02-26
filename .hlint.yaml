@@ -1,0 +1,10 @@
+- arguments: [--color=auto]
+
+# Enable standard hints
+- group: {name: default, enabled: true}
+- group: {name: dollar, enabled: true}
+- group: {name: generalise, enabled: true}
+
+# Ignore some noisy hints
+- ignore: {name: "Use newtype instead of data"}
+- ignore: {name: "Redundant do"}

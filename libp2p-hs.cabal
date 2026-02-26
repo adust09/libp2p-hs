@@ -1,0 +1,81 @@
+cabal-version:   3.0
+name:            libp2p-hs
+version:         0.1.0.0
+synopsis:        Haskell implementation of the libp2p networking stack
+description:
+  A Haskell implementation of the libp2p modular peer-to-peer networking
+  stack. Implements transport, security, multiplexing, and application
+  protocols following the libp2p specification.
+license:         MIT
+license-file:    LICENSE
+author:          adust09
+maintainer:      adust09
+category:        Network
+build-type:      Simple
+extra-doc-files: README.md
+tested-with:     GHC == 9.10.1 || == 9.14.1
+
+common warnings
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates
+               -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
+
+common lang
+  default-language:   GHC2021
+  default-extensions:
+    OverloadedStrings
+    StrictData
+
+library
+  import:          warnings, lang
+  hs-source-dirs:  src
+  exposed-modules:
+    Network.LibP2P
+    Network.LibP2P.Core.Base58
+    Network.LibP2P.Core.Varint
+    Network.LibP2P.Core.Multihash
+    Network.LibP2P.Multiaddr.Multiaddr
+    Network.LibP2P.Multiaddr.Protocol
+    Network.LibP2P.Multiaddr.Codec
+    Network.LibP2P.Crypto.Key
+    Network.LibP2P.Crypto.Ed25519
+    Network.LibP2P.Crypto.Protobuf
+    Network.LibP2P.Crypto.PeerId
+    Network.LibP2P.MultistreamSelect.Wire
+    Network.LibP2P.MultistreamSelect.Negotiation
+    Network.LibP2P.Mux.Yamux.Frame
+    Network.LibP2P.Security.Noise.Framing
+    Network.LibP2P.Security.Noise.Handshake
+  build-depends:
+    base       >= 4.18 && < 5,
+    bytestring >= 0.10 && < 0.13,
+    binary     >= 0.8.9 && < 0.9,
+    text       >= 1.2  && < 2.2,
+    crypton    >= 1.0   && < 1.1,
+    memory     >= 0.18  && < 0.19,
+    iproute    >= 1.7  && < 1.8,
+    network    >= 3.1  && < 3.3,
+    stm        >= 2.4  && < 2.6
+
+test-suite libp2p-hs-test
+  import:          warnings, lang
+  type:            exitcode-stdio-1.0
+  hs-source-dirs:  test
+  main-is:         Spec.hs
+  other-modules:
+    Test.Network.LibP2P.Core.VarintSpec
+    Test.Network.LibP2P.Core.MultihashSpec
+    Test.Network.LibP2P.Multiaddr.MultiaddrSpec
+    Test.Network.LibP2P.Crypto.PeerIdSpec
+    Test.Network.LibP2P.MultistreamSelect.NegotiationSpec
+    Test.Network.LibP2P.Mux.Yamux.FrameSpec
+    Test.Network.LibP2P.Security.Noise.HandshakeSpec
+  build-depends:
+    base       >= 4.18 && < 5,
+    bytestring >= 0.10 && < 0.13,
+    text       >= 1.2  && < 2.2,
+    libp2p-hs,
+    async      >= 2.2 && < 2.3,
+    hspec      >= 2.11 && < 2.12,
+    QuickCheck >= 2.14 && < 2.16
+  build-tool-depends:
+    hspec-discover:hspec-discover
