@@ -52,6 +52,7 @@ library
     Network.LibP2P.Switch.ConnPool
     Network.LibP2P.Switch.Switch
     Network.LibP2P.Switch.Dial
+    Network.LibP2P.Switch.Listen
     Network.LibP2P.Switch.Upgrade
     Network.LibP2P.Security.Noise.Framing
     Network.LibP2P.Security.Noise.Handshake
@@ -90,6 +91,7 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Switch.ConnPoolSpec
     Test.Network.LibP2P.Switch.SwitchSpec
     Test.Network.LibP2P.Switch.DialSpec
+    Test.Network.LibP2P.Switch.ListenSpec
     Test.Network.LibP2P.Switch.UpgradeSpec
     Test.Network.LibP2P.Security.Noise.HandshakeSpec
   build-depends:
