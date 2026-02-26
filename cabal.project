@@ -1,5 +1,9 @@
 packages: .
 
+-- Requires GHC 9.10.x (base < 4.22) for cacophony compatibility.
+-- CI: haskell-actions/setup installs ghc-9.10.1 and puts 'ghc' on PATH.
+-- Local: set 'with-compiler' in cabal.project.local if needed.
+
 -- Enable all warnings
 package libp2p-hs
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
