@@ -98,10 +98,13 @@ spec = do
 
   describe "Ed25519 key generation" $ do
     it "generates a valid key pair" $ do
-      kp <- generateKeyPair
-      let pk = publicKey kp
-      pkType pk `shouldBe` Ed25519
-      BS.length (pkBytes pk) `shouldBe` 32
+      result <- generateKeyPair
+      case result of
+        Right kp -> do
+          let pk = publicKey kp
+          pkType pk `shouldBe` Ed25519
+          BS.length (pkBytes pk) `shouldBe` 32
+        Left err -> expectationFailure err
 
     it "creates key pair from seed" $ do
       let seed = BS.replicate 32 0x01
@@ -113,18 +116,29 @@ spec = do
 
   describe "Sign and verify" $ do
     it "sign then verify succeeds" $ do
-      kp <- generateKeyPair
+      Right kp <- generateKeyPair
       let msg = "hello libp2p" :: BS.ByteString
-      let sig = sign (kpPrivate kp) msg
-      verify (kpPublic kp) msg sig `shouldBe` True
+      case sign (kpPrivate kp) msg of
+        Right sig -> verify (kpPublic kp) msg sig `shouldBe` True
+        Left err -> expectationFailure err
 
     it "verify with wrong message fails" $ do
-      kp <- generateKeyPair
-      let sig = sign (kpPrivate kp) ("correct" :: BS.ByteString)
-      verify (kpPublic kp) ("wrong" :: BS.ByteString) sig `shouldBe` False
+      Right kp <- generateKeyPair
+      case sign (kpPrivate kp) ("correct" :: BS.ByteString) of
+        Right sig -> verify (kpPublic kp) ("wrong" :: BS.ByteString) sig `shouldBe` False
+        Left err -> expectationFailure err
 
     it "verify with wrong key fails" $ do
-      kp1 <- generateKeyPair
-      kp2 <- generateKeyPair
-      let sig = sign (kpPrivate kp1) ("message" :: BS.ByteString)
-      verify (kpPublic kp2) ("message" :: BS.ByteString) sig `shouldBe` False
+      Right kp1 <- generateKeyPair
+      Right kp2 <- generateKeyPair
+      case sign (kpPrivate kp1) ("message" :: BS.ByteString) of
+        Right sig -> verify (kpPublic kp2) ("message" :: BS.ByteString) sig `shouldBe` False
+        Left err -> expectationFailure err
+
+    it "sign with invalid key returns Left" $ do
+      let badKey = PrivateKey Ed25519 (BS.pack [0x00]) -- invalid 1-byte key
+      sign badKey "test" `shouldSatisfy` isLeft
+
+isLeft :: Either a b -> Bool
+isLeft (Left _) = True
+isLeft _ = False

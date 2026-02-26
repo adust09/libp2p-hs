@@ -38,7 +38,7 @@ noiseStaticKeyPrefix = "noise-libp2p-static-key:"
 
 -- | Sign the Noise static public key with the identity private key.
 -- Produces: sign(identity_sk, "noise-libp2p-static-key:" || noise_static_pubkey)
-signStaticKey :: PrivateKey -> ByteString -> ByteString
+signStaticKey :: PrivateKey -> ByteString -> Either String ByteString
 signStaticKey sk noiseStaticPubKey =
   let payload = noiseStaticKeyPrefix <> noiseStaticPubKey
    in sign sk payload

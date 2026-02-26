@@ -13,12 +13,11 @@ import qualified Data.ByteString as BS
 import Network.LibP2P.Crypto.Key
 
 -- | Generate a new random Ed25519 key pair.
-generateKeyPair :: IO KeyPair
+-- Returns Left on cryptographic failure (should not occur with proper RNG).
+generateKeyPair :: IO (Either String KeyPair)
 generateKeyPair = do
   seed <- getRandomBytes 32 :: IO ByteString
-  case keyPairFromSeed seed of
-    Right kp -> pure kp
-    Left err -> error $ "generateKeyPair: " <> err
+  pure (keyPairFromSeed seed)
 
 -- | Create an Ed25519 key pair from a 32-byte seed.
 keyPairFromSeed :: ByteString -> Either String KeyPair
