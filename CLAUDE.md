@@ -8,7 +8,7 @@ libp2p-hs is a Haskell implementation of the [libp2p](https://libp2p.io/) networ
 
 ## Current State
 
-**No Haskell code exists yet.** The repository contains only documentation. When implementation begins, the project will use Cabal (the `.gitignore` is already configured for Cabal/Stack/GHC artifacts).
+Phases 0–4a are implemented: scaffolding, varint, multihash, multiaddr, peer identity (Ed25519), multistream-select, Yamux frame encoding, and Noise framing/payload/key-signing. 102+ tests pass across all modules. The project uses a single Cabal library (not internal libraries, due to linker issues with shared `hs-source-dirs`).
 
 ## Documentation Reference
 
@@ -66,16 +66,20 @@ Application (GossipSub, DHT, Identify, Ping)
 
 The **Switch** (ch.08) is the central coordinator that manages this pipeline, connection pooling, and protocol handler dispatch.
 
-## Key Haskell Libraries (from textbook recommendations)
+## Key Haskell Libraries
 
-- **Crypto**: `crypton` (Ed25519, X25519, ChaCha20-Poly1305)
-- **Noise protocol**: `cacophony`
-- **Protobuf**: `proto-lens` or manual encoding (libp2p protobufs are small)
-- **Networking**: `network`
+- **Crypto**: `crypton` (Ed25519, X25519, ChaCha20-Poly1305) + `memory` (ByteArray conversion)
+- **Noise protocol**: `crypton` directly (not `cacophony` — incompatible with GHC 9.14.1 due to `lens`→`these`→`base-4.22` chain)
+- **Protobuf**: Manual encoding (libp2p protobufs are small, avoids `proto-lens` dependency)
+- **Networking**: `network`, `iproute` (IPv4/IPv6 address handling)
 - **Concurrency**: `stm`, `async`
 - **Binary parsing**: `binary`, `bytestring`
-- **Base encoding**: `base58-bytestring`
-- **ASN.1**: `asn1-encoding` (for RSA/ECDSA key formats)
+- **Base encoding**: Self-contained Base58btc in `Core.Base58` (no external dependency)
+- **ASN.1**: `asn1-encoding` (for RSA/ECDSA key formats, not yet used)
+
+### Architecture note
+
+Single library pattern in `.cabal` — internal libraries caused linker issues with shared `hs-source-dirs` on GHC 9.14.1.
 
 ## Upstream Specs
 

@@ -13,7 +13,7 @@ maintainer:      adust09
 category:        Network
 build-type:      Simple
 extra-doc-files: README.md
-tested-with:     GHC == 9.14.1
+tested-with:     GHC == 9.10.1 || == 9.14.1
 
 common warnings
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates
