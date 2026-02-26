@@ -49,6 +49,22 @@ library core
     crypton    >= 1.0   && < 1.1,
     memory     >= 0.18  && < 0.19
 
+-- Internal library: multiaddr parsing/encoding
+library multiaddr
+  import:          warnings, lang
+  visibility:      public
+  hs-source-dirs:  src
+  exposed-modules:
+    Network.LibP2P.Multiaddr.Multiaddr
+    Network.LibP2P.Multiaddr.Protocol
+    Network.LibP2P.Multiaddr.Codec
+  build-depends:
+    base       >= 4.18 && < 5,
+    bytestring >= 0.10 && < 0.13,
+    text       >= 1.2  && < 2.2,
+    iproute    >= 1.7  && < 1.8,
+    libp2p-hs:core
+
 -- Test suite
 test-suite libp2p-hs-test
   import:          warnings, lang
@@ -58,10 +74,13 @@ test-suite libp2p-hs-test
   other-modules:
     Test.Network.LibP2P.Core.VarintSpec
     Test.Network.LibP2P.Core.MultihashSpec
+    Test.Network.LibP2P.Multiaddr.MultiaddrSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
+    text       >= 1.2  && < 2.2,
     libp2p-hs:core,
+    libp2p-hs:multiaddr,
     hspec      >= 2.11 && < 2.12,
     QuickCheck >= 2.14 && < 2.16
   build-tool-depends:
