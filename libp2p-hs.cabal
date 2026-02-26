@@ -39,6 +39,8 @@ library
     Network.LibP2P.Crypto.Ed25519
     Network.LibP2P.Crypto.Protobuf
     Network.LibP2P.Crypto.PeerId
+    Network.LibP2P.MultistreamSelect.Wire
+    Network.LibP2P.MultistreamSelect.Negotiation
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
@@ -46,7 +48,8 @@ library
     text       >= 1.2  && < 2.2,
     crypton    >= 1.0   && < 1.1,
     memory     >= 0.18  && < 0.19,
-    iproute    >= 1.7  && < 1.8
+    iproute    >= 1.7  && < 1.8,
+    stm        >= 2.4  && < 2.6
 
 test-suite libp2p-hs-test
   import:          warnings, lang
@@ -58,11 +61,13 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Core.MultihashSpec
     Test.Network.LibP2P.Multiaddr.MultiaddrSpec
     Test.Network.LibP2P.Crypto.PeerIdSpec
+    Test.Network.LibP2P.MultistreamSelect.NegotiationSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
     text       >= 1.2  && < 2.2,
     libp2p-hs,
+    async      >= 2.2 && < 2.3,
     hspec      >= 2.11 && < 2.12,
     QuickCheck >= 2.14 && < 2.16
   build-tool-depends:
