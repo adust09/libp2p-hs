@@ -39,6 +39,8 @@ newSwitch pid kp = do
     { dlSystemLimits = defaultSystemLimits
     , dlPeerLimits   = defaultPeerLimits
     }
+  peerStoreVar <- newTVarIO Map.empty
+  notifiersVar <- newTVarIO []
   pure Switch
     { swLocalPeerId  = pid
     , swIdentityKey  = kp
@@ -50,6 +52,8 @@ newSwitch pid kp = do
     , swDialBackoffs = backoffsVar
     , swPendingDials = pendingDialsVar
     , swResourceMgr  = resMgr
+    , swPeerStore    = peerStoreVar
+    , swNotifiers    = notifiersVar
     }
 
 -- | Register a transport with the switch.
