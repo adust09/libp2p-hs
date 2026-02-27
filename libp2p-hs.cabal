@@ -75,6 +75,9 @@ library
     Network.LibP2P.Security.Noise.Framing
     Network.LibP2P.Security.Noise.Handshake
     Network.LibP2P.Security.Noise.Session
+    Network.LibP2P.Protocol.GossipSub.Types
+    Network.LibP2P.Protocol.GossipSub.Message
+    Network.LibP2P.Protocol.GossipSub.Router
   build-depends:
     base        >= 4.18 && < 5,
     bytestring  >= 0.10 && < 0.13,
@@ -90,7 +93,8 @@ library
     stm         >= 2.4  && < 2.6,
     async       >= 2.2  && < 2.3,
     containers  >= 0.6  && < 0.8,
-    proto3-wire >= 1.4  && < 1.5
+    proto3-wire >= 1.4  && < 1.5,
+    list-shuffle >= 1.0  && < 1.1
 
 test-suite libp2p-hs-test
   import:          warnings, lang
@@ -130,6 +134,9 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.NAT.Relay.ClientSpec
     Test.Network.LibP2P.NAT.DCUtR.MessageSpec
     Test.Network.LibP2P.NAT.DCUtR.DCUtRSpec
+    Test.Network.LibP2P.Protocol.GossipSub.TypesSpec
+    Test.Network.LibP2P.Protocol.GossipSub.MessageSpec
+    Test.Network.LibP2P.Protocol.GossipSub.RouterSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
