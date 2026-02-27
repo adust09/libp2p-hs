@@ -23,6 +23,7 @@ import Network.LibP2P.Crypto.Key (KeyPair)
 import Network.LibP2P.Crypto.PeerId (PeerId)
 import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
 import Network.LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO)
+import Network.LibP2P.Protocol.Identify.Message (IdentifyInfo)
 import Network.LibP2P.Switch.ResourceManager (Direction (..), ResourceError (..), ResourceManager)
 import Network.LibP2P.Transport.Transport (Transport)
 
@@ -104,4 +105,6 @@ data Switch = Switch
   , swDialBackoffs :: !(TVar (Map PeerId BackoffEntry))                  -- ^ Per-peer dial backoff state
   , swPendingDials :: !(TVar (Map PeerId (TMVar (Either DialError Connection)))) -- ^ In-flight dials for dedup
   , swResourceMgr  :: !ResourceManager                                   -- ^ Hierarchical resource manager
+  , swPeerStore    :: !(TVar (Map PeerId IdentifyInfo))                  -- ^ Identify info per peer
+  , swNotifiers    :: !(TVar [Connection -> IO ()])                      -- ^ Callbacks on new connection
   }
