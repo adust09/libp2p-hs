@@ -62,6 +62,8 @@ library
     Network.LibP2P.DHT.Distance
     Network.LibP2P.DHT.RoutingTable
     Network.LibP2P.DHT.Message
+    Network.LibP2P.DHT.DHT
+    Network.LibP2P.DHT.Lookup
     Network.LibP2P.Security.Noise.Framing
     Network.LibP2P.Security.Noise.Handshake
     Network.LibP2P.Security.Noise.Session
@@ -110,6 +112,8 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.DHT.DistanceSpec
     Test.Network.LibP2P.DHT.RoutingTableSpec
     Test.Network.LibP2P.DHT.MessageSpec
+    Test.Network.LibP2P.DHT.DHTSpec
+    Test.Network.LibP2P.DHT.LookupSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
