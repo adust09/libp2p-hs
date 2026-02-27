@@ -479,7 +479,97 @@ spec = do
         delivered `shouldBe` 1
 
     describe "peerScore" $ do
-      it "returns 0 for all peers (Phase 9a stub)" $ do
+      it "returns 0 for unknown peer" $ do
         (router, _) <- mkTestRouter localPid
+        score <- peerScore router (mkPeerId 99)
+        score `shouldBe` 0
+
+      it "returns 0 for newly added peer with no counters" $ do
+        (router, _) <- mkTestRouter localPid
+        addPeer router (mkPeerId 1) GossipSubPeer True fixedTime
         score <- peerScore router (mkPeerId 1)
         score `shouldBe` 0
+
+    describe "Scoring integration" $ do
+      it "handleGraft rejects negative-score peer" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            -- Configure topic params so P4 penalty applies
+            routerWithParams = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspTopicParams = Map.singleton "blocks" defaultTopicScoreParams }
+              }
+        addPeer routerWithParams sender GossipSubPeer False fixedTime
+        -- Manually set negative score via P4 (invalid messages)
+        atomically $ modifyTVar' (gsPeers routerWithParams) $
+          Map.adjust (\ps -> ps
+            { psTopicState = Map.singleton "blocks"
+                (defaultTopicPeerState { tpsInvalidMessages = 10 })
+            }) sender
+        -- Set up mesh entry for topic
+        atomically $ modifyTVar' (gsMesh routerWithParams) $
+          Map.insert "blocks" Set.empty
+        handleGraft routerWithParams sender [Graft "blocks"]
+        -- Sender should NOT be in mesh (rejected due to negative score)
+        mesh <- readTVarIO (gsMesh routerWithParams)
+        Set.member sender (Map.findWithDefault Set.empty "blocks" mesh) `shouldBe` False
+        -- Should send PRUNE
+        sent <- readIORef logRef
+        let pruneMsgs = filter (\(pid, rpc) ->
+              pid == sender && case rpcControl rpc of
+                Just ctrl -> not (null (ctrlPrune ctrl))
+                Nothing -> False) sent
+        length pruneMsgs `shouldBe` 1
+
+      it "P7 penalty applied for GRAFT during backoff" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "blocks" Set.empty
+        -- Set backoff
+        let backoffExpiry = addUTCTime 60 fixedTime
+        atomically $ modifyTVar' (gsBackoff router) $
+          Map.insert (sender, "blocks") backoffExpiry
+        -- Behavior penalty should be 0 before
+        peers0 <- readTVarIO (gsPeers router)
+        case Map.lookup sender peers0 of
+          Just ps -> psBehaviorPenalty ps `shouldBe` 0
+          Nothing -> expectationFailure "peer not found"
+        -- GRAFT during backoff
+        handleGraft router sender [Graft "blocks"]
+        -- Behavior penalty should increment to 1
+        peers1 <- readTVarIO (gsPeers router)
+        case Map.lookup sender peers1 of
+          Just ps -> psBehaviorPenalty ps `shouldBe` 1
+          Nothing -> expectationFailure "peer not found"
+
+      it "handlePrune records P3b mesh failure" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        -- Set topic params so P3b can be recorded
+        -- The router uses gsScoreParams which defaults to empty topic params
+        -- We need to configure topic params for "blocks"
+        let tsp = defaultTopicScoreParams { tspMeshMessageDeliveriesThreshold = 5 }
+            routerWithParams = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspTopicParams = Map.singleton "blocks" tsp }
+              }
+        -- Set up peer in mesh with 0 deliveries
+        atomically $ do
+          modifyTVar' (gsMesh routerWithParams) $
+            Map.insert "blocks" (Set.singleton sender)
+          modifyTVar' (gsPeers routerWithParams) $
+            Map.adjust (\ps -> ps
+              { psTopicState = Map.singleton "blocks"
+                  (defaultTopicPeerState { tpsMeshMessageDeliveries = 0 })
+              }) sender
+        handlePrune routerWithParams sender [Prune "blocks" [] (Just 60)]
+        -- P3b should capture deficit^2 = (5-0)^2 = 25
+        peers <- readTVarIO (gsPeers routerWithParams)
+        case Map.lookup sender peers of
+          Just ps -> case Map.lookup "blocks" (psTopicState ps) of
+            Just tps -> tpsMeshFailurePenalty tps `shouldBe` 25
+            Nothing -> expectationFailure "topic state not found"
+          Nothing -> expectationFailure "peer not found"

@@ -32,6 +32,15 @@ module Network.LibP2P.Protocol.GossipSub.Types
     -- * Peer tracking
   , PeerProtocol (..)
   , PeerState (..)
+    -- * Scoring types
+  , TopicScoreParams (..)
+  , defaultTopicScoreParams
+  , PeerScoreParams (..)
+  , defaultPeerScoreParams
+  , TopicPeerState (..)
+  , defaultTopicPeerState
+  , ScoreThresholds (..)
+  , defaultScoreThresholds
     -- * Router state
   , GossipSubRouter (..)
     -- * Defaults
@@ -44,6 +53,7 @@ import Control.Concurrent.STM (TVar)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import Data.Text (Text)
 import Data.Time (NominalDiffTime, UTCTime)
@@ -197,11 +207,133 @@ data PeerProtocol
 
 -- | Per-peer state tracked by the router.
 data PeerState = PeerState
-  { psProtocol    :: !PeerProtocol   -- ^ Protocol support
-  , psTopics      :: !(Set Topic)    -- ^ Subscribed topics
-  , psIsOutbound  :: !Bool           -- ^ True if we dialed this peer
-  , psConnectedAt :: !UTCTime        -- ^ Connection establishment time
+  { psProtocol         :: !PeerProtocol              -- ^ Protocol support
+  , psTopics           :: !(Set Topic)               -- ^ Subscribed topics
+  , psIsOutbound       :: !Bool                      -- ^ True if we dialed this peer
+  , psConnectedAt      :: !UTCTime                   -- ^ Connection establishment time
+  , psTopicState       :: !(Map Topic TopicPeerState) -- ^ Per-topic scoring state
+  , psBehaviorPenalty  :: !Double                     -- ^ P7 behavioral penalty counter
+  , psIPAddress        :: !(Maybe ByteString)         -- ^ IP address for P6
+  , psCachedScore      :: !Double                     -- ^ Cached computed score
   } deriving (Show, Eq)
+
+-- Scoring types
+
+-- | Per-topic scoring parameters.
+data TopicScoreParams = TopicScoreParams
+  { tspTopicWeight                    :: !Double          -- ^ How much this topic contributes
+  , tspTimeInMeshWeight               :: !Double          -- ^ P1 weight (small positive)
+  , tspTimeInMeshQuantum              :: !NominalDiffTime -- ^ P1 time unit
+  , tspTimeInMeshCap                  :: !Double          -- ^ P1 maximum value
+  , tspFirstMessageDeliveriesWeight   :: !Double          -- ^ P2 weight (positive)
+  , tspFirstMessageDeliveriesDecay    :: !Double          -- ^ P2 decay factor
+  , tspFirstMessageDeliveriesCap      :: !Double          -- ^ P2 maximum counter
+  , tspMeshMessageDeliveriesWeight    :: !Double          -- ^ P3 weight (negative)
+  , tspMeshMessageDeliveriesDecay     :: !Double          -- ^ P3 decay factor
+  , tspMeshMessageDeliveriesThreshold :: !Double          -- ^ P3 expected threshold
+  , tspMeshMessageDeliveriesCap       :: !Double          -- ^ P3 maximum counter
+  , tspMeshMessageDeliveriesActivation :: !NominalDiffTime -- ^ P3 grace period
+  , tspMeshMessageDeliveryWindow      :: !NominalDiffTime  -- ^ P3 near-first window
+  , tspMeshFailurePenaltyWeight       :: !Double          -- ^ P3b weight (negative)
+  , tspMeshFailurePenaltyDecay        :: !Double          -- ^ P3b decay factor
+  , tspInvalidMessageDeliveriesWeight :: !Double          -- ^ P4 weight (negative)
+  , tspInvalidMessageDeliveriesDecay  :: !Double          -- ^ P4 decay factor
+  } deriving (Show, Eq)
+
+-- | Default topic scoring parameters (conservative values).
+defaultTopicScoreParams :: TopicScoreParams
+defaultTopicScoreParams = TopicScoreParams
+  { tspTopicWeight                     = 1.0
+  , tspTimeInMeshWeight                = 0.01
+  , tspTimeInMeshQuantum               = 1     -- 1 second
+  , tspTimeInMeshCap                   = 100
+  , tspFirstMessageDeliveriesWeight    = 1.0
+  , tspFirstMessageDeliveriesDecay     = 0.5
+  , tspFirstMessageDeliveriesCap       = 100
+  , tspMeshMessageDeliveriesWeight     = -1.0
+  , tspMeshMessageDeliveriesDecay      = 0.5
+  , tspMeshMessageDeliveriesThreshold  = 1.0
+  , tspMeshMessageDeliveriesCap        = 100
+  , tspMeshMessageDeliveriesActivation = 5    -- 5 seconds
+  , tspMeshMessageDeliveryWindow       = 0.01 -- 10 ms
+  , tspMeshFailurePenaltyWeight        = -1.0
+  , tspMeshFailurePenaltyDecay         = 0.5
+  , tspInvalidMessageDeliveriesWeight  = -100.0
+  , tspInvalidMessageDeliveriesDecay   = 0.5
+  }
+
+-- | Global peer scoring parameters.
+data PeerScoreParams = PeerScoreParams
+  { pspTopicParams              :: !(Map Topic TopicScoreParams)
+  , pspAppSpecificWeight        :: !Double            -- ^ w5 weight
+  , pspAppSpecificScore         :: !(PeerId -> Double) -- ^ P5 callback
+  , pspIPColocationFactorWeight :: !Double            -- ^ w6 weight (negative)
+  , pspIPColocationFactorThreshold :: !Int            -- ^ P6 threshold
+  , pspBehaviorPenaltyWeight    :: !Double            -- ^ w7 weight (negative)
+  , pspBehaviorPenaltyDecay     :: !Double            -- ^ w7 decay factor
+  , pspDecayInterval            :: !NominalDiffTime   -- ^ How often to decay
+  , pspDecayToZero              :: !Double            -- ^ Zero-out threshold
+  , pspRetainScore              :: !NominalDiffTime   -- ^ Keep score after disconnect
+  , pspTopicScoreCap            :: !Double            -- ^ Cap for topic score sum
+  }
+
+-- | Default global scoring parameters.
+defaultPeerScoreParams :: PeerScoreParams
+defaultPeerScoreParams = PeerScoreParams
+  { pspTopicParams              = Map.empty
+  , pspAppSpecificWeight        = 1.0
+  , pspAppSpecificScore         = const 0
+  , pspIPColocationFactorWeight = -10.0
+  , pspIPColocationFactorThreshold = 3
+  , pspBehaviorPenaltyWeight    = -1.0
+  , pspBehaviorPenaltyDecay     = 0.99
+  , pspDecayInterval            = 1    -- 1 second
+  , pspDecayToZero              = 0.01
+  , pspRetainScore              = 3600 -- 1 hour
+  , pspTopicScoreCap            = 100.0
+  }
+
+-- | Per-topic per-peer state for scoring counters.
+data TopicPeerState = TopicPeerState
+  { tpsMeshTime                :: !NominalDiffTime  -- ^ P1: time in mesh
+  , tpsFirstMessageDeliveries  :: !Double           -- ^ P2 counter
+  , tpsMeshMessageDeliveries   :: !Double           -- ^ P3 counter
+  , tpsMeshFailurePenalty      :: !Double           -- ^ P3b counter
+  , tpsInvalidMessages         :: !Double           -- ^ P4 counter
+  , tpsGraftTime               :: !(Maybe UTCTime)  -- ^ When grafted
+  , tpsInMesh                  :: !Bool             -- ^ Currently in mesh?
+  } deriving (Show, Eq)
+
+-- | Default empty topic peer state.
+defaultTopicPeerState :: TopicPeerState
+defaultTopicPeerState = TopicPeerState
+  { tpsMeshTime               = 0
+  , tpsFirstMessageDeliveries = 0
+  , tpsMeshMessageDeliveries  = 0
+  , tpsMeshFailurePenalty     = 0
+  , tpsInvalidMessages        = 0
+  , tpsGraftTime              = Nothing
+  , tpsInMesh                 = False
+  }
+
+-- | Score thresholds controlling router behavior.
+data ScoreThresholds = ScoreThresholds
+  { stGossipThreshold            :: !Double  -- ^ Below: no gossip
+  , stPublishThreshold           :: !Double  -- ^ Below: no flood publish
+  , stGraylistThreshold          :: !Double  -- ^ Below: ignore all RPCs
+  , stAcceptPXThreshold          :: !Double  -- ^ Above: accept PX from PRUNE
+  , stOpportunisticGraftThreshold :: !Double -- ^ Below: trigger opportunistic graft
+  } deriving (Show, Eq)
+
+-- | Default score thresholds.
+defaultScoreThresholds :: ScoreThresholds
+defaultScoreThresholds = ScoreThresholds
+  { stGossipThreshold             = -100
+  , stPublishThreshold            = -1000
+  , stGraylistThreshold           = -10000
+  , stAcceptPXThreshold           = 100
+  , stOpportunisticGraftThreshold = 1
+  }
 
 -- Router state
 
@@ -219,6 +351,11 @@ data GossipSubRouter = GossipSubRouter
   , gsSeen        :: !(TVar (Map MessageId UTCTime))
     -- Backoff state
   , gsBackoff     :: !(TVar (Map (PeerId, Topic) UTCTime))
+    -- Scoring (Phase 9b)
+  , gsScoreParams :: !PeerScoreParams
+  , gsThresholds  :: !ScoreThresholds
+  , gsIPPeerCount :: !(TVar (Map ByteString (Set PeerId)))
+    -- ^ IP address → peers sharing that IP (for P6)
     -- Injectable functions for testability
   , gsSendRPC     :: !(PeerId -> RPC -> IO ())
     -- ^ Fire-and-forget RPC sender
