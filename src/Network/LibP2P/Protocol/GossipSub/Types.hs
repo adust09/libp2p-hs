@@ -41,6 +41,9 @@ module Network.LibP2P.Protocol.GossipSub.Types
   , defaultTopicPeerState
   , ScoreThresholds (..)
   , defaultScoreThresholds
+    -- * Message cache types
+  , CacheEntry (..)
+  , MessageCache (..)
     -- * Router state
   , GossipSubRouter (..)
     -- * Defaults
@@ -54,6 +57,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Sequence (Seq)
 import Data.Set (Set)
 import Data.Text (Text)
 import Data.Time (NominalDiffTime, UTCTime)
@@ -335,6 +339,23 @@ defaultScoreThresholds = ScoreThresholds
   , stOpportunisticGraftThreshold = 1
   }
 
+-- Message cache types
+
+-- | A cached message entry.
+data CacheEntry = CacheEntry
+  { ceMessageId :: !MessageId
+  , ceMessage   :: !PubSubMessage
+  , ceTopic     :: !Topic
+  } deriving (Show, Eq)
+
+-- | Sliding-window message cache.
+data MessageCache = MessageCache
+  { mcWindows :: !(Seq [CacheEntry])          -- ^ Circular windows, newest first (index 0)
+  , mcIndex   :: !(Map MessageId CacheEntry)  -- ^ Fast lookup by message ID
+  , mcLen     :: !Int                         -- ^ Total number of windows
+  , mcGossip  :: !Int                         -- ^ Number of windows for gossip (IHAVE)
+  } deriving (Show, Eq)
+
 -- Router state
 
 -- | GossipSub router state with STM-managed concurrent state.
@@ -356,6 +377,11 @@ data GossipSubRouter = GossipSubRouter
   , gsThresholds  :: !ScoreThresholds
   , gsIPPeerCount :: !(TVar (Map ByteString (Set PeerId)))
     -- ^ IP address → peers sharing that IP (for P6)
+    -- Message cache (Phase 9c)
+  , gsMessageCache  :: !(TVar MessageCache)
+    -- ^ Sliding-window message cache for IWANT and IHAVE
+  , gsHeartbeatCount :: !(TVar Int)
+    -- ^ Heartbeat counter (for opportunistic graft timing)
     -- Injectable functions for testability
   , gsSendRPC     :: !(PeerId -> RPC -> IO ())
     -- ^ Fire-and-forget RPC sender
