@@ -20,6 +20,7 @@ import Network.LibP2P.Crypto.Key (KeyPair)
 import Network.LibP2P.Crypto.PeerId (PeerId)
 import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
 import Network.LibP2P.MultistreamSelect.Negotiation (ProtocolId)
+import Network.LibP2P.Switch.ResourceManager (DefaultLimits (..), defaultPeerLimits, defaultSystemLimits, newResourceManager)
 import Network.LibP2P.Switch.Types (StreamHandler, Switch (..))
 import Network.LibP2P.Transport.Transport (Transport (..))
 
@@ -34,6 +35,10 @@ newSwitch pid kp = do
   closedVar       <- newTVarIO False
   backoffsVar     <- newTVarIO Map.empty
   pendingDialsVar <- newTVarIO Map.empty
+  resMgr <- newResourceManager DefaultLimits
+    { dlSystemLimits = defaultSystemLimits
+    , dlPeerLimits   = defaultPeerLimits
+    }
   pure Switch
     { swLocalPeerId  = pid
     , swIdentityKey  = kp
@@ -44,6 +49,7 @@ newSwitch pid kp = do
     , swClosed       = closedVar
     , swDialBackoffs = backoffsVar
     , swPendingDials = pendingDialsVar
+    , swResourceMgr  = resMgr
     }
 
 -- | Register a transport with the switch.
