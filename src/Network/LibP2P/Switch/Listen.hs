@@ -28,6 +28,7 @@ import Network.LibP2P.MultistreamSelect.Negotiation
   , negotiateResponder
   )
 import Network.LibP2P.Switch.ConnPool (addConn)
+import Network.LibP2P.Switch.ResourceManager (Direction (..), reserveConnection)
 import Network.LibP2P.Switch.Types
   ( Connection (..)
   , MuxerSession (..)
@@ -70,10 +71,15 @@ handleInbound sw gater rawConn = do
       if not secured
         then muxClose (connSession conn)
         else do
-          -- Add to connection pool
-          atomically $ addConn (swConnPool sw) conn
-          -- Block on stream accept loop until connection closes
-          streamAcceptLoop sw conn
+          -- Gate 3: check resource limits (PeerId known after handshake)
+          resCheck <- atomically $ reserveConnection (swResourceMgr sw) (connPeerId conn) Inbound
+          case resCheck of
+            Left _ -> muxClose (connSession conn)
+            Right () -> do
+              -- Add to connection pool
+              atomically $ addConn (swConnPool sw) conn
+              -- Block on stream accept loop until connection closes
+              streamAcceptLoop sw conn
 
 -- | Accept inbound streams and dispatch to registered protocol handlers.
 --

@@ -44,6 +44,7 @@ import Data.Time.Clock (NominalDiffTime, addUTCTime, getCurrentTime)
 import Network.LibP2P.Crypto.PeerId (PeerId)
 import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
 import Network.LibP2P.Switch.ConnPool (addConn, lookupConn)
+import Network.LibP2P.Switch.ResourceManager (Direction (..), releaseConnection, reserveConnection)
 import Network.LibP2P.Switch.Types
   ( BackoffEntry (..)
   , Connection
@@ -166,22 +167,35 @@ dialNewAndBroadcast
   -> TMVar (Either DialError Connection)
   -> IO (Either DialError Connection)
 dialNewAndBroadcast sw remotePeerId addrs tmvar = do
-  result <- dialNewInner sw addrs
-  -- Broadcast result to any waiting threads
-  atomically $ putTMVar tmvar result
-  -- Clean up pending dials map
-  atomically $ do
-    pending <- readTVar (swPendingDials sw)
-    writeTVar (swPendingDials sw) (Map.delete remotePeerId pending)
-  -- Record backoff on failure, clear on success, add to pool
-  case result of
-    Right conn -> do
-      clearBackoff (swDialBackoffs sw) remotePeerId
-      atomically $ addConn (swConnPool sw) conn
-      pure (Right conn)
-    Left _ -> do
-      recordBackoff (swDialBackoffs sw) remotePeerId
+  -- Check resource limits before attempting dial
+  resCheck <- atomically $ reserveConnection (swResourceMgr sw) remotePeerId Outbound
+  case resCheck of
+    Left resErr -> do
+      let result = Left (DialResourceLimit resErr)
+      atomically $ putTMVar tmvar result
+      atomically $ do
+        pending <- readTVar (swPendingDials sw)
+        writeTVar (swPendingDials sw) (Map.delete remotePeerId pending)
       pure result
+    Right () -> do
+      result <- dialNewInner sw addrs
+      -- Broadcast result to any waiting threads
+      atomically $ putTMVar tmvar result
+      -- Clean up pending dials map
+      atomically $ do
+        pending <- readTVar (swPendingDials sw)
+        writeTVar (swPendingDials sw) (Map.delete remotePeerId pending)
+      -- Record backoff on failure, clear on success, add to pool
+      case result of
+        Right conn -> do
+          clearBackoff (swDialBackoffs sw) remotePeerId
+          atomically $ addConn (swConnPool sw) conn
+          pure (Right conn)
+        Left _ -> do
+          -- Release the reserved connection since dial failed
+          atomically $ releaseConnection (swResourceMgr sw) remotePeerId Outbound
+          recordBackoff (swDialBackoffs sw) remotePeerId
+          pure result
 
 -- | Inner dial logic: transport selection and staggered parallel dial.
 dialNewInner :: Switch -> [Multiaddr] -> IO (Either DialError Connection)

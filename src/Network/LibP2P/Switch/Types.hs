@@ -13,6 +13,7 @@ module Network.LibP2P.Switch.Types
   , Switch (..)
   , DialError (..)
   , BackoffEntry (..)
+  , ResourceError (..)
   ) where
 
 import Control.Concurrent.STM (TChan, TMVar, TVar)
@@ -22,6 +23,7 @@ import Network.LibP2P.Crypto.Key (KeyPair)
 import Network.LibP2P.Crypto.PeerId (PeerId)
 import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
 import Network.LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO)
+import Network.LibP2P.Switch.ResourceManager (Direction (..), ResourceError (..), ResourceManager)
 import Network.LibP2P.Transport.Transport (Transport)
 
 -- | Connection state machine (docs/08-switch.md §Connection States).
@@ -32,12 +34,6 @@ data ConnState
   | ConnOpen    -- ^ Fully upgraded, streams can be opened/accepted
   | Closing     -- ^ Go Away sent/received, draining existing streams
   | ConnClosed  -- ^ Transport connection closed, resources freed
-  deriving (Show, Eq)
-
--- | Direction of a connection relative to this node.
-data Direction
-  = Inbound   -- ^ Remote peer initiated the connection
-  | Outbound  -- ^ Local node initiated the connection
   deriving (Show, Eq)
 
 -- | Abstract muxer session interface.
@@ -81,6 +77,7 @@ data DialError
   | DialAllFailed ![String]   -- ^ All dial attempts failed
   | DialUpgradeFailed !String -- ^ Connection upgrade pipeline failed
   | DialSwitchClosed          -- ^ Switch has been shut down
+  | DialResourceLimit !ResourceError  -- ^ Resource limit exceeded
   deriving (Show, Eq)
 
 -- | Per-peer dial backoff state (docs/08-switch.md §Dial Backoff).
@@ -106,4 +103,5 @@ data Switch = Switch
   , swClosed       :: !(TVar Bool)                                       -- ^ Whether the switch is shut down
   , swDialBackoffs :: !(TVar (Map PeerId BackoffEntry))                  -- ^ Per-peer dial backoff state
   , swPendingDials :: !(TVar (Map PeerId (TMVar (Either DialError Connection)))) -- ^ In-flight dials for dedup
+  , swResourceMgr  :: !ResourceManager                                   -- ^ Hierarchical resource manager
   }
