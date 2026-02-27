@@ -70,6 +70,8 @@ library
     Network.LibP2P.NAT.Relay.Message
     Network.LibP2P.NAT.Relay.Relay
     Network.LibP2P.NAT.Relay.Client
+    Network.LibP2P.NAT.DCUtR.Message
+    Network.LibP2P.NAT.DCUtR.DCUtR
     Network.LibP2P.Security.Noise.Framing
     Network.LibP2P.Security.Noise.Handshake
     Network.LibP2P.Security.Noise.Session
@@ -126,6 +128,8 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.NAT.Relay.MessageSpec
     Test.Network.LibP2P.NAT.Relay.RelaySpec
     Test.Network.LibP2P.NAT.Relay.ClientSpec
+    Test.Network.LibP2P.NAT.DCUtR.MessageSpec
+    Test.Network.LibP2P.NAT.DCUtR.DCUtRSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
