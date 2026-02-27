@@ -57,6 +57,7 @@ library
     Network.LibP2P.Switch.ResourceManager
     Network.LibP2P.Protocol.Identify.Message
     Network.LibP2P.Protocol.Identify.Identify
+    Network.LibP2P.Protocol.Ping.Ping
     Network.LibP2P.Security.Noise.Framing
     Network.LibP2P.Security.Noise.Handshake
     Network.LibP2P.Security.Noise.Session
@@ -100,6 +101,7 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Switch.ResourceManagerSpec
     Test.Network.LibP2P.Protocol.Identify.MessageSpec
     Test.Network.LibP2P.Protocol.Identify.IdentifySpec
+    Test.Network.LibP2P.Protocol.Ping.PingSpec
     Test.Network.LibP2P.Security.Noise.HandshakeSpec
   build-depends:
     base       >= 4.18 && < 5,
@@ -111,6 +113,7 @@ test-suite libp2p-hs-test
     async      >= 2.2 && < 2.3,
     stm        >= 2.4 && < 2.6,
     containers >= 0.6 && < 0.8,
+    crypton    >= 1.0  && < 1.1,
     hspec      >= 2.11 && < 2.12,
     QuickCheck >= 2.14 && < 2.16
   build-tool-depends:
