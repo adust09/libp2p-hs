@@ -43,6 +43,7 @@ import Network.LibP2P.Crypto.Key (KeyPair (..), sign)
 import Network.LibP2P.Crypto.Protobuf (encodePublicKey)
 import Network.LibP2P.Protocol.GossipSub.Types
 import Network.LibP2P.Protocol.GossipSub.Message (encodePubSubMessageBS)
+import Network.LibP2P.Protocol.GossipSub.MessageCache (newMessageCache, cachePut, cacheGet)
 import Network.LibP2P.Protocol.GossipSub.Score (computeScore, addP7Penalty, recordMeshFailure)
 
 -- | Create a new GossipSub router with empty state.
@@ -59,22 +60,26 @@ newRouter params localPid sendRPC getTime = do
   seen     <- newTVarIO Map.empty
   backoff  <- newTVarIO Map.empty
   ipCount  <- newTVarIO Map.empty
+  mcache   <- newTVarIO (newMessageCache (paramMcacheLen params) (paramMcacheGossip params))
+  hbCount  <- newTVarIO 0
   onMsg    <- newTVarIO (\_ _ -> pure ())
   pure GossipSubRouter
-    { gsParams      = params
-    , gsLocalPeerId = localPid
-    , gsMesh        = mesh
-    , gsFanout      = fanout
-    , gsFanoutPub   = fanoutPub
-    , gsPeers       = peers
-    , gsSeen        = seen
-    , gsBackoff     = backoff
-    , gsScoreParams = defaultPeerScoreParams
-    , gsThresholds  = defaultScoreThresholds
-    , gsIPPeerCount = ipCount
-    , gsSendRPC     = sendRPC
-    , gsGetTime     = getTime
-    , gsOnMessage   = onMsg
+    { gsParams         = params
+    , gsLocalPeerId    = localPid
+    , gsMesh           = mesh
+    , gsFanout         = fanout
+    , gsFanoutPub      = fanoutPub
+    , gsPeers          = peers
+    , gsSeen           = seen
+    , gsBackoff        = backoff
+    , gsScoreParams    = defaultPeerScoreParams
+    , gsThresholds     = defaultScoreThresholds
+    , gsIPPeerCount    = ipCount
+    , gsMessageCache   = mcache
+    , gsHeartbeatCount = hbCount
+    , gsSendRPC        = sendRPC
+    , gsGetTime        = getTime
+    , gsOnMessage      = onMsg
     }
 
 -- Peer management
@@ -275,6 +280,10 @@ handlePublishedMessage router sender msg = do
   if alreadySeen
     then pure ()
     else do
+      -- Cache the message for IWANT responses
+      atomically $ modifyTVar' (gsMessageCache router) $
+        cachePut msgId msg
+
       -- Forward to mesh peers (excluding sender)
       forwardMessage router sender msg
 
@@ -368,10 +377,15 @@ handleIHave router sender ihaves = do
     gsSendRPC router sender emptyRPC
       { rpcControl = Just emptyControlMessage { ctrlIWant = [IWant unseen] } }
 
--- | Handle IWANT: respond with cached messages.
--- Stub in Phase 9a — full implementation requires MessageCache (Phase 9c).
+-- | Handle IWANT: respond with cached messages from the message cache.
 handleIWant :: GossipSubRouter -> PeerId -> [IWant] -> IO ()
-handleIWant _router _sender _iwants = pure ()
+handleIWant router sender iwants = do
+  cache <- readTVarIO (gsMessageCache router)
+  let requestedIds = concatMap iwantMessageIds iwants
+      found = [ msg | mid <- requestedIds
+                     , Just msg <- [cacheGet mid cache] ]
+  unless (null found) $
+    gsSendRPC router sender emptyRPC { rpcPublish = found }
 
 -- | Handle subscription changes from a peer.
 handleSubscriptions :: GossipSubRouter -> PeerId -> [SubOpts] -> IO ()

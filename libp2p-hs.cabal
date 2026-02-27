@@ -79,6 +79,8 @@ library
     Network.LibP2P.Protocol.GossipSub.Message
     Network.LibP2P.Protocol.GossipSub.Router
     Network.LibP2P.Protocol.GossipSub.Score
+    Network.LibP2P.Protocol.GossipSub.MessageCache
+    Network.LibP2P.Protocol.GossipSub.Heartbeat
   build-depends:
     base        >= 4.18 && < 5,
     bytestring  >= 0.10 && < 0.13,
@@ -139,6 +141,8 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Protocol.GossipSub.MessageSpec
     Test.Network.LibP2P.Protocol.GossipSub.RouterSpec
     Test.Network.LibP2P.Protocol.GossipSub.ScoreSpec
+    Test.Network.LibP2P.Protocol.GossipSub.MessageCacheSpec
+    Test.Network.LibP2P.Protocol.GossipSub.HeartbeatSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
