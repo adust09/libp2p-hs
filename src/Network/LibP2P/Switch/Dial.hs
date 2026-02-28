@@ -44,6 +44,7 @@ import Data.Time.Clock (NominalDiffTime, addUTCTime, getCurrentTime)
 import Network.LibP2P.Crypto.PeerId (PeerId)
 import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
 import Network.LibP2P.Switch.ConnPool (addConn, lookupConn)
+import Network.LibP2P.Switch.Listen (streamAcceptLoop)
 import Network.LibP2P.Switch.ResourceManager (Direction (..), releaseConnection, reserveConnection)
 import Network.LibP2P.Switch.Types
   ( BackoffEntry (..)
@@ -190,6 +191,11 @@ dialNewAndBroadcast sw remotePeerId addrs tmvar = do
         Right conn -> do
           clearBackoff (swDialBackoffs sw) remotePeerId
           atomically $ addConn (swConnPool sw) conn
+          -- Start accepting inbound streams on the dialer side
+          _ <- async $ streamAcceptLoop sw conn
+          -- Notify connection listeners (e.g. GossipSub auto-stream open)
+          notifiers <- atomically $ readTVar (swNotifiers sw)
+          mapM_ (\f -> async $ f conn) notifiers
           pure (Right conn)
         Left _ -> do
           -- Release the reserved connection since dial failed
