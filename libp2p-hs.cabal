@@ -118,6 +118,7 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Switch.SwitchSpec
     Test.Network.LibP2P.Switch.DialSpec
     Test.Network.LibP2P.Switch.ListenSpec
+    Test.Network.LibP2P.Switch.ListenImplSpec
     Test.Network.LibP2P.Switch.UpgradeSpec
     Test.Network.LibP2P.Switch.ResourceManagerSpec
     Test.Network.LibP2P.Protocol.Identify.MessageSpec

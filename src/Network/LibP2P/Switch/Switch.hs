@@ -13,7 +13,9 @@ module Network.LibP2P.Switch.Switch
   , switchClose
   ) where
 
+import Control.Concurrent.Async (cancel)
 import Control.Concurrent.STM (atomically, newBroadcastTChanIO, newTVarIO, readTVar, writeTVar)
+import Control.Exception (SomeException, catch)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Network.LibP2P.Crypto.Key (KeyPair)
@@ -21,8 +23,8 @@ import Network.LibP2P.Crypto.PeerId (PeerId)
 import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
 import Network.LibP2P.MultistreamSelect.Negotiation (ProtocolId)
 import Network.LibP2P.Switch.ResourceManager (DefaultLimits (..), defaultPeerLimits, defaultSystemLimits, newResourceManager)
-import Network.LibP2P.Switch.Types (StreamHandler, Switch (..))
-import Network.LibP2P.Transport.Transport (Transport (..))
+import Network.LibP2P.Switch.Types (ActiveListener (..), StreamHandler, Switch (..))
+import Network.LibP2P.Transport.Transport (Listener (..), Transport (..))
 
 -- | Create a new Switch with the given local identity.
 -- All internal state is initialized empty.
@@ -41,6 +43,7 @@ newSwitch pid kp = do
     }
   peerStoreVar <- newTVarIO Map.empty
   notifiersVar <- newTVarIO []
+  listenersVar <- newTVarIO []
   pure Switch
     { swLocalPeerId  = pid
     , swIdentityKey  = kp
@@ -54,6 +57,7 @@ newSwitch pid kp = do
     , swResourceMgr  = resMgr
     , swPeerStore    = peerStoreVar
     , swNotifiers    = notifiersVar
+    , swListeners    = listenersVar
     }
 
 -- | Register a transport with the switch.
@@ -89,6 +93,18 @@ lookupStreamHandler sw proto = atomically $ do
   pure $ Map.lookup proto protos
 
 -- | Shut down the switch.
--- Sets the closed flag. Future phases will add connection cleanup.
+-- Cancels all accept loop threads, closes all listeners, then sets the closed flag.
 switchClose :: Switch -> IO ()
-switchClose sw = atomically $ writeTVar (swClosed sw) True
+switchClose sw = do
+  -- Read and clear listeners atomically
+  listeners <- atomically $ do
+    ls <- readTVar (swListeners sw)
+    writeTVar (swListeners sw) []
+    writeTVar (swClosed sw) True
+    pure ls
+  -- Cancel accept loops and close listeners outside STM
+  mapM_ closeListener listeners
+  where
+    closeListener al = do
+      cancel (alAcceptLoop al) `catch` (\(_ :: SomeException) -> pure ())
+      listenerClose (alListener al) `catch` (\(_ :: SomeException) -> pure ())

@@ -33,6 +33,8 @@ import Data.Text (Text)
 import Network.LibP2P.Crypto.PeerId (PeerId)
 import Network.LibP2P.Crypto.Protobuf (encodePublicKey)
 import Network.LibP2P.Crypto.Key (kpPublic)
+import Network.LibP2P.Multiaddr.Codec (encodeProtocols)
+import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..))
 import Network.LibP2P.MultistreamSelect.Negotiation
   ( ProtocolId
   , StreamIO (..)
@@ -46,7 +48,8 @@ import Network.LibP2P.Protocol.Identify.Message
   , maxIdentifySize
   )
 import Network.LibP2P.Switch.Types
-  ( Connection (..)
+  ( ActiveListener (..)
+  , Connection (..)
   , MuxerSession (..)
   , Switch (..)
   , StreamHandler
@@ -105,14 +108,17 @@ handleIdentifyPush sw stream remotePeerId = do
 
 -- | Build our local IdentifyInfo from Switch state.
 buildLocalIdentify :: Switch -> Maybe Connection -> IO IdentifyInfo
-buildLocalIdentify sw _mConn = do
-  protocols <- atomically $ Map.keys <$> readTVar (swProtocols sw)
+buildLocalIdentify sw mConn = do
+  (protocols, listenAddrs) <- atomically $ do
+    protos <- Map.keys <$> readTVar (swProtocols sw)
+    listeners <- readTVar (swListeners sw)
+    pure (protos, map alAddress listeners)
   pure IdentifyInfo
     { idProtocolVersion = Just "ipfs/0.1.0"
     , idAgentVersion    = Just "libp2p-hs/0.1.0"
     , idPublicKey       = Just (encodePublicKey (kpPublic (swIdentityKey sw)))
-    , idListenAddrs     = []  -- TODO: populate from transport listeners
-    , idObservedAddr    = Nothing  -- TODO: populate from connection remote addr
+    , idListenAddrs     = map (\(Multiaddr ps) -> encodeProtocols ps) listenAddrs
+    , idObservedAddr    = (\(Multiaddr ps) -> encodeProtocols ps) . connRemoteAddr <$> mConn
     , idProtocols       = protocols
     }
 

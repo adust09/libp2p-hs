@@ -14,11 +14,14 @@ module Network.LibP2P.Switch.Listen
   , dispatchStream
     -- * Listen orchestration
   , switchListen
+  , acceptLoop
+  , switchListenAddrs
   ) where
 
 import Control.Concurrent.Async (async)
-import Control.Concurrent.STM (atomically, readTVar)
+import Control.Concurrent.STM (atomically, readTVar, writeTVar)
 import Control.Exception (SomeException, catch)
+import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Network.LibP2P.Crypto.PeerId (PeerId)
 import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
@@ -30,12 +33,13 @@ import Network.LibP2P.MultistreamSelect.Negotiation
 import Network.LibP2P.Switch.ConnPool (addConn)
 import Network.LibP2P.Switch.ResourceManager (Direction (..), reserveConnection)
 import Network.LibP2P.Switch.Types
-  ( Connection (..)
+  ( ActiveListener (..)
+  , Connection (..)
   , MuxerSession (..)
   , Switch (..)
   )
 import Network.LibP2P.Switch.Upgrade (upgradeInbound)
-import Network.LibP2P.Transport.Transport (RawConnection (..))
+import Network.LibP2P.Transport.Transport (Listener (..), RawConnection (..), Transport (..))
 
 -- | Connection gater: policy-based admission control (docs/08-switch.md §Connection Gating).
 --
@@ -131,6 +135,53 @@ dispatchStream sw conn stream = do
 --
 -- For each address, selects a matching transport, binds a listener,
 -- and spawns an accept loop that handles inbound connections.
--- Returns the listener addresses (with resolved ports).
+-- Returns the actual bound addresses (port 0 resolved to actual port).
+-- Fails if the switch is already closed.
 switchListen :: Switch -> ConnectionGater -> [Multiaddr] -> IO [Multiaddr]
-switchListen _sw _gater _addrs = pure []  -- TODO: Phase 5e extension
+switchListen sw gater addrs = do
+  closed <- atomically $ readTVar (swClosed sw)
+  if closed
+    then fail "switchListen: switch is closed"
+    else do
+      transports <- atomically $ readTVar (swTransports sw)
+      activeListeners <- mapM (bindAndListen transports gater sw) addrs
+      let newListeners = concat activeListeners
+      atomically $ do
+        existing <- readTVar (swListeners sw)
+        writeTVar (swListeners sw) (existing ++ newListeners)
+      pure (map alAddress newListeners)
+  where
+    -- Find a transport for the address, bind, and spawn accept loop
+    bindAndListen transports gater' sw' addr = do
+      case find (\t -> transportCanDial t addr) transports of
+        Nothing -> fail $ "switchListen: no transport for " ++ show addr
+        Just transport -> do
+          listener <- transportListen transport addr
+          loopThread <- async $ acceptLoop sw' gater' listener
+          pure [ActiveListener
+            { alListener   = listener
+            , alAcceptLoop = loopThread
+            , alAddress    = listenerAddr listener
+            }]
+
+-- | Accept loop: forever accepts connections and spawns handleInbound threads.
+-- Catches exceptions from individual connections without stopping the loop.
+-- Stops when the listener is closed (accept throws).
+acceptLoop :: Switch -> ConnectionGater -> Listener -> IO ()
+acceptLoop sw gater listener = loop
+  where
+    loop = do
+      result <- (Right <$> listenerAccept listener)
+                  `catch` (\(_ :: SomeException) -> pure (Left ()))
+      case result of
+        Left () -> pure ()  -- Listener closed, stop
+        Right rawConn -> do
+          _ <- async $ handleInbound sw gater rawConn
+                         `catch` (\(_ :: SomeException) -> pure ())
+          loop
+
+-- | Get the current listen addresses from all active listeners.
+switchListenAddrs :: Switch -> IO [Multiaddr]
+switchListenAddrs sw = atomically $ do
+  listeners <- readTVar (swListeners sw)
+  pure (map alAddress listeners)
