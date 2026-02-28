@@ -1,5 +1,8 @@
 packages: .
 
+-- Always enable test suites in solver plans (fixes cabal 3.12 Cabal-7043 error)
+tests: True
+
 -- Requires GHC 9.10.x (base < 4.22) for cacophony compatibility.
 -- CI: haskell-actions/setup installs ghc-9.10.1 and puts 'ghc' on PATH.
 -- Local: set 'with-compiler' in cabal.project.local if needed.
