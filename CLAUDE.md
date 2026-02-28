@@ -8,7 +8,7 @@ libp2p-hs is a Haskell implementation of the [libp2p](https://libp2p.io/) networ
 
 ## Current State
 
-Phases 0–4a + Noise XX handshake are implemented: scaffolding, varint, multihash, multiaddr, peer identity (Ed25519), multistream-select, Yamux frame encoding, Noise framing/payload/key-signing, and full Noise XX handshake (via cacophony) + post-handshake encrypted transport. 117 tests pass across all modules. The project uses a single Cabal library (not internal libraries, due to linker issues with shared `hs-source-dirs`).
+All implementation phases (0–10d) are complete: the full libp2p stack from transport through application protocols, including TCP, Noise XX, Yamux, Switch, Identify, Ping, Kademlia DHT, AutoNAT, Circuit Relay v2, DCUtR, GossipSub, end-to-end integration tests, and public API facade. 547 tests pass across all modules. The project uses a single Cabal library (not internal libraries, due to linker issues with shared `hs-source-dirs`).
 
 ## Documentation Reference
 
@@ -96,3 +96,7 @@ Reference implementations for cross-checking: [go-libp2p](https://github.com/lib
 - `fix/*` — bug fix branches
 
 Create branches matching the GitHub Issue tag. Use worktrees for parallel work.
+
+### Avoid Stacked PRs
+
+When working on sequential sub-phases, **merge each PR into main before creating the next branch**. Do not branch from a feature branch — this creates stacked PRs where deleting a base branch auto-closes downstream PRs. Always branch from the latest `main`.
