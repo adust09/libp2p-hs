@@ -182,15 +182,34 @@ handleGossipSubStream node stream pid = do
           handleRPC (gsnRouter node) pid rpc
           readLoop
 
--- | Start the GossipSub node: register stream handler and start heartbeat.
+-- | Start the GossipSub node: register stream handler, notifier, and start heartbeat.
 startGossipSub :: GossipSubNode -> IO ()
 startGossipSub node = do
   -- Register inbound stream handler on Switch
   setStreamHandler (gsnSwitch node) gossipSubProtocolId
     (handleGossipSubStream node)
+  -- Register connection notifier to auto-open GossipSub streams to new peers
+  atomically $ modifyTVar' (swNotifiers (gsnSwitch node))
+    (onNewConnection node :)
   -- Start heartbeat background thread
   hbAsync <- runHeartbeat (gsnRouter node)
   atomically $ writeTVar (gsnHeartbeat node) (Just hbAsync)
+
+-- | Called on new connection: open a GossipSub stream to the peer.
+-- This registers the peer in the router and creates a read loop.
+onNewConnection :: GossipSubNode -> Connection -> IO ()
+onNewConnection node conn = do
+  let pid = connPeerId conn
+  -- Open a mux stream and negotiate GossipSub protocol
+  mStream <- openAndNegotiate conn
+  case mStream of
+    Nothing -> pure ()  -- Peer doesn't support GossipSub
+    Just stream -> do
+      -- Cache the outbound stream
+      atomically $ modifyTVar' (gsnStreams node) (Map.insert pid stream)
+      -- Register peer and start read loop (blocks until disconnect)
+      now <- getCurrentTime
+      addPeer (gsnRouter node) pid GossipSubPeer True now
 
 -- | Stop the GossipSub node: cancel heartbeat and unregister handler.
 stopGossipSub :: GossipSubNode -> IO ()

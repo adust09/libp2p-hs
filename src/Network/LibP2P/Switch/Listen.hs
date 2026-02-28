@@ -82,6 +82,9 @@ handleInbound sw gater rawConn = do
             Right () -> do
               -- Add to connection pool
               atomically $ addConn (swConnPool sw) conn
+              -- Notify connection listeners (e.g. GossipSub auto-stream open)
+              notifiers <- atomically $ readTVar (swNotifiers sw)
+              mapM_ (\f -> async $ f conn) notifiers
               -- Block on stream accept loop until connection closes
               streamAcceptLoop sw conn
 

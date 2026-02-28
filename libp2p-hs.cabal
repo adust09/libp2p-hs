@@ -146,6 +146,7 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Protocol.GossipSub.MessageCacheSpec
     Test.Network.LibP2P.Protocol.GossipSub.HeartbeatSpec
     Test.Network.LibP2P.Protocol.GossipSub.HandlerSpec
+    Test.Network.LibP2P.IntegrationSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
