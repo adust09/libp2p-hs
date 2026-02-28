@@ -78,6 +78,7 @@ library
     Network.LibP2P.Protocol.GossipSub.Types
     Network.LibP2P.Protocol.GossipSub.Message
     Network.LibP2P.Protocol.GossipSub.Router
+    Network.LibP2P.Protocol.GossipSub.Score
   build-depends:
     base        >= 4.18 && < 5,
     bytestring  >= 0.10 && < 0.13,
@@ -137,6 +138,7 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Protocol.GossipSub.TypesSpec
     Test.Network.LibP2P.Protocol.GossipSub.MessageSpec
     Test.Network.LibP2P.Protocol.GossipSub.RouterSpec
+    Test.Network.LibP2P.Protocol.GossipSub.ScoreSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,

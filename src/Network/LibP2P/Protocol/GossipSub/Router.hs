@@ -24,7 +24,7 @@ module Network.LibP2P.Protocol.GossipSub.Router
   , handleSubscriptions
     -- * Message forwarding
   , forwardMessage
-    -- * Scoring stub (replaced in Phase 9b)
+    -- * Scoring
   , peerScore
   ) where
 
@@ -43,6 +43,7 @@ import Network.LibP2P.Crypto.Key (KeyPair (..), sign)
 import Network.LibP2P.Crypto.Protobuf (encodePublicKey)
 import Network.LibP2P.Protocol.GossipSub.Types
 import Network.LibP2P.Protocol.GossipSub.Message (encodePubSubMessageBS)
+import Network.LibP2P.Protocol.GossipSub.Score (computeScore, addP7Penalty, recordMeshFailure)
 
 -- | Create a new GossipSub router with empty state.
 newRouter :: GossipSubParams
@@ -57,6 +58,7 @@ newRouter params localPid sendRPC getTime = do
   peers    <- newTVarIO Map.empty
   seen     <- newTVarIO Map.empty
   backoff  <- newTVarIO Map.empty
+  ipCount  <- newTVarIO Map.empty
   onMsg    <- newTVarIO (\_ _ -> pure ())
   pure GossipSubRouter
     { gsParams      = params
@@ -67,6 +69,9 @@ newRouter params localPid sendRPC getTime = do
     , gsPeers       = peers
     , gsSeen        = seen
     , gsBackoff     = backoff
+    , gsScoreParams = defaultPeerScoreParams
+    , gsThresholds  = defaultScoreThresholds
+    , gsIPPeerCount = ipCount
     , gsSendRPC     = sendRPC
     , gsGetTime     = getTime
     , gsOnMessage   = onMsg
@@ -79,10 +84,14 @@ addPeer :: GossipSubRouter -> PeerId -> PeerProtocol -> Bool -> UTCTime -> IO ()
 addPeer router pid proto isOutbound now = atomically $
   modifyTVar' (gsPeers router) $
     Map.insert pid PeerState
-      { psProtocol    = proto
-      , psTopics      = Set.empty
-      , psIsOutbound  = isOutbound
-      , psConnectedAt = now
+      { psProtocol        = proto
+      , psTopics          = Set.empty
+      , psIsOutbound      = isOutbound
+      , psConnectedAt     = now
+      , psTopicState      = Map.empty
+      , psBehaviorPenalty = 0
+      , psIPAddress       = Nothing
+      , psCachedScore     = 0
       }
 
 -- | Remove a disconnected peer and clean up mesh/fanout membership.
@@ -306,6 +315,9 @@ handleOneGraft router sender now (Graft topic) = do
 
       if inBackoff
         then do
+          -- P7 penalty: GRAFT during backoff is a protocol violation
+          atomically $ modifyTVar' (gsPeers router) $
+            Map.adjust addP7Penalty sender
           let backoffSecs = round (paramPruneBackoff (gsParams router)) :: Word64
           pure [Prune topic [] (Just backoffSecs)]
         else if score < 0
@@ -325,6 +337,16 @@ handlePrune router sender prunes = do
 handleOnePrune :: GossipSubRouter -> PeerId -> UTCTime -> Prune -> IO ()
 handleOnePrune router sender now prune = do
   let topic = pruneTopic prune
+  -- Record P3b mesh failure: snapshot delivery deficit before removing
+  let scoreParams = gsScoreParams router
+  case Map.lookup topic (pspTopicParams scoreParams) of
+    Just tsp -> atomically $ modifyTVar' (gsPeers router) $
+      Map.adjust (\ps ->
+        let topicSt = Map.findWithDefault defaultTopicPeerState topic (psTopicState ps)
+            topicSt' = recordMeshFailure tsp topicSt
+        in ps { psTopicState = Map.insert topic topicSt' (psTopicState ps) }
+      ) sender
+    Nothing -> pure ()
   -- Remove sender from mesh
   atomically $ modifyTVar' (gsMesh router) $
     Map.adjust (Set.delete sender) topic
@@ -378,12 +400,18 @@ forwardMessage router sender msg = do
       fwdRPC = emptyRPC { rpcPublish = [msg] }
   mapM_ (\pid -> gsSendRPC router pid fwdRPC) (Set.toList targets)
 
--- Scoring stub
+-- Scoring
 
--- | Peer score (stub: returns 0 for all peers in Phase 9a).
--- Replaced with real scoring in Phase 9b.
+-- | Compute peer score using Score.computeScore (P1-P4, P6, P7).
+-- P5 (application-specific) is not included here.
 peerScore :: GossipSubRouter -> PeerId -> IO Double
-peerScore _router _pid = pure 0
+peerScore router pid = do
+  peers <- readTVarIO (gsPeers router)
+  now <- gsGetTime router
+  ipMap <- readTVarIO (gsIPPeerCount router)
+  case Map.lookup pid peers of
+    Nothing -> pure 0
+    Just ps -> pure $ computeScore (gsScoreParams router) ps ipMap now
 
 -- Helper: construct a GRAFT RPC
 graftRPC :: Topic -> RPC
