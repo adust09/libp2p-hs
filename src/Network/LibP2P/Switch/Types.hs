@@ -14,8 +14,10 @@ module Network.LibP2P.Switch.Types
   , DialError (..)
   , BackoffEntry (..)
   , ResourceError (..)
+  , ActiveListener (..)
   ) where
 
+import Control.Concurrent.Async (Async)
 import Control.Concurrent.STM (TChan, TMVar, TVar)
 import Data.Map.Strict (Map)
 import Data.Time.Clock (UTCTime)
@@ -25,7 +27,7 @@ import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
 import Network.LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO)
 import Network.LibP2P.Protocol.Identify.Message (IdentifyInfo)
 import Network.LibP2P.Switch.ResourceManager (Direction (..), ResourceError (..), ResourceManager)
-import Network.LibP2P.Transport.Transport (Transport)
+import Network.LibP2P.Transport.Transport (Listener, Transport)
 
 -- | Connection state machine (docs/08-switch.md §Connection States).
 --
@@ -90,6 +92,13 @@ data BackoffEntry = BackoffEntry
   , beAttempts :: !Int      -- ^ Number of consecutive failures (for exponential calc)
   } deriving (Show, Eq)
 
+-- | An active listener bound to an address with its accept loop thread.
+data ActiveListener = ActiveListener
+  { alListener   :: !Listener      -- ^ The transport listener (accept, close)
+  , alAcceptLoop :: !(Async ())    -- ^ Background thread accepting connections
+  , alAddress    :: !Multiaddr     -- ^ Actual bound address (port 0 resolved)
+  }
+
 -- | The Switch: central coordinator of the libp2p networking stack.
 --
 -- Manages transports, connection pool, protocol handlers, and events.
@@ -107,4 +116,5 @@ data Switch = Switch
   , swResourceMgr  :: !ResourceManager                                   -- ^ Hierarchical resource manager
   , swPeerStore    :: !(TVar (Map PeerId IdentifyInfo))                  -- ^ Identify info per peer
   , swNotifiers    :: !(TVar [Connection -> IO ()])                      -- ^ Callbacks on new connection
+  , swListeners    :: !(TVar [ActiveListener])                           -- ^ Active listeners
   }

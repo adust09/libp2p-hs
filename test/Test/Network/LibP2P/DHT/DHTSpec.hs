@@ -54,6 +54,7 @@ mkMockSwitch pid = do
   resMgr <- mkMockResourceMgr
   peerStore <- newTVarIO Map.empty
   notifiers <- newTVarIO []
+  listeners <- newTVarIO []
   pure Switch
     { swLocalPeerId  = pid
     , swIdentityKey  = dummyKeyPair
@@ -67,6 +68,7 @@ mkMockSwitch pid = do
     , swResourceMgr  = resMgr
     , swPeerStore    = peerStore
     , swNotifiers    = notifiers
+    , swListeners    = listeners
     }
 
 -- | Create a mock resource manager with no limits (tests don't need resource enforcement).
