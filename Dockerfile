@@ -2,22 +2,21 @@
 # Used by the libp2p/test-plans multidim-interop framework.
 
 # Stage 1: Build with GHC 9.10
-FROM haskell:9.10.1-slim AS builder
+FROM haskell:9.10-slim-bookworm AS builder
 
 WORKDIR /app
 
-# Copy dependency files first for layer caching
+# Copy all source files needed for building
 COPY libp2p-hs.cabal cabal.project ./
-
-# Fetch and build dependencies (cached unless .cabal changes)
-RUN cabal update && cabal build --only-dependencies libp2p-interop
-
-# Copy source code
 COPY src/ src/
 COPY interop/ interop/
 
+# Fix ppad-sha256 ARM SHA2 intrinsic compilation on Docker (GCC 12)
+RUN echo 'package ppad-sha256' >> cabal.project && \
+    echo '  ghc-options: -optc-march=armv8-a+crypto' >> cabal.project
+
 # Build the interop executable
-RUN cabal build libp2p-interop \
+RUN cabal update && cabal build libp2p-interop \
     && cp "$(cabal list-bin libp2p-interop)" /app/libp2p-interop \
     && strip /app/libp2p-interop
 

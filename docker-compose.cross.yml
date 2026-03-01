@@ -1,5 +1,8 @@
 # Cross-implementation interop test: libp2p-hs <-> go-libp2p.
 #
+# Prerequisites:
+#   git clone https://github.com/libp2p/go-libp2p.git go-libp2p
+#
 # Test 1: go-libp2p listener, libp2p-hs dialer
 #   docker compose -f docker-compose.cross.yml up --build go-listener hs-dialer redis --abort-on-container-exit
 #
@@ -13,7 +16,9 @@ services:
 
   # --- Test 1: go listener, hs dialer ---
   go-listener:
-    image: ghcr.io/libp2p/test-plan-transport-interop:master
+    build:
+      context: ./go-libp2p
+      dockerfile: test-plans/PingDockerfile
     depends_on:
       - redis
     environment:
@@ -51,7 +56,9 @@ services:
       test_timeout_seconds: "180"
 
   go-dialer:
-    image: ghcr.io/libp2p/test-plan-transport-interop:master
+    build:
+      context: ./go-libp2p
+      dockerfile: test-plans/PingDockerfile
     depends_on:
       - redis
       - hs-listener
