@@ -109,16 +109,20 @@ performInitiatorHandshake identityKP stream = do
   (hsState0, noiseStaticPub) <- initHandshakeInitiator identityKP
 
   -- Message 1: → (empty payload)
-  let Right (msg1, hsState1) = writeHandshakeMsg hsState0 BS.empty
+  (msg1, hsState1) <- either (fail . ("initiator msg1 write: " <>)) pure $
+    writeHandshakeMsg hsState0 BS.empty
   writeFramedMessage stream msg1
 
   -- Message 2: ← (responder's identity payload)
   msg2 <- readFramedMessage stream
-  let Right (payload2, hsState2) = readHandshakeMsg hsState1 msg2
+  (payload2, hsState2) <- either (fail . ("initiator msg2 read: " <>)) pure $
+    readHandshakeMsg hsState1 msg2
 
   -- Decode responder's identity
-  let Right remoteNP = decodeNoisePayload payload2
-  let Right remotePubKey = Proto.decodePublicKey (HS.npIdentityKey remoteNP)
+  remoteNP <- either (fail . ("initiator decode payload: " <>)) pure $
+    decodeNoisePayload payload2
+  remotePubKey <- either (fail . ("initiator decode pubkey: " <>)) pure $
+    Proto.decodePublicKey (HS.npIdentityKey remoteNP)
   let remotePeerId = fromPublicKey remotePubKey
 
   -- Verify identity_sig: binds identity key to Noise static key
@@ -131,7 +135,8 @@ performInitiatorHandshake identityKP stream = do
 
   -- Message 3: → (initiator's identity payload)
   let identPayload = encodeNoisePayload $ buildHandshakePayload identityKP noiseStaticPub
-  let Right (msg3, hsStateFinal) = writeHandshakeMsg hsState2 identPayload
+  (msg3, hsStateFinal) <- either (fail . ("initiator msg3 write: " <>)) pure $
+    writeHandshakeMsg hsState2 identPayload
   writeFramedMessage stream msg3
 
   let noiseSession = mkNoiseSession (HS.hsNoiseState hsStateFinal)
@@ -144,20 +149,25 @@ performResponderHandshake identityKP stream = do
 
   -- Message 1: ← (empty payload)
   msg1 <- readFramedMessage stream
-  let Right (_payload1, hsState1) = readHandshakeMsg hsState0 msg1
+  (_payload1, hsState1) <- either (fail . ("responder msg1 read: " <>)) pure $
+    readHandshakeMsg hsState0 msg1
 
   -- Message 2: → (responder's identity payload)
   let identPayload = encodeNoisePayload $ buildHandshakePayload identityKP noiseStaticPub
-  let Right (msg2, hsState2) = writeHandshakeMsg hsState1 identPayload
+  (msg2, hsState2) <- either (fail . ("responder msg2 write: " <>)) pure $
+    writeHandshakeMsg hsState1 identPayload
   writeFramedMessage stream msg2
 
   -- Message 3: ← (initiator's identity payload)
   msg3 <- readFramedMessage stream
-  let Right (payload3, hsStateFinal) = readHandshakeMsg hsState2 msg3
+  (payload3, hsStateFinal) <- either (fail . ("responder msg3 read: " <>)) pure $
+    readHandshakeMsg hsState2 msg3
 
   -- Decode initiator's identity
-  let Right remoteNP = decodeNoisePayload payload3
-  let Right remotePubKey = Proto.decodePublicKey (HS.npIdentityKey remoteNP)
+  remoteNP <- either (fail . ("responder decode payload: " <>)) pure $
+    decodeNoisePayload payload3
+  remotePubKey <- either (fail . ("responder decode pubkey: " <>)) pure $
+    Proto.decodePublicKey (HS.npIdentityKey remoteNP)
   let remotePeerId = fromPublicKey remotePubKey
 
   -- Verify identity_sig: binds identity key to Noise static key
@@ -233,11 +243,15 @@ yamuxToMuxerSession yamuxSess = do
   _ <- async (recvLoop yamuxSess)
   pure MuxerSession
     { muxOpenStream = do
-        Right stream <- Yamux.openStream yamuxSess
-        yamuxStreamToStreamIO stream
+        result <- Yamux.openStream yamuxSess
+        case result of
+          Right stream -> yamuxStreamToStreamIO stream
+          Left err -> fail $ "muxOpenStream: " <> show err
     , muxAcceptStream = do
-        Right stream <- Yamux.acceptStream yamuxSess
-        yamuxStreamToStreamIO stream
+        result <- Yamux.acceptStream yamuxSess
+        case result of
+          Right stream -> yamuxStreamToStreamIO stream
+          Left err -> fail $ "muxAcceptStream: " <> show err
     , muxClose = closeSession yamuxSess
     }
 
@@ -249,18 +263,23 @@ yamuxStreamToStreamIO yamuxStream = do
   readBuf <- newIORef BS.empty
   pure StreamIO
     { streamWrite = \bs -> do
-        Right () <- YS.streamWrite yamuxStream bs
-        pure ()
+        result <- YS.streamWrite yamuxStream bs
+        case result of
+          Right () -> pure ()
+          Left err -> fail $ "yamuxStreamWrite: " <> show err
     , streamReadByte = do
         buf <- readIORef readBuf
         if BS.null buf
           then do
-            Right chunk <- streamRead yamuxStream
-            if BS.length chunk <= 1
-              then pure (BS.head chunk)
-              else do
-                writeIORef readBuf (BS.tail chunk)
-                pure (BS.head chunk)
+            result <- streamRead yamuxStream
+            case result of
+              Left err -> fail $ "yamuxStreamRead: " <> show err
+              Right chunk
+                | BS.null chunk -> fail "yamuxStreamRead: empty chunk"
+                | BS.length chunk == 1 -> pure (BS.head chunk)
+                | otherwise -> do
+                    writeIORef readBuf (BS.tail chunk)
+                    pure (BS.head chunk)
           else do
             writeIORef readBuf (BS.tail buf)
             pure (BS.head buf)
@@ -276,7 +295,10 @@ upgradeOutbound identityKP rawConn = do
   let rawIO = rcStreamIO rawConn
 
   -- Step 1: multistream-select → "/noise"
-  Accepted _ <- negotiateInitiator rawIO ["/noise"]
+  secResult <- negotiateInitiator rawIO ["/noise"]
+  case secResult of
+    Accepted _ -> pure ()
+    NoProtocol -> fail "upgradeOutbound: /noise negotiation failed"
 
   -- Step 2: Noise XX handshake (initiator)
   (noiseSess, HandshakeResult remotePeerId _remotePK) <-
@@ -289,7 +311,10 @@ upgradeOutbound identityKP rawConn = do
   let encryptedIO = noiseSessionToStreamIO sendRef recvRef bufRef rawIO
 
   -- Step 4: multistream-select → "/yamux/1.0.0" (over encrypted channel)
-  Accepted _ <- negotiateInitiator encryptedIO ["/yamux/1.0.0"]
+  muxResult <- negotiateInitiator encryptedIO ["/yamux/1.0.0"]
+  case muxResult of
+    Accepted _ -> pure ()
+    NoProtocol -> fail "upgradeOutbound: /yamux/1.0.0 negotiation failed"
 
   -- Step 5: Initialize Yamux session (client = odd IDs)
   let yamuxWrite = streamWrite encryptedIO
@@ -317,7 +342,10 @@ upgradeInbound identityKP rawConn = do
   let rawIO = rcStreamIO rawConn
 
   -- Step 1: multistream-select → "/noise"
-  Accepted _ <- negotiateResponder rawIO ["/noise"]
+  secResult <- negotiateResponder rawIO ["/noise"]
+  case secResult of
+    Accepted _ -> pure ()
+    NoProtocol -> fail "upgradeInbound: /noise negotiation failed"
 
   -- Step 2: Noise XX handshake (responder)
   (noiseSess, HandshakeResult remotePeerId _remotePK) <-
@@ -330,7 +358,10 @@ upgradeInbound identityKP rawConn = do
   let encryptedIO = noiseSessionToStreamIO sendRef recvRef bufRef rawIO
 
   -- Step 4: multistream-select → "/yamux/1.0.0" (over encrypted channel)
-  Accepted _ <- negotiateResponder encryptedIO ["/yamux/1.0.0"]
+  muxResult <- negotiateResponder encryptedIO ["/yamux/1.0.0"]
+  case muxResult of
+    Accepted _ -> pure ()
+    NoProtocol -> fail "upgradeInbound: /yamux/1.0.0 negotiation failed"
 
   -- Step 5: Initialize Yamux session (server = even IDs)
   let yamuxWrite = streamWrite encryptedIO
