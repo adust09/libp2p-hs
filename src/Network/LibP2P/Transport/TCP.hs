@@ -119,6 +119,7 @@ socketToStreamIO sock = StreamIO
       if BS.null bs
         then fail "socketToStreamIO: connection closed"
         else pure (BS.head bs)
+  , streamClose = NS.close sock
   }
 
 -- | Convert a SockAddr to a Multiaddr.

@@ -22,6 +22,7 @@ mockStreamIO :: StreamIO
 mockStreamIO = StreamIO
   { streamWrite    = \_ -> pure ()
   , streamReadByte = pure 0
+  , streamClose    = pure ()
   }
 
 -- | Create a mock connection with the given PeerId and direction.

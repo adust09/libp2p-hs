@@ -185,6 +185,7 @@ noiseSessionToStreamIO
 noiseSessionToStreamIO sendRef recvRef bufRef rawIO = StreamIO
   { streamWrite = encryptAndWrite sendRef rawIO
   , streamReadByte = decryptAndReadByte recvRef bufRef rawIO
+  , streamClose = pure ()  -- Encryption layer does not own the connection
   }
 
 -- | Encrypt plaintext and write as a framed Noise message.
@@ -263,6 +264,9 @@ yamuxStreamToStreamIO yamuxStream = do
           else do
             writeIORef readBuf (BS.tail buf)
             pure (BS.head buf)
+    , streamClose = do
+        _ <- YS.streamClose yamuxStream  -- Sends FIN flag
+        pure ()
     }
 
 -- | Upgrade an outbound (dialer) raw connection.
