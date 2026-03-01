@@ -232,6 +232,25 @@ spec = do
         stClient <- readTVarIO (ysState clientStream)
         stClient `shouldBe` StreamClosed
 
+  describe "Flow control: window underflow protection" $ do
+    it "payload exceeding recv window triggers GoAway protocol error" $ do
+      withSessionPair $ \(client, server) -> do
+        (clientStream, serverStream) <-
+          concurrently
+            (openStream client >>= \(Right s) -> pure s)
+            (acceptStream server >>= \(Right s) -> pure s)
+        atomically $ do
+          st <- readTVar (ysState clientStream)
+          check (st == StreamEstablished)
+        -- Shrink server recv window to 10 bytes (simulating near-exhaustion)
+        atomically $ writeTVar (ysRecvWindow serverStream) 10
+        -- Client sends 100 bytes (exceeds server's 10-byte window)
+        _ <- streamWrite clientStream (BS.replicate 100 0xAA)
+        -- Server should detect over-window and enter shutdown
+        atomically $ do
+          shut <- readTVar (ysShutdown server)
+          check shut
+
   describe "Flow control integration" $ do
     it "transfer data exceeding initial window (requires WindowUpdate exchange)" $ do
       withSessionPair $ \(client, server) -> do
