@@ -71,6 +71,35 @@ spec = do
               Right (SHA256, digest) -> BS.length digest === 32
               other -> counterexample (show other) False
 
+  describe "validateMultihash" $ do
+    it "accepts valid Identity multihash (≤42 bytes digest)" $ do
+      let mh = BS.pack [0x00, 0x03, 0xAA, 0xBB, 0xCC]
+      validateMultihash mh `shouldBe` Right (Identity, BS.pack [0xAA, 0xBB, 0xCC])
+
+    it "accepts valid SHA-256 multihash (32-byte digest)" $ do
+      let digest = BS.replicate 32 0x42
+      let mh = BS.pack [0x12, 0x20] <> digest
+      validateMultihash mh `shouldBe` Right (SHA256, digest)
+
+    it "rejects SHA-256 with wrong digest length" $ do
+      -- SHA-256 claims 16 bytes instead of 32
+      let mh = BS.pack [0x12, 0x10] <> BS.replicate 16 0x42
+      validateMultihash mh `shouldSatisfy` isLeft
+
+    it "rejects Identity multihash with digest > 42 bytes" $ do
+      let mh = BS.pack [0x00, 0x2B] <> BS.replicate 43 0x42  -- 43 bytes
+      validateMultihash mh `shouldSatisfy` isLeft
+
+    it "rejects multihash with trailing bytes" $ do
+      -- Valid SHA-256 multihash + extra byte
+      let digest = BS.replicate 32 0x42
+      let mh = BS.pack [0x12, 0x20] <> digest <> BS.singleton 0xFF
+      validateMultihash mh `shouldSatisfy` isLeft
+
+    it "rejects unknown hash code" $ do
+      let mh = BS.pack [0xFF, 0x01, 0x42]
+      validateMultihash mh `shouldSatisfy` isLeft
+
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
 isLeft _ = False

@@ -173,6 +173,7 @@ test-suite libp2p-hs-test
     stm        >= 2.4 && < 2.6,
     containers >= 0.6 && < 0.8,
     crypton    >= 1.0  && < 1.1,
+    ppad-base58 >= 0.2 && < 0.3,
     hspec      >= 2.11 && < 2.12,
     QuickCheck >= 2.14 && < 2.16
   build-tool-depends:

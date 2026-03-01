@@ -2,6 +2,7 @@ module Test.Network.LibP2P.Multiaddr.MultiaddrSpec (spec) where
 
 import qualified Data.ByteString as BS
 import Data.Text (Text)
+import Network.LibP2P.Core.Varint (encodeUvarint)
 import Network.LibP2P.Crypto.PeerId (PeerId (..))
 import Network.LibP2P.Multiaddr.Codec
 import Network.LibP2P.Multiaddr.Multiaddr
@@ -180,6 +181,20 @@ spec = do
         Nothing -> expectationFailure "splitP2P returned Nothing"
         Just (transport, PeerId mhBytes) ->
           encapsulate transport (Multiaddr [P2P mhBytes]) `shouldBe` original
+
+  describe "P2P validation" $ do
+    it "text /p2p/INVALID rejects non-base58 input" $ do
+      textToProtocols "/p2p/INVALID!!!" `shouldSatisfy` isLeft
+
+    it "text /p2p/ with invalid multihash rejects" $ do
+      -- base58-encode bytes that aren't a valid multihash
+      textToProtocols "/p2p/1111" `shouldSatisfy` isLeft
+
+    it "binary P2P with invalid multihash rejects" $ do
+      -- Protocol code 421 = P2P, followed by invalid multihash bytes
+      let invalidMh = BS.pack [0xDE, 0xAD]  -- unknown hash code 0xDE
+      let encoded = encodeUvarint 421 <> encodeUvarint (fromIntegral (BS.length invalidMh)) <> invalidMh
+      decodeProtocols encoded `shouldSatisfy` isLeft
 
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
