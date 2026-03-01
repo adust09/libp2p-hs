@@ -48,8 +48,9 @@ import Network.LibP2P.Switch.Listen (streamAcceptLoop)
 import Network.LibP2P.Switch.ResourceManager (Direction (..), releaseConnection, reserveConnection)
 import Network.LibP2P.Switch.Types
   ( BackoffEntry (..)
-  , Connection
+  , Connection (..)
   , DialError (..)
+  , MuxerSession (..)
   , Switch (..)
   )
 import Network.LibP2P.Switch.Upgrade (upgradeOutbound)
@@ -180,14 +181,20 @@ dialNewAndBroadcast sw remotePeerId addrs tmvar = do
       pure result
     Right () -> do
       result <- dialNewInner sw addrs
-      -- Broadcast result to any waiting threads
-      atomically $ putTMVar tmvar result
+      -- Verify remote PeerId matches expected target before broadcasting
+      let verified = case result of
+            Right conn
+              | connPeerId conn /= remotePeerId ->
+                  Left (DialPeerIdMismatch remotePeerId (connPeerId conn))
+            _ -> result
+      -- Broadcast verified result to any waiting threads
+      atomically $ putTMVar tmvar verified
       -- Clean up pending dials map
       atomically $ do
         pending <- readTVar (swPendingDials sw)
         writeTVar (swPendingDials sw) (Map.delete remotePeerId pending)
       -- Record backoff on failure, clear on success, add to pool
-      case result of
+      case verified of
         Right conn -> do
           clearBackoff (swDialBackoffs sw) remotePeerId
           atomically $ addConn (swConnPool sw) conn
@@ -198,10 +205,14 @@ dialNewAndBroadcast sw remotePeerId addrs tmvar = do
           mapM_ (\f -> async $ f conn) notifiers
           pure (Right conn)
         Left _ -> do
+          -- Close the muxer session on PeerId mismatch
+          case result of
+            Right conn -> muxClose (connSession conn)
+            Left _     -> pure ()
           -- Release the reserved connection since dial failed
           atomically $ releaseConnection (swResourceMgr sw) remotePeerId Outbound
           recordBackoff (swDialBackoffs sw) remotePeerId
-          pure result
+          pure verified
 
 -- | Inner dial logic: transport selection and staggered parallel dial.
 dialNewInner :: Switch -> [Multiaddr] -> IO (Either DialError Connection)

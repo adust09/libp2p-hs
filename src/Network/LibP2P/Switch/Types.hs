@@ -81,6 +81,7 @@ data DialError
   | DialUpgradeFailed !String -- ^ Connection upgrade pipeline failed
   | DialSwitchClosed          -- ^ Switch has been shut down
   | DialResourceLimit !ResourceError  -- ^ Resource limit exceeded
+  | DialPeerIdMismatch !PeerId !PeerId  -- ^ Expected vs actual remote PeerId
   deriving (Show, Eq)
 
 -- | Per-peer dial backoff state (docs/08-switch.md §Dial Backoff).
