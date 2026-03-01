@@ -23,6 +23,8 @@ module Network.LibP2P.Security.Noise.Handshake
   , writeHandshakeMsg
   , readHandshakeMsg
   , sessionComplete
+    -- * Remote static key extraction
+  , getRemoteNoiseStaticKey
     -- * Convenience
   , performFullHandshake
   , performFullHandshakeWithSessions
@@ -39,6 +41,7 @@ import Crypto.Noise
   , handshakeComplete
   , noiseState
   , readMessage
+  , remoteStaticKey
   , setLocalEphemeral
   , setLocalStatic
   , writeMessage
@@ -200,6 +203,13 @@ readHandshakeMsg hs ciphertext =
           Left $ "readHandshakeMsg: " <> show ex
         NoiseResultNeedPSK _ ->
           Left "readHandshakeMsg: unexpected PSK request"
+
+-- | Extract the remote party's Noise static public key from the handshake state.
+-- Returns Just after the remote static key has been transmitted (msg2 for initiator,
+-- msg3 for responder in XX pattern).
+getRemoteNoiseStaticKey :: HandshakeState -> Maybe ByteString
+getRemoteNoiseStaticKey hs =
+  convert . dhPubToBytes <$> remoteStaticKey (hsNoiseState hs)
 
 -- | Check whether the handshake is complete.
 sessionComplete :: HandshakeState -> Bool

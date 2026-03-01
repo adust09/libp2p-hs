@@ -147,36 +147,68 @@ spec = do
           -- Bob sees Alice's PeerId
           bobRemotePeerId `shouldBe` alicePeerId
 
-    it "fails with forged identity signature" $ do
+    it "replayed identity payload is detected by verifyStaticKey (MitM scenario)" $ do
+      -- Scenario: Eve intercepts and runs her own Noise session with Alice,
+      -- but sends Bob's identity payload (key + signature). The signature was
+      -- over Bob's Noise static key, not Eve's, so verification fails.
       Right aliceIdentity <- generateKeyPair
       Right bobIdentity <- generateKeyPair
-      Right eveIdentity <- generateKeyPair
 
       (aliceInit, _aliceNoiseStaticPub) <- initHandshakeInitiator aliceIdentity
-      (bobInit, _bobNoiseStaticPub) <- initHandshakeResponder bobIdentity
+      -- Eve runs her own Noise session (different Noise keys than Bob)
+      (eveInit, _eveNoiseStaticPub) <- initHandshakeResponder bobIdentity
+
+      -- Bob's payload signed over a DIFFERENT Noise static key (not the one in this session)
+      -- Simulate: Bob pre-signed his identity for a different Noise session
+      let bobOtherNoiseKey = BS.replicate 32 0xBB  -- arbitrary, not the actual session key
+      let replayedPayload = encodeNoisePayload $ buildHandshakePayload bobIdentity bobOtherNoiseKey
 
       -- Message 1 (normal)
       (msg1, aliceState1) <- either fail pure $ writeHandshakeMsg aliceInit BS.empty
+      (_payload1, eveState1) <- either fail pure $ readHandshakeMsg eveInit msg1
+
+      -- Message 2: Eve sends Bob's identity payload (replay attack)
+      (msg2, _eveState2) <- either fail pure $ writeHandshakeMsg eveState1 replayedPayload
+      (payload2, aliceState2) <- either fail pure $ readHandshakeMsg aliceState1 msg2
+
+      -- Alice decodes payload (valid protobuf, Bob's key)
+      let Right remoteNP = decodeNoisePayload payload2
+      let Right remotePubKey = decodePublicKey (npIdentityKey remoteNP)
+
+      -- Alice extracts the ACTUAL Noise static key from the handshake state
+      case getRemoteNoiseStaticKey aliceState2 of
+        Nothing -> expectationFailure "expected remote Noise static key"
+        Just remoteNoisePub -> do
+          -- Verification MUST fail: Bob's signature was over bobOtherNoiseKey,
+          -- but the actual Noise static key is Eve's
+          verifyStaticKey remotePubKey remoteNoisePub (npIdentitySig remoteNP)
+            `shouldBe` False
+
+    it "valid identity signature passes verifyStaticKey" $ do
+      Right aliceIdentity <- generateKeyPair
+      Right bobIdentity <- generateKeyPair
+
+      (aliceInit, _aliceNoiseStaticPub) <- initHandshakeInitiator aliceIdentity
+      (bobInit, bobNoiseStaticPub) <- initHandshakeResponder bobIdentity
+
+      -- Normal 3-message handshake
+      (msg1, aliceState1) <- either fail pure $ writeHandshakeMsg aliceInit BS.empty
       (_payload1, bobState1) <- either fail pure $ readHandshakeMsg bobInit msg1
 
-      -- Message 2: Bob sends payload with Eve's identity key (forgery attempt)
-      -- Use Eve's identity to sign Bob's noise static key → signature won't match
-      -- when verified against Eve's key + the actual Noise static key from handshake
-      (bobInit2, bobNoiseStaticPub2) <- initHandshakeResponder eveIdentity
-      -- Can't forge because the Noise static key is bound to the handshake state
-      -- The signature must be over the REAL noise static key, not arbitrary bytes
-      let forgedPayload = encodeNoisePayload $ buildHandshakePayload eveIdentity bobNoiseStaticPub2
-      (msg2, _bobState2) <- either fail pure $ writeHandshakeMsg bobState1 forgedPayload
-      (payload2, _aliceState2) <- either fail pure $ readHandshakeMsg aliceState1 msg2
+      let bobPayload = encodeNoisePayload $ buildHandshakePayload bobIdentity bobNoiseStaticPub
+      (msg2, _bobState2) <- either fail pure $ writeHandshakeMsg bobState1 bobPayload
+      (payload2, aliceState2) <- either fail pure $ readHandshakeMsg aliceState1 msg2
 
-      -- Alice decodes the payload and verifies the signature
-      case decodeNoisePayload payload2 >>= validateHandshakePayload of
-        Left _ -> pure () -- Expected: signature verification should fail
-        Right _ -> do
-          -- Even if decoding succeeds, the Noise static key in the payload
-          -- won't match the one from the handshake, so the caller should
-          -- verify this externally. This test validates payload decode works.
-          pure ()
+      -- Alice decodes Bob's legitimate payload
+      let Right remoteNP = decodeNoisePayload payload2
+      let Right remotePubKey = decodePublicKey (npIdentityKey remoteNP)
+
+      -- Verification MUST pass: Bob signed his own Noise static key
+      case getRemoteNoiseStaticKey aliceState2 of
+        Nothing -> expectationFailure "expected remote Noise static key"
+        Just remoteNoisePub ->
+          verifyStaticKey remotePubKey remoteNoisePub (npIdentitySig remoteNP)
+            `shouldBe` True
 
     it "post-handshake encrypted transport works" $ do
       Right aliceIdentity <- generateKeyPair
