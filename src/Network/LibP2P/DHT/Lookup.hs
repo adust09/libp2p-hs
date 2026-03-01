@@ -20,14 +20,13 @@ import Control.Concurrent.Async (mapConcurrently)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Time (UTCTime, getCurrentTime)
-import Network.LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
-import Network.LibP2P.DHT.DHT (DHTNode (..), ProviderEntry (..), Validator (..), storeRecord)
+import Network.LibP2P.Crypto.PeerId (PeerId (..))
+import Network.LibP2P.DHT.DHT (DHTNode (..), ProviderEntry (..), Validator (..))
 import Network.LibP2P.DHT.Distance (peerIdToKey, xorDistance, sortByDistance)
 import Network.LibP2P.DHT.Message
 import Network.LibP2P.DHT.RoutingTable (RoutingTable, closestPeers, insertPeer, allPeers)
