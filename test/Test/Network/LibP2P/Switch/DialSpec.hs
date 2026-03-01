@@ -291,6 +291,23 @@ spec = do
       backoffResult <- checkBackoff (swDialBackoffs sw) remotePid
       backoffResult `shouldBe` Left DialBackoff
 
+    it "returns DialPeerIdMismatch when remote identity differs from target" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _remoteKP) <- mkTestIdentity
+      -- Eve's key: the actual responder identity (different from remotePid)
+      (_evePid, eveKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      -- Transport uses Eve's key, but we dial expecting remotePid
+      transport <- mkMockDialTransport eveKP
+      addTransport sw transport
+      result <- dial sw remotePid [testAddr]
+      case result of
+        Left (DialPeerIdMismatch expected actual) -> do
+          expected `shouldBe` remotePid
+          actual `shouldNotBe` remotePid
+        Left err -> expectationFailure $ "expected DialPeerIdMismatch, got: " <> show err
+        Right _ -> expectationFailure "expected DialPeerIdMismatch, got Right"
+
     it "concurrent dials to same peer share a single dial operation" $ do
       (localPid, localKP) <- mkTestIdentity
       (_remotePid, remoteKP) <- mkTestIdentity
