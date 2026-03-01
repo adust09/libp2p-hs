@@ -32,8 +32,8 @@ import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
-import Data.Time (UTCTime)
-import Network.LibP2P.Crypto.PeerId (PeerId, peerIdBytes)
+import Data.Time (UTCTime, getCurrentTime)
+import Network.LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import Network.LibP2P.DHT.Distance (peerIdToKey)
 import Network.LibP2P.DHT.Message
 import Network.LibP2P.DHT.RoutingTable (RoutingTable, closestPeers, newRoutingTable)
@@ -163,15 +163,13 @@ handlePutValue node msg = do
 
 -- | ADD_PROVIDER: verify sender and store provider record.
 handleAddProvider :: DHTNode -> DHTMessage -> PeerId -> IO DHTMessage
-handleAddProvider _node msg remotePeerId = do
+handleAddProvider node msg remotePeerId = do
+  now <- getCurrentTime
   -- Verify that provider peers match sender's Peer ID
   let validProviders = filter (\p -> dhtPeerId p == peerIdBytes remotePeerId) (msgProviderPeers msg)
-  if null validProviders
-    then pure emptyDHTMessage { msgType = AddProvider }
-    else do
-      -- Store each valid provider (we only add if the sender's peer ID matches)
-      mapM_ (\_ -> pure ()) validProviders  -- provider storage done below
-      pure emptyDHTMessage { msgType = AddProvider }
+  -- Store each valid provider keyed by msgKey
+  mapM_ (\p -> addProvider node (msgKey msg) (dhtPeerToProvider p now)) validProviders
+  pure emptyDHTMessage { msgType = AddProvider }
 
 -- | GET_PROVIDERS: return stored providers + k closest peers.
 handleGetProviders :: DHTNode -> DHTMessage -> IO DHTMessage
@@ -220,6 +218,14 @@ entryToDHTPeer entry = DHTPeer
   { dhtPeerId = peerIdBytes (entryPeerId entry)
   , dhtPeerAddrs = []  -- addresses would be encoded multiaddrs
   , dhtPeerConnType = entryConnType entry
+  }
+
+-- | Convert a DHTPeer from ADD_PROVIDER into a ProviderEntry.
+dhtPeerToProvider :: DHTPeer -> UTCTime -> ProviderEntry
+dhtPeerToProvider peer now = ProviderEntry
+  { peProvider  = PeerId (dhtPeerId peer)
+  , peAddrs     = []  -- raw bytes in dhtPeerAddrs; address decoding is not yet wired
+  , peTimestamp = now
   }
 
 -- | Convert a ProviderEntry to a DHTPeer protobuf message.

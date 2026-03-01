@@ -13,7 +13,7 @@ import qualified Data.Map.Strict as Map
 import Data.Time (getCurrentTime)
 import Data.Word (Word8)
 import Network.LibP2P.Crypto.Key (KeyPair (..), PublicKey (..), PrivateKey (..), KeyType (..))
-import Network.LibP2P.Crypto.PeerId (PeerId (..))
+import Network.LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import Network.LibP2P.DHT.DHT
 import Network.LibP2P.DHT.Distance (peerIdToKey)
 import Network.LibP2P.DHT.Message
@@ -208,6 +208,68 @@ spec = do
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
         Right resp -> msgType resp `shouldBe` AddProvider
+        Left err -> expectationFailure $ "Failed: " ++ err
+
+      -- Mismatched provider must NOT be stored
+      stored <- getProviders node key
+      stored `shouldBe` []
+
+    it "ADD_PROVIDER with valid sender persists provider record" $ do
+      node <- mkTestNode localPid
+      let key = BS.pack [0xAA, 0xBB]
+          -- remotePid has raw bytes [1], so dhtPeerId must match
+          validPeer = DHTPeer (peerIdBytes remotePid) [] Connected
+
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage
+            { msgType = AddProvider
+            , msgKey = key
+            , msgProviderPeers = [validPeer]
+            }
+      writeFramedMessage clientStream request
+      handleDHTRequest node serverStream remotePid
+
+      result <- readFramedMessage clientStream maxDHTMessageSize
+      case result of
+        Right resp -> msgType resp `shouldBe` AddProvider
+        Left err -> expectationFailure $ "Failed: " ++ err
+
+      -- Provider should now be persisted
+      stored <- getProviders node key
+      length stored `shouldBe` 1
+      peProvider (head stored) `shouldBe` remotePid
+
+    it "ADD_PROVIDER round-trip via GET_PROVIDERS" $ do
+      node <- mkTestNode localPid
+      let key = BS.pack [0xCC, 0xDD]
+          validPeer = DHTPeer (peerIdBytes remotePid) [] Connected
+
+      -- Send ADD_PROVIDER
+      (clientStream1, serverStream1) <- mkStreamPair
+      let addReq = emptyDHTMessage
+            { msgType = AddProvider
+            , msgKey = key
+            , msgProviderPeers = [validPeer]
+            }
+      writeFramedMessage clientStream1 addReq
+      handleDHTRequest node serverStream1 remotePid
+      _ <- readFramedMessage clientStream1 maxDHTMessageSize
+
+      -- Send GET_PROVIDERS for the same key
+      (clientStream2, serverStream2) <- mkStreamPair
+      let getReq = emptyDHTMessage
+            { msgType = GetProviders
+            , msgKey = key
+            }
+      writeFramedMessage clientStream2 getReq
+      handleDHTRequest node serverStream2 remotePid
+
+      result <- readFramedMessage clientStream2 maxDHTMessageSize
+      case result of
+        Right resp -> do
+          msgType resp `shouldBe` GetProviders
+          length (msgProviderPeers resp) `shouldBe` 1
+          dhtPeerId (head (msgProviderPeers resp)) `shouldBe` peerIdBytes remotePid
         Left err -> expectationFailure $ "Failed: " ++ err
 
     it "registerDHTHandler registers protocol on Switch" $ do
