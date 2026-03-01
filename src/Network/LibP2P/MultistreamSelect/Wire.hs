@@ -44,7 +44,8 @@ decodeMessage bs = do
        in if BS.null payload || BS.last payload /= 0x0a
             then Left "decodeMessage: message does not end with newline"
             else
-              let text = TE.decodeUtf8 (BS.init payload)
-               in Right (text, rest2)
+              case TE.decodeUtf8' (BS.init payload) of
+                Left err -> Left $ "decodeMessage: invalid UTF-8: " <> show err
+                Right text -> Right (text, rest2)
   where
     -- BS.init is safe here because we checked non-null above

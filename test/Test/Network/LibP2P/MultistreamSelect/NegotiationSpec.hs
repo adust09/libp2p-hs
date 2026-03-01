@@ -84,6 +84,20 @@ spec = do
       initResult `shouldBe` Accepted "/yamux/1.0.0"
       respResult `shouldBe` Accepted "/yamux/1.0.0"
 
+  describe "Wire decoding safety" $ do
+    it "decodeMessage returns Left on invalid UTF-8 bytes" $ do
+      -- Construct a framed message with invalid UTF-8: 0xFF 0xFE followed by '\n'
+      let invalidUtf8 = BS.pack [0xFF, 0xFE, 0x0a]
+          -- varint length = 3, then payload
+          framed = BS.pack [0x03] <> invalidUtf8
+      decodeMessage framed `shouldSatisfy` isLeft
+
+    it "decodeMessage returns Left on truncated UTF-8 sequence" $ do
+      -- 0xC0 starts a 2-byte UTF-8 sequence but is followed by '\n' instead of continuation
+      let truncated = BS.pack [0xC0, 0x0a]
+          framed = BS.pack [0x02] <> truncated
+      decodeMessage framed `shouldSatisfy` isLeft
+
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
 isLeft _ = False
