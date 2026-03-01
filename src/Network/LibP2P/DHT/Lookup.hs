@@ -4,6 +4,9 @@
 -- per docs/09-dht.md. Uses STM for shared state and async for concurrent
 -- queries (alpha=10 parallelism).
 --
+-- Candidates are maintained as a list sorted by XOR distance to the
+-- target key, ensuring the closest peers are always queried first.
+--
 -- Bootstrap performs a self-lookup followed by per-bucket random refresh.
 module Network.LibP2P.DHT.Lookup
   ( -- * Lookup results
@@ -20,16 +23,14 @@ import Control.Concurrent.Async (mapConcurrently)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
 import Data.ByteString (ByteString)
-import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Time (UTCTime, getCurrentTime)
 import Network.LibP2P.Crypto.PeerId (PeerId (..))
 import Network.LibP2P.DHT.DHT (DHTNode (..), ProviderEntry (..), Validator (..))
-import Network.LibP2P.DHT.Distance (peerIdToKey, xorDistance, sortByDistance)
+import Network.LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
 import Network.LibP2P.DHT.Message
-import Network.LibP2P.DHT.RoutingTable (RoutingTable, closestPeers, insertPeer, allPeers)
+import Network.LibP2P.DHT.RoutingTable (closestPeers, insertPeer, allPeers)
 import Network.LibP2P.DHT.Types
 
 -- | Result of an iterative lookup.
@@ -52,30 +53,32 @@ iterativeFindNode node targetKey = do
   let seeds = closestPeers targetKey kValue rt
   now <- getCurrentTime
 
-  -- State: candidates sorted by distance, queried set
-  candidatesVar <- newTVarIO (entriesToMap seeds)
+  -- State: candidates sorted by XOR distance, queried set, known set (for dedup)
+  candidatesVar <- newTVarIO (sortByDistance targetKey seeds)
   queriedVar    <- newTVarIO Set.empty
+  knownVar      <- newTVarIO (Set.fromList (map entryPeerId seeds))
 
-  lookupLoop node targetKey candidatesVar queriedVar now FindNode
+  lookupLoop node targetKey candidatesVar queriedVar knownVar now FindNode
 
 -- | Core lookup loop shared by FIND_NODE, GET_VALUE, GET_PROVIDERS.
 lookupLoop
   :: DHTNode
   -> DHTKey
-  -> TVar (Map DHTKey BucketEntry)  -- ^ Candidates sorted by distance to target
-  -> TVar (Set PeerId)              -- ^ Already queried peers
-  -> a                              -- ^ Timestamp placeholder (UTCTime)
-  -> MessageType                    -- ^ Query type
+  -> TVar [BucketEntry]   -- ^ Candidates sorted by XOR distance to target
+  -> TVar (Set PeerId)    -- ^ Already queried peers
+  -> TVar (Set PeerId)    -- ^ Known peers (all candidates ever seen, for dedup)
+  -> a                    -- ^ Timestamp placeholder (UTCTime)
+  -> MessageType          -- ^ Query type
   -> IO [BucketEntry]
-lookupLoop node targetKey candidatesVar queriedVar _now queryType = go
+lookupLoop node targetKey candidatesVar queriedVar knownVar _now queryType = go
   where
     go = do
       -- Pick up to alpha unqueried candidates closest to target
       toQuery <- atomically $ do
         candidates <- readTVar candidatesVar
         queried <- readTVar queriedVar
-        let unqueried = Map.filter (\e -> not (Set.member (entryPeerId e) queried)) candidates
-            batch = take alphaValue (Map.elems unqueried)
+        let unqueried = filter (\e -> not (Set.member (entryPeerId e) queried)) candidates
+            batch = take alphaValue unqueried
         -- Mark them as queried
         let newQueried = Set.union queried (Set.fromList (map entryPeerId batch))
         writeTVar queriedVar newQueried
@@ -83,30 +86,33 @@ lookupLoop node targetKey candidatesVar queriedVar _now queryType = go
 
       if null toQuery
         then do
-          -- No more unqueried candidates → return top k
+          -- No more unqueried candidates -> return top k
           candidates <- readTVarIO candidatesVar
-          pure (take kValue (Map.elems candidates))
+          pure (take kValue candidates)
         else do
           -- Query each peer in parallel
           results <- mapConcurrently (queryPeer node targetKey queryType) toQuery
 
           -- Merge results
           atomically $ do
-            queried <- readTVar queriedVar
+            known <- readTVar knownVar
             candidates <- readTVar candidatesVar
             let newPeers = concatMap (either (const []) id) results
-                -- Convert DHTPeers to BucketEntries, excluding already queried
-                newEntries = filter (\e -> not (Set.member (entryPeerId e) queried))
+                -- Convert DHTPeers to BucketEntries, excluding already known
+                newEntries = filter (\e -> not (Set.member (entryPeerId e) known))
                            $ map (dhtPeerToEntry _now) newPeers
-                -- Add to candidates map (keyed by distance to target)
-                newMap = foldl (\m e -> Map.insert (entryKey e) e m) candidates newEntries
-            writeTVar candidatesVar newMap
+                -- Mark new entries as known
+                newKnown = Set.union known (Set.fromList (map entryPeerId newEntries))
+                -- Merge and re-sort by XOR distance
+                merged = sortByDistance targetKey (candidates ++ newEntries)
+            writeTVar candidatesVar merged
+            writeTVar knownVar newKnown
 
           -- Check termination: have we queried top-k?
           shouldContinue <- atomically $ do
             candidates <- readTVar candidatesVar
             queried <- readTVar queriedVar
-            let topK = take kValue (Map.elems candidates)
+            let topK = take kValue candidates
                 allQueried = all (\e -> Set.member (entryPeerId e) queried) topK
             pure (not allQueried)
 
@@ -114,7 +120,7 @@ lookupLoop node targetKey candidatesVar queriedVar _now queryType = go
             then go
             else do
               candidates <- readTVarIO candidatesVar
-              pure (take kValue (Map.elems candidates))
+              pure (take kValue candidates)
 
     _now = let DHTKey bs = targetKey in bs  -- placeholder, overridden by caller
 
@@ -143,34 +149,36 @@ iterativeGetValue node validator key = do
       seeds = closestPeers targetKey kValue rt
   now <- getCurrentTime
 
-  candidatesVar <- newTVarIO (entriesToMap seeds)
+  candidatesVar <- newTVarIO (sortByDistance targetKey seeds)
   queriedVar    <- newTVarIO Set.empty
+  knownVar      <- newTVarIO (Set.fromList (map entryPeerId seeds))
   bestVar       <- newTVarIO (Nothing :: Maybe DHTRecord)
   bestPeersVar  <- newTVarIO (Set.empty :: Set PeerId)
   outdatedVar   <- newTVarIO (Set.empty :: Set PeerId)
 
-  valueLoop node targetKey candidatesVar queriedVar bestVar bestPeersVar outdatedVar validator now
+  valueLoop node targetKey candidatesVar queriedVar knownVar bestVar bestPeersVar outdatedVar validator now
 
 -- | Value lookup loop with best/outdated tracking.
 valueLoop
   :: DHTNode
   -> DHTKey
-  -> TVar (Map DHTKey BucketEntry)
+  -> TVar [BucketEntry]
   -> TVar (Set PeerId)
+  -> TVar (Set PeerId)    -- ^ Known peers (dedup)
   -> TVar (Maybe DHTRecord)
-  -> TVar (Set PeerId)  -- ^ Peers that returned best value
-  -> TVar (Set PeerId)  -- ^ Peers with outdated values
+  -> TVar (Set PeerId)    -- ^ Peers that returned best value
+  -> TVar (Set PeerId)    -- ^ Peers with outdated values
   -> Validator
   -> a
   -> IO (Either String DHTRecord)
-valueLoop node targetKey candidatesVar queriedVar bestVar bestPeersVar outdatedVar validator _now = go
+valueLoop node targetKey candidatesVar queriedVar knownVar bestVar bestPeersVar outdatedVar validator _now = go
   where
     go = do
       toQuery <- atomically $ do
         candidates <- readTVar candidatesVar
         queried <- readTVar queriedVar
-        let unqueried = Map.filter (\e -> not (Set.member (entryPeerId e) queried)) candidates
-            batch = take alphaValue (Map.elems unqueried)
+        let unqueried = filter (\e -> not (Set.member (entryPeerId e) queried)) candidates
+            batch = take alphaValue unqueried
         let newQueried = Set.union queried (Set.fromList (map entryPeerId batch))
         writeTVar queriedVar newQueried
         pure batch
@@ -185,19 +193,21 @@ valueLoop node targetKey candidatesVar queriedVar bestVar bestPeersVar outdatedV
 
           -- Merge closer peers from responses
           atomically $ do
-            queried <- readTVar queriedVar
+            known <- readTVar knownVar
             candidates <- readTVar candidatesVar
             let newPeers = concatMap (\(_, peers, _) -> either (const []) id peers) results
-                newEntries = filter (\e -> not (Set.member (entryPeerId e) queried))
+                newEntries = filter (\e -> not (Set.member (entryPeerId e) known))
                            $ map (dhtPeerToEntry _now) newPeers
-                newMap = foldl (\m e -> Map.insert (entryKey e) e m) candidates newEntries
-            writeTVar candidatesVar newMap
+                newKnown = Set.union known (Set.fromList (map entryPeerId newEntries))
+                merged = sortByDistance targetKey (candidates ++ newEntries)
+            writeTVar candidatesVar merged
+            writeTVar knownVar newKnown
 
           -- Check termination
           shouldContinue <- atomically $ do
             candidates <- readTVar candidatesVar
             queried <- readTVar queriedVar
-            let topK = take kValue (Map.elems candidates)
+            let topK = take kValue candidates
                 allQueried = all (\e -> Set.member (entryPeerId e) queried) topK
             pure (not allQueried)
 
@@ -276,29 +286,31 @@ iterativeGetProviders node key = do
       seeds = closestPeers targetKey kValue rt
   now <- getCurrentTime
 
-  candidatesVar <- newTVarIO (entriesToMap seeds)
+  candidatesVar <- newTVarIO (sortByDistance targetKey seeds)
   queriedVar    <- newTVarIO Set.empty
+  knownVar      <- newTVarIO (Set.fromList (map entryPeerId seeds))
   providersVar  <- newTVarIO ([] :: [ProviderEntry])
 
-  providerLoop node targetKey candidatesVar queriedVar providersVar now
+  providerLoop node targetKey candidatesVar queriedVar knownVar providersVar now
 
 -- | Provider lookup loop.
 providerLoop
   :: DHTNode
   -> DHTKey
-  -> TVar (Map DHTKey BucketEntry)
+  -> TVar [BucketEntry]
   -> TVar (Set PeerId)
+  -> TVar (Set PeerId)    -- ^ Known peers (dedup)
   -> TVar [ProviderEntry]
   -> a
   -> IO [ProviderEntry]
-providerLoop node targetKey candidatesVar queriedVar providersVar _now = go
+providerLoop node targetKey candidatesVar queriedVar knownVar providersVar _now = go
   where
     go = do
       toQuery <- atomically $ do
         candidates <- readTVar candidatesVar
         queried <- readTVar queriedVar
-        let unqueried = Map.filter (\e -> not (Set.member (entryPeerId e) queried)) candidates
-            batch = take alphaValue (Map.elems unqueried)
+        let unqueried = filter (\e -> not (Set.member (entryPeerId e) queried)) candidates
+            batch = take alphaValue unqueried
         let newQueried = Set.union queried (Set.fromList (map entryPeerId batch))
         writeTVar queriedVar newQueried
         pure batch
@@ -310,22 +322,24 @@ providerLoop node targetKey candidatesVar queriedVar providersVar _now = go
 
           -- Collect providers and closer peers
           atomically $ do
-            queried <- readTVar queriedVar
+            known <- readTVar knownVar
             candidates <- readTVar candidatesVar
             currentProviders <- readTVar providersVar
             let allCloser = concatMap (\(_, closer, _) -> either (const []) id closer) results
                 allProviders = concatMap (\(_, _, provs) -> provs) results
-                newEntries = filter (\e -> not (Set.member (entryPeerId e) queried))
+                newEntries = filter (\e -> not (Set.member (entryPeerId e) known))
                            $ map (dhtPeerToEntry _now) allCloser
-                newMap = foldl (\m e -> Map.insert (entryKey e) e m) candidates newEntries
+                newKnown = Set.union known (Set.fromList (map entryPeerId newEntries))
+                merged = sortByDistance targetKey (candidates ++ newEntries)
                 newProviderEntries = map dhtPeerToProvider allProviders
-            writeTVar candidatesVar newMap
+            writeTVar candidatesVar merged
+            writeTVar knownVar newKnown
             writeTVar providersVar (currentProviders ++ newProviderEntries)
 
           shouldContinue <- atomically $ do
             candidates <- readTVar candidatesVar
             queried <- readTVar queriedVar
-            let topK = take kValue (Map.elems candidates)
+            let topK = take kValue candidates
                 allQueried = all (\e -> Set.member (entryPeerId e) queried) topK
             pure (not allQueried)
 
@@ -369,10 +383,6 @@ bootstrap node seeds = do
         bucketReps
 
 -- Helpers
-
--- | Convert BucketEntries to a Map keyed by DHTKey (for sorted iteration).
-entriesToMap :: [BucketEntry] -> Map DHTKey BucketEntry
-entriesToMap = foldl (\m e -> Map.insert (entryKey e) e m) Map.empty
 
 -- | Convert a DHTPeer to a BucketEntry (with current time).
 dhtPeerToEntry :: a -> DHTPeer -> BucketEntry

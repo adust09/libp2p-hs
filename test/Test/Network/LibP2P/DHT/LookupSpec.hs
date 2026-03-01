@@ -3,12 +3,14 @@ module Test.Network.LibP2P.DHT.LookupSpec (spec) where
 import Test.Hspec
 
 import Control.Concurrent.STM
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Time (getCurrentTime)
 import Network.LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import Network.LibP2P.DHT.DHT
-import Network.LibP2P.DHT.Distance (peerIdToKey)
+import Network.LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
 import Network.LibP2P.DHT.Lookup
 import Network.LibP2P.DHT.Message
 import Network.LibP2P.DHT.RoutingTable (insertPeer, allPeers)
@@ -129,6 +131,54 @@ spec = do
 
       result <- iterativeFindNode node (DHTKey (BS.pack [99]))
       length result `shouldBe` 3  -- only 3 peers total, less than k=20
+
+    it "queries peers in XOR distance order, not lexicographic key order" $ do
+      now <- getCurrentTime
+      queryOrderRef <- newIORef ([] :: [PeerId])
+
+      -- Create 15 peers so that alpha (10) < total, forcing batch selection
+      let peers = [mkPeerId (BS.pack [i]) | i <- [10..24]]
+          targetKey = DHTKey (BS.replicate 32 0xFF)
+
+      -- Compute expected first batch: the 10 closest by XOR distance
+      let entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
+          sortedByDist = sortByDistance targetKey entries
+          closestAlpha = Set.fromList $ map entryPeerId (take alphaValue sortedByDist)
+
+      -- Mock network: each peer returns empty but records query order
+      let mockSend pid _msg = do
+            atomicModifyIORef' queryOrderRef (\xs -> (xs ++ [pid], ()))
+            pure (Right (emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] }))
+
+      node <- mkNodeWithMock localPid mockSend
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        foldl (\r e -> fst (insertPeer e r)) rt entries
+
+      _ <- iterativeFindNode node targetKey
+
+      -- The first alpha peers queried should be the closest by XOR distance
+      -- (mapConcurrently doesn't preserve order within batch, so compare as sets)
+      queriedOrder <- readIORef queryOrderRef
+      let firstBatch = Set.fromList (take alphaValue queriedOrder)
+      firstBatch `shouldBe` closestAlpha
+
+    it "returns results sorted by XOR distance to target" $ do
+      now <- getCurrentTime
+      let peers = [mkPeerId (BS.pack [i]) | i <- [10..20]]
+          targetKey = DHTKey (BS.replicate 32 0xAA)
+          entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
+          expectedOrder = map entryPeerId (sortByDistance targetKey entries)
+
+      let mockSend _pid _msg =
+            pure (Right (emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] }))
+
+      node <- mkNodeWithMock localPid mockSend
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        foldl (\r e -> fst (insertPeer e r)) rt entries
+
+      result <- iterativeFindNode node targetKey
+      -- Results should be sorted by XOR distance to the target
+      map entryPeerId result `shouldBe` expectedOrder
 
   describe "iterativeGetValue" $ do
     it "finds value from mock network" $ do
