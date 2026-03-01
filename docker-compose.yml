@@ -1,0 +1,32 @@
+# Self-to-self interop test: libp2p-hs listener + libp2p-hs dialer.
+# Usage: docker compose up --build --abort-on-container-exit
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379"
+
+  listener:
+    build: .
+    depends_on:
+      - redis
+    environment:
+      transport: tcp
+      security: noise
+      muxer: yamux
+      is_dialer: "false"
+      redis_addr: "redis:6379"
+      test_timeout_seconds: "180"
+
+  dialer:
+    build: .
+    depends_on:
+      - redis
+      - listener
+    environment:
+      transport: tcp
+      security: noise
+      muxer: yamux
+      is_dialer: "true"
+      redis_addr: "redis:6379"
+      test_timeout_seconds: "180"

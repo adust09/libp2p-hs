@@ -22,3 +22,5 @@ cabal.project.local~
 .HTF/
 .ghc.environment.*
 .playwright-mcp/
+cabal.project.freeze
+go-libp2p/

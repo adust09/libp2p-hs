@@ -25,10 +25,15 @@ module Network.LibP2P
   , KeyPair
   , generateKeyPair
   , fromPublicKey
+  , peerIdBytes
+  , toBase58
 
     -- * Addressing
   , Multiaddr (..)
   , Protocol (..)
+  , splitP2P
+  , toText
+  , fromText
 
     -- * Switch (central coordinator)
   , Switch
@@ -78,8 +83,8 @@ module Network.LibP2P
 
 import Network.LibP2P.Crypto.Ed25519 (generateKeyPair)
 import Network.LibP2P.Crypto.Key (KeyPair)
-import Network.LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..))
+import Network.LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes, toBase58)
+import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..), fromText, splitP2P, toText)
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
 import Network.LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO (..))
 import Network.LibP2P.Protocol.GossipSub.Handler

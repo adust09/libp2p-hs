@@ -100,6 +100,21 @@ library
     proto3-wire >= 1.4  && < 1.5,
     list-shuffle >= 1.0  && < 1.1
 
+executable libp2p-interop
+  import:          warnings, lang
+  hs-source-dirs:  interop
+  main-is:         Main.hs
+  build-depends:
+    base        >= 4.18 && < 5,
+    bytestring  >= 0.10 && < 0.13,
+    text        >= 1.2  && < 2.2,
+    time        >= 1.9  && < 2,
+    network     >= 3.1  && < 3.3,
+    hedis       >= 0.15 && < 0.16,
+    aeson       >= 2.1  && < 2.3,
+    libp2p-hs
+  ghc-options: -threaded -rtsopts
+
 test-suite libp2p-hs-test
   import:          warnings, lang
   type:            exitcode-stdio-1.0

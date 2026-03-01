@@ -2,6 +2,7 @@ module Test.Network.LibP2P.Multiaddr.MultiaddrSpec (spec) where
 
 import qualified Data.ByteString as BS
 import Data.Text (Text)
+import Network.LibP2P.Crypto.PeerId (PeerId (..))
 import Network.LibP2P.Multiaddr.Codec
 import Network.LibP2P.Multiaddr.Multiaddr
 import Network.LibP2P.Multiaddr.Protocol
@@ -153,6 +154,32 @@ spec = do
       case fromText input of
         Right ma -> toText ma `shouldBe` input
         Left err -> expectationFailure err
+
+  describe "splitP2P" $ do
+    it "splits /ip4/.../tcp/.../p2p/<id> into transport addr and PeerId" $ do
+      let peerIdMH = BS.pack $ [0x00, 0x24, 0x08, 0x01, 0x12, 0x20] <> replicate 32 0xAB
+      let ma = Multiaddr [IP4 0x7f000001, TCP 4001, P2P peerIdMH]
+      case splitP2P ma of
+        Nothing -> expectationFailure "splitP2P returned Nothing"
+        Just (transport, pid) -> do
+          transport `shouldBe` Multiaddr [IP4 0x7f000001, TCP 4001]
+          pid `shouldBe` PeerId peerIdMH
+
+    it "returns Nothing when multiaddr has no /p2p/ suffix" $ do
+      let ma = Multiaddr [IP4 0x7f000001, TCP 4001]
+      splitP2P ma `shouldBe` Nothing
+
+    it "returns Nothing for empty multiaddr" $ do
+      let ma = Multiaddr []
+      splitP2P ma `shouldBe` Nothing
+
+    it "roundtrips: encapsulate transport (Multiaddr [P2P id]) == original" $ do
+      let peerIdMH = BS.pack $ [0x00, 0x24, 0x08, 0x01, 0x12, 0x20] <> replicate 32 0xCC
+      let original = Multiaddr [IP4 0xc0a80001, TCP 9090, P2P peerIdMH]
+      case splitP2P original of
+        Nothing -> expectationFailure "splitP2P returned Nothing"
+        Just (transport, PeerId mhBytes) ->
+          encapsulate transport (Multiaddr [P2P mhBytes]) `shouldBe` original
 
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
