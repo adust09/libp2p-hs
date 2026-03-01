@@ -72,7 +72,6 @@ import Network.LibP2P.Switch.Types
   , MuxerSession (..)
   , Switch (..)
   )
-import Prelude hiding (join)
 
 -- | GossipSub protocol ID.
 gossipSubProtocolId :: ProtocolId

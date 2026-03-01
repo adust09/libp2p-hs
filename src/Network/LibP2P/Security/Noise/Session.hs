@@ -27,7 +27,7 @@ import Data.ByteString (ByteString)
 type CacophonyState = NoiseState ChaChaPoly1305 Curve25519 SHA256
 
 -- | A post-handshake transport session for encrypted communication.
-newtype NoiseSession = NoiseSession { nsState :: CacophonyState }
+newtype NoiseSession = NoiseSession CacophonyState
 
 -- | Create a NoiseSession from a completed handshake state.
 mkNoiseSession :: CacophonyState -> NoiseSession

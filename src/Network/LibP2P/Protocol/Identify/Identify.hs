@@ -29,7 +29,6 @@ import Control.Concurrent.STM (atomically, readTVar, writeTVar)
 import Control.Exception (SomeException, catch)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
-import Data.Text (Text)
 import Network.LibP2P.Crypto.PeerId (PeerId)
 import Network.LibP2P.Crypto.Protobuf (encodePublicKey)
 import Network.LibP2P.Crypto.Key (kpPublic)
@@ -52,7 +51,6 @@ import Network.LibP2P.Switch.Types
   , Connection (..)
   , MuxerSession (..)
   , Switch (..)
-  , StreamHandler
   )
 
 -- | Identify protocol ID.

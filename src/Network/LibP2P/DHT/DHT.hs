@@ -29,13 +29,12 @@ module Network.LibP2P.DHT.DHT
 
 import Control.Concurrent.STM
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Time (UTCTime)
 import Network.LibP2P.Crypto.PeerId (PeerId, peerIdBytes)
-import Network.LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
+import Network.LibP2P.DHT.Distance (peerIdToKey)
 import Network.LibP2P.DHT.Message
 import Network.LibP2P.DHT.RoutingTable (RoutingTable, closestPeers, newRoutingTable)
 import Network.LibP2P.DHT.Types
@@ -164,7 +163,7 @@ handlePutValue node msg = do
 
 -- | ADD_PROVIDER: verify sender and store provider record.
 handleAddProvider :: DHTNode -> DHTMessage -> PeerId -> IO DHTMessage
-handleAddProvider node msg remotePeerId = do
+handleAddProvider _node msg remotePeerId = do
   -- Verify that provider peers match sender's Peer ID
   let validProviders = filter (\p -> dhtPeerId p == peerIdBytes remotePeerId) (msgProviderPeers msg)
   if null validProviders
