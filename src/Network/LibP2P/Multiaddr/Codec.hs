@@ -15,9 +15,11 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word16, Word32, Word64)
 import Text.Read (readMaybe)
-import qualified Data.ByteString.Base58 as B58
 import Network.LibP2P.Core.Binary (readWord16BE, readWord32BE, word16BE, word32BE)
+import Network.LibP2P.Core.Multihash (validateMultihash)
 import Network.LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
+import qualified Data.ByteString.Base58 as B58
+import Network.LibP2P.Crypto.PeerId (parsePeerId, peerIdBytes)
 import Network.LibP2P.Multiaddr.Protocol
 
 -- | Encode a list of protocols to binary multiaddr format.
@@ -102,7 +104,9 @@ decodeProtocols bs
     buildProtocol _ _ = Nothing
 
     buildVarProtocol :: Word64 -> ByteString -> Maybe Protocol
-    buildVarProtocol 421 mh = Just $ P2P mh
+    buildVarProtocol 421 mh = case validateMultihash mh of
+      Right _ -> Just $ P2P mh
+      Left _  -> Nothing
     buildVarProtocol 53 bs' = DNS <$> decodeUtf8Safe bs'
     buildVarProtocol 54 bs' = DNS4 <$> decodeUtf8Safe bs'
     buildVarProtocol 55 bs' = DNS6 <$> decodeUtf8Safe bs'
@@ -175,7 +179,7 @@ textToProtocols input
         port <- parsePort addr
         Right (UDP port, remaining)
       "p2p" -> withAddr rest $ \addr remaining -> do
-        mh <- parseBase58PeerId addr
+        mh <- parsePeerIdAddr addr
         Right (P2P mh, remaining)
       "dns" -> withAddr rest $ \addr remaining ->
         Right (DNS addr, remaining)
@@ -239,10 +243,12 @@ textToProtocols input
         | n >= (0 :: Int) && n <= 65535 -> Right (fromIntegral n)
       _ -> Left $ "textToProtocols: invalid port: " <> T.unpack t
 
-    parseBase58PeerId :: Text -> Either String ByteString
-    parseBase58PeerId t = case B58.decode (TE.encodeUtf8 t) of
-      Just bs -> Right bs
-      Nothing -> Left $ "textToProtocols: invalid base58 peer ID: " <> T.unpack t
+    -- | Parse a peer ID from text, accepting both base58btc and CIDv1 formats.
+    -- Validates the decoded bytes as a well-formed multihash.
+    parsePeerIdAddr :: Text -> Either String ByteString
+    parsePeerIdAddr t = case parsePeerId t of
+      Right pid -> Right (peerIdBytes pid)
+      Left err -> Left $ "textToProtocols: invalid peer ID: " <> err
 
 -- | Safely decode UTF-8 bytes to Text, returning Nothing on invalid input.
 decodeUtf8Safe :: ByteString -> Maybe Text

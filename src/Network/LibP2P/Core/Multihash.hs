@@ -6,6 +6,7 @@ module Network.LibP2P.Core.Multihash
   ( HashFunction (..)
   , encodeMultihash
   , decodeMultihash
+  , validateMultihash
   ) where
 
 import Crypto.Hash (Digest, SHA256, hash)
@@ -45,6 +46,7 @@ encodeMultihash hf input =
         <> digest
 
 -- | Decode a multihash into its hash function and digest/data.
+-- Note: does not reject trailing bytes after the digest.
 decodeMultihash :: ByteString -> Either String (HashFunction, ByteString)
 decodeMultihash bs = do
   (code, rest1) <- decodeUvarint bs
@@ -54,3 +56,27 @@ decodeMultihash bs = do
   if BS.length rest2 < digestLen
     then Left $ "decodeMultihash: expected " <> show digestLen <> " bytes but got " <> show (BS.length rest2)
     else Right (hf, BS.take digestLen rest2)
+
+-- | Validate a multihash strictly: decode, check digest length constraints,
+-- and reject trailing bytes.
+validateMultihash :: ByteString -> Either String (HashFunction, ByteString)
+validateMultihash bs = do
+  (code, rest1) <- decodeUvarint bs
+  hf <- fromHashCode code
+  (len, rest2) <- decodeUvarint rest1
+  let digestLen = fromIntegral len :: Int
+  if BS.length rest2 < digestLen
+    then Left $ "validateMultihash: expected " <> show digestLen <> " bytes but got " <> show (BS.length rest2)
+    else do
+      let digest = BS.take digestLen rest2
+          trailing = BS.drop digestLen rest2
+      if not (BS.null trailing)
+        then Left $ "validateMultihash: " <> show (BS.length trailing) <> " trailing bytes"
+        else case hf of
+          SHA256
+            | digestLen /= 32 ->
+                Left $ "validateMultihash: SHA-256 digest must be 32 bytes, got " <> show digestLen
+          Identity
+            | digestLen > 42 ->
+                Left $ "validateMultihash: Identity digest must be ≤42 bytes, got " <> show digestLen
+          _ -> Right (hf, digest)

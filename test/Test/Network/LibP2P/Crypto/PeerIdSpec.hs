@@ -1,8 +1,10 @@
 module Test.Network.LibP2P.Crypto.PeerIdSpec (spec) where
 
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base58 as B58
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Network.LibP2P.Crypto.Ed25519 (generateKeyPair, keyPairFromSeed)
 import Network.LibP2P.Crypto.Key
 import Network.LibP2P.Crypto.PeerId
@@ -138,6 +140,55 @@ spec = do
     it "sign with invalid key returns Left" $ do
       let badKey = PrivateKey Ed25519 (BS.pack [0x00]) -- invalid 1-byte key
       sign badKey "test" `shouldSatisfy` isLeft
+
+  describe "fromBase58 validation" $ do
+    it "rejects base58-encoded non-multihash bytes" $ do
+      -- base58(0xDE 0xAD 0xBE 0xEF) -- not a valid multihash (0xDE is unknown hash code)
+      let invalidBytes = BS.pack [0xDE, 0xAD, 0xBE, 0xEF]
+      let b58Text = TE.decodeUtf8 (B58.encode invalidBytes)
+      fromBase58 b58Text `shouldSatisfy` isLeft
+
+    it "rejects base58-encoded SHA-256 with wrong digest length" $ do
+      -- SHA-256 code (0x12) with 16-byte digest instead of 32
+      let invalidMh = BS.pack [0x12, 0x10] <> BS.replicate 16 0x42
+      let b58Text = TE.decodeUtf8 (B58.encode invalidMh)
+      fromBase58 b58Text `shouldSatisfy` isLeft
+
+    it "accepts valid Ed25519 PeerId from base58" $ do
+      let rawPubKey = BS.replicate 32 0x42
+      let pk = PublicKey Ed25519 rawPubKey
+      let pid = fromPublicKey pk
+      fromBase58 (toBase58 pid) `shouldBe` Right pid
+
+  describe "parsePeerId" $ do
+    it "parses base58 peer ID (12D3KooW...)" $ do
+      let rawPubKey = BS.replicate 32 0x42
+      let pk = PublicKey Ed25519 rawPubKey
+      let pid = fromPublicKey pk
+      let b58Text = toBase58 pid
+      parsePeerId b58Text `shouldBe` Right pid
+
+    it "parses CIDv1 peer ID (bafz...)" $ do
+      let rawPubKey = BS.replicate 32 0x42
+      let pk = PublicKey Ed25519 rawPubKey
+      let pid = fromPublicKey pk
+      let cidText = toCIDv1 pid
+      -- CIDv1 starts with 'b' (multibase base32lower)
+      T.head cidText `shouldBe` 'b'
+      parsePeerId cidText `shouldBe` Right pid
+
+    it "round-trips: parsePeerId(toCIDv1(pid)) == pid" $ do
+      Right kp <- generateKeyPair
+      let pid = fromPublicKey (kpPublic kp)
+      parsePeerId (toCIDv1 pid) `shouldBe` Right pid
+
+    it "rejects invalid base58 string" $
+      parsePeerId "not-a-valid-peer-id-!@#$" `shouldSatisfy` isLeft
+
+    it "rejects CIDv1 with wrong codec" $ do
+      -- Manually construct a CIDv1-like string with wrong codec
+      -- This test verifies parsePeerId validates the CID structure
+      parsePeerId "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi" `shouldSatisfy` isLeft
 
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True

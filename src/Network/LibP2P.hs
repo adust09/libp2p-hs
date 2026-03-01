@@ -27,6 +27,8 @@ module Network.LibP2P
   , fromPublicKey
   , peerIdBytes
   , toBase58
+  , parsePeerId
+  , toCIDv1
 
     -- * Addressing
   , Multiaddr (..)
@@ -83,7 +85,7 @@ module Network.LibP2P
 
 import Network.LibP2P.Crypto.Ed25519 (generateKeyPair)
 import Network.LibP2P.Crypto.Key (KeyPair)
-import Network.LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes, toBase58)
+import Network.LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes, toBase58, parsePeerId, toCIDv1)
 import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..), fromText, splitP2P, toText)
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
 import Network.LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO (..))
