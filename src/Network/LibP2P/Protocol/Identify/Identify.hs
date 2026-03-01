@@ -70,7 +70,7 @@ handleIdentify sw stream _remotePeerId = do
   info <- buildLocalIdentify sw Nothing
   let encoded = encodeIdentify info
   streamWrite stream encoded
-  -- Stream closure (by muxer) signals end of message
+  streamClose stream  -- Signal EOF so the remote side's readUntilEOF terminates
 
 -- | Request Identify from a remote peer (initiator side).
 --

@@ -49,8 +49,8 @@ mkClosableStreamPair = do
       closeWriter q closed = atomically $ do
         putTMVar closed ()
         writeTQueue q Nothing
-      streamA = StreamIO (writeQ qAtoB closedA) (readQ qBtoA)
-      streamB = StreamIO (writeQ qBtoA closedB) (readQ qAtoB)
+      streamA = StreamIO (writeQ qAtoB closedA) (readQ qBtoA) (closeWriter qAtoB closedA)
+      streamB = StreamIO (writeQ qBtoA closedB) (readQ qAtoB) (closeWriter qBtoA closedB)
   pure (streamA, closeWriter qAtoB closedA, streamB)
 
 -- | Create a simple bidirectional memory stream pair (no close).
@@ -60,8 +60,8 @@ mkMemoryPair = do
   qBtoA <- newTQueueIO :: IO (TQueue Word8)
   let writeQ q bs = mapM_ (atomically . writeTQueue q) (BS.unpack bs)
       readQ q = atomically (readTQueue q)
-  pure ( StreamIO (writeQ qAtoB) (readQ qBtoA)
-       , StreamIO (writeQ qBtoA) (readQ qAtoB)
+  pure ( StreamIO (writeQ qAtoB) (readQ qBtoA) (pure ())
+       , StreamIO (writeQ qBtoA) (readQ qAtoB) (pure ())
        )
 
 -- | Read exactly n bytes from a stream.

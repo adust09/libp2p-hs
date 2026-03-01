@@ -30,8 +30,9 @@ data NegotiationResult
 
 -- | Abstraction for stream I/O to enable testing with in-memory buffers.
 data StreamIO = StreamIO
-  { streamWrite :: ByteString -> IO ()
-  , streamReadByte :: IO Word8  -- ^ Read exactly one byte (blocks until available)
+  { streamWrite    :: ByteString -> IO ()
+  , streamReadByte :: IO Word8   -- ^ Read exactly one byte (blocks until available)
+  , streamClose    :: IO ()      -- ^ Close/half-close the stream (signals EOF to remote)
   }
 
 -- | Create an in-memory stream pair for testing using STM TQueue.
@@ -43,8 +44,8 @@ mkMemoryStreamPair = do
   let writeToQueue q bs = mapM_ (atomically . writeTQueue q) (BS.unpack bs)
       readFromQueue q = atomically (readTQueue q)
   pure
-    ( StreamIO (writeToQueue queueAtoB) (readFromQueue queueBtoA)
-    , StreamIO (writeToQueue queueBtoA) (readFromQueue queueAtoB)
+    ( StreamIO (writeToQueue queueAtoB) (readFromQueue queueBtoA) (pure ())
+    , StreamIO (writeToQueue queueBtoA) (readFromQueue queueAtoB) (pure ())
     )
 
 -- | Read exactly n bytes from a stream.

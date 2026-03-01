@@ -23,10 +23,12 @@ mkStreamPair = do
   let streamA = StreamIO
         { streamWrite = \bs -> mapM_ (\b -> atomically (writeTQueue q1 b)) (BS.unpack bs)
         , streamReadByte = atomically (readTQueue q2)
+        , streamClose = pure ()
         }
       streamB = StreamIO
         { streamWrite = \bs -> mapM_ (\b -> atomically (writeTQueue q2 b)) (BS.unpack bs)
         , streamReadByte = atomically (readTQueue q1)
+        , streamClose = pure ()
         }
   pure (streamA, streamB)
 
