@@ -6,6 +6,8 @@ import qualified Data.ByteString as BS
 import Network.LibP2P.Crypto.SignedEnvelope
 import Network.LibP2P.Crypto.Key (KeyPair (..))
 import Network.LibP2P.Crypto.Ed25519 (generateKeyPair)
+import Network.LibP2P.Core.Varint (encodeUvarint)
+import Data.Word (Word64)
 
 spec :: Spec
 spec = do
@@ -86,3 +88,37 @@ spec = do
             Left err -> expectationFailure $ "decodeSignedEnvelope failed: " ++ err
             Right decoded ->
               verifyEnvelope decoded domain `shouldBe` True
+
+    -- RFC 0002 compliance tests
+    describe "buildSigningContent (RFC 0002)" $ do
+      it "produces varint-length-prefixed format for all three fields" $ do
+        -- RFC 0002: [varint(len(domain))][domain][varint(len(payload_type))][payload_type][varint(len(payload))][payload]
+        let domain = "test"            -- 4 bytes
+            payloadType = BS.pack [0x01, 0x02]  -- 2 bytes
+            payload = BS.pack [0xAA, 0xBB, 0xCC]  -- 3 bytes
+            result = buildSigningContent domain payloadType payload
+            lenPrefix bs = encodeUvarint (fromIntegral (BS.length bs) :: Word64) <> bs
+            expected = lenPrefix domain <> lenPrefix payloadType <> lenPrefix payload
+        result `shouldBe` expected
+
+      it "encodes varint length prefix for each field independently" $ do
+        -- Verify byte-level structure:
+        -- domain "AB" (2 bytes): [0x02, 0x41, 0x42]
+        -- payloadType [0xFF] (1 byte): [0x01, 0xFF]
+        -- payload [0xDE, 0xAD] (2 bytes): [0x02, 0xDE, 0xAD]
+        let domain = "AB"
+            payloadType = BS.pack [0xFF]
+            payload = BS.pack [0xDE, 0xAD]
+            result = buildSigningContent domain payloadType payload
+            expected = BS.pack [0x02, 0x41, 0x42, 0x01, 0xFF, 0x02, 0xDE, 0xAD]
+        result `shouldBe` expected
+
+      it "handles empty payload_type and payload with varint(0) prefix" $ do
+        -- Empty fields still get a varint(0) length prefix
+        let domain = "d"
+            payloadType = BS.empty
+            payload = BS.empty
+            result = buildSigningContent domain payloadType payload
+            -- [0x01, 'd', 0x00, 0x00]
+            expected = BS.pack [0x01, 0x64, 0x00, 0x00]
+        result `shouldBe` expected
