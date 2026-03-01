@@ -236,15 +236,31 @@ performFullHandshake aliceIdentity bobIdentity = do
     bobPubKey <- decodePublicKey (npIdentityKey bobNP)
     let bobRemotePeerId = fromPublicKey bobPubKey
 
+    -- Verify Bob's identity_sig: binds identity key to Noise static key
+    case getRemoteNoiseStaticKey aliceState2 of
+      Nothing -> Left "performFullHandshake: remote Noise static key unavailable after msg2"
+      Just remoteNoisePub ->
+        if not (verifyStaticKey bobPubKey remoteNoisePub (npIdentitySig bobNP))
+          then Left "performFullHandshake: Bob's identity signature verification failed"
+          else Right ()
+
     -- Message 3: Alice → Bob (Alice's identity payload)
     let alicePayload = encodeNoisePayload $ buildHandshakePayload aliceIdentity aliceNoiseStaticPub
     (msg3, _aliceFinal) <- writeHandshakeMsg aliceState2 alicePayload
-    (payload3, _bobFinal) <- readHandshakeMsg bobState2 msg3
+    (payload3, bobFinal) <- readHandshakeMsg bobState2 msg3
 
     -- Decode Alice's identity
     aliceNP <- decodeNoisePayload payload3
     alicePubKey <- decodePublicKey (npIdentityKey aliceNP)
     let aliceRemotePeerId = fromPublicKey alicePubKey
+
+    -- Verify Alice's identity_sig: binds identity key to Noise static key
+    case getRemoteNoiseStaticKey bobFinal of
+      Nothing -> Left "performFullHandshake: remote Noise static key unavailable after msg3"
+      Just remoteNoisePub ->
+        if not (verifyStaticKey alicePubKey remoteNoisePub (npIdentitySig aliceNP))
+          then Left "performFullHandshake: Alice's identity signature verification failed"
+          else Right ()
 
     Right (bobRemotePeerId, aliceRemotePeerId)
 
@@ -261,12 +277,32 @@ performFullHandshakeWithSessions aliceIdentity bobIdentity = do
     -- Message 2: Bob → Alice (Bob's identity payload)
     let bobPayload = encodeNoisePayload $ buildHandshakePayload bobIdentity bobNoiseStaticPub
     (msg2, bobState2) <- writeHandshakeMsg bobState1 bobPayload
-    (_payload2, aliceState2) <- readHandshakeMsg aliceState1 msg2
+    (payload2, aliceState2) <- readHandshakeMsg aliceState1 msg2
+
+    -- Verify Bob's identity_sig
+    bobNP <- decodeNoisePayload payload2
+    bobPubKey <- decodePublicKey (npIdentityKey bobNP)
+    case getRemoteNoiseStaticKey aliceState2 of
+      Nothing -> Left "performFullHandshakeWithSessions: remote Noise static key unavailable after msg2"
+      Just remoteNoisePub ->
+        if not (verifyStaticKey bobPubKey remoteNoisePub (npIdentitySig bobNP))
+          then Left "performFullHandshakeWithSessions: Bob's identity signature verification failed"
+          else Right ()
 
     -- Message 3: Alice → Bob (Alice's identity payload)
     let alicePayload = encodeNoisePayload $ buildHandshakePayload aliceIdentity aliceNoiseStaticPub
     (msg3, aliceFinal) <- writeHandshakeMsg aliceState2 alicePayload
-    (_payload3, bobFinal) <- readHandshakeMsg bobState2 msg3
+    (payload3, bobFinal) <- readHandshakeMsg bobState2 msg3
+
+    -- Verify Alice's identity_sig
+    aliceNP <- decodeNoisePayload payload3
+    alicePubKey <- decodePublicKey (npIdentityKey aliceNP)
+    case getRemoteNoiseStaticKey bobFinal of
+      Nothing -> Left "performFullHandshakeWithSessions: remote Noise static key unavailable after msg3"
+      Just remoteNoisePub ->
+        if not (verifyStaticKey alicePubKey remoteNoisePub (npIdentitySig aliceNP))
+          then Left "performFullHandshakeWithSessions: Alice's identity signature verification failed"
+          else Right ()
 
     -- Convert to transport sessions
     Right (mkNoiseSession (hsNoiseState aliceFinal), mkNoiseSession (hsNoiseState bobFinal))
