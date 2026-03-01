@@ -1,0 +1,13 @@
+dist-newstyle/
+.git/
+.claude/
+.serena/
+docs/
+test/
+*.md
+LICENSE
+.DS_Store
+cabal.project.local
+cabal.project.freeze
+cabal.project.freeze.bak
+.playwright-mcp/

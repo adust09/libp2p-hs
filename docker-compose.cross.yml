@@ -1,0 +1,64 @@
+# Cross-implementation interop test: libp2p-hs <-> go-libp2p.
+#
+# Test 1: go-libp2p listener, libp2p-hs dialer
+#   docker compose -f docker-compose.cross.yml up --build go-listener hs-dialer redis --abort-on-container-exit
+#
+# Test 2: libp2p-hs listener, go-libp2p dialer
+#   docker compose -f docker-compose.cross.yml up --build hs-listener go-dialer redis --abort-on-container-exit
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379"
+
+  # --- Test 1: go listener, hs dialer ---
+  go-listener:
+    image: ghcr.io/libp2p/test-plan-transport-interop:master
+    depends_on:
+      - redis
+    environment:
+      transport: tcp
+      security: noise
+      muxer: yamux
+      is_dialer: "false"
+      redis_addr: "redis:6379"
+      test_timeout_seconds: "180"
+
+  hs-dialer:
+    build: .
+    depends_on:
+      - redis
+      - go-listener
+    environment:
+      transport: tcp
+      security: noise
+      muxer: yamux
+      is_dialer: "true"
+      redis_addr: "redis:6379"
+      test_timeout_seconds: "180"
+
+  # --- Test 2: hs listener, go dialer ---
+  hs-listener:
+    build: .
+    depends_on:
+      - redis
+    environment:
+      transport: tcp
+      security: noise
+      muxer: yamux
+      is_dialer: "false"
+      redis_addr: "redis:6379"
+      test_timeout_seconds: "180"
+
+  go-dialer:
+    image: ghcr.io/libp2p/test-plan-transport-interop:master
+    depends_on:
+      - redis
+      - hs-listener
+    environment:
+      transport: tcp
+      security: noise
+      muxer: yamux
+      is_dialer: "true"
+      redis_addr: "redis:6379"
+      test_timeout_seconds: "180"
