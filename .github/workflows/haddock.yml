@@ -1,0 +1,56 @@
+name: Haddock
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  haddock:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.10.1'
+          cabal-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ runner.os }}-haddock-${{ hashFiles('libp2p-hs.cabal', 'cabal.project') }}
+          restore-keys: ${{ runner.os }}-haddock-
+
+      - name: Build dependencies
+        run: cabal update && cabal build --only-dependencies
+
+      - name: Generate Haddock
+        run: cabal haddock --haddock-hyperlink-source --haddock-quickjump --haddock-html-location='https://hackage.haskell.org/package/$pkg-$version/docs'
+
+      - name: Prepare docs directory
+        run: |
+          HADDOCK_DIR=$(find dist-newstyle -path '*/doc/html/libp2p-hs' -type d | head -1)
+          cp -r "$HADDOCK_DIR" docs-out
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs-out
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
