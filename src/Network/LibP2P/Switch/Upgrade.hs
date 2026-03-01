@@ -50,9 +50,11 @@ import Network.LibP2P.Security.Noise.Handshake
   , buildHandshakePayload
   , decodeNoisePayload
   , encodeNoisePayload
+  , getRemoteNoiseStaticKey
   , initHandshakeInitiator
   , initHandshakeResponder
   , readHandshakeMsg
+  , verifyStaticKey
   , writeHandshakeMsg
   )
 import Network.LibP2P.Security.Noise.Session
@@ -119,6 +121,14 @@ performInitiatorHandshake identityKP stream = do
   let Right remotePubKey = Proto.decodePublicKey (HS.npIdentityKey remoteNP)
   let remotePeerId = fromPublicKey remotePubKey
 
+  -- Verify identity_sig: binds identity key to Noise static key
+  case getRemoteNoiseStaticKey hsState2 of
+    Nothing -> fail "performInitiatorHandshake: remote Noise static key unavailable after msg2"
+    Just remoteNoisePub ->
+      if not (verifyStaticKey remotePubKey remoteNoisePub (HS.npIdentitySig remoteNP))
+        then fail "performInitiatorHandshake: identity signature verification failed"
+        else pure ()
+
   -- Message 3: → (initiator's identity payload)
   let identPayload = encodeNoisePayload $ buildHandshakePayload identityKP noiseStaticPub
   let Right (msg3, hsStateFinal) = writeHandshakeMsg hsState2 identPayload
@@ -149,6 +159,14 @@ performResponderHandshake identityKP stream = do
   let Right remoteNP = decodeNoisePayload payload3
   let Right remotePubKey = Proto.decodePublicKey (HS.npIdentityKey remoteNP)
   let remotePeerId = fromPublicKey remotePubKey
+
+  -- Verify identity_sig: binds identity key to Noise static key
+  case getRemoteNoiseStaticKey hsStateFinal of
+    Nothing -> fail "performResponderHandshake: remote Noise static key unavailable after msg3"
+    Just remoteNoisePub ->
+      if not (verifyStaticKey remotePubKey remoteNoisePub (HS.npIdentitySig remoteNP))
+        then fail "performResponderHandshake: identity signature verification failed"
+        else pure ()
 
   let noiseSession = mkNoiseSession (HS.hsNoiseState hsStateFinal)
   pure (noiseSession, HandshakeResult remotePeerId remotePubKey)
