@@ -7,7 +7,7 @@
 --   - Payload bytes
 --   - Signature over domain-separated content
 --
--- Signing content: [varint(len(domain))][domain][payload_type][payload]
+-- Signing content (RFC 0002): [varint(len(domain))][domain][varint(len(payload_type))][payload_type][varint(len(payload))][payload]
 -- Wire format (protobuf):
 --   field 1: public_key (bytes, protobuf-encoded PublicKey)
 --   field 2: payload_type (bytes, multicodec)
@@ -19,6 +19,7 @@ module Network.LibP2P.Crypto.SignedEnvelope
   , verifyEnvelope
   , encodeSignedEnvelope
   , decodeSignedEnvelope
+  , buildSigningContent  -- exported for testing
   ) where
 
 import Data.ByteString (ByteString)
@@ -42,12 +43,13 @@ data SignedEnvelope = SignedEnvelope
   , seSignature   :: !ByteString    -- ^ Ed25519 signature
   } deriving (Show, Eq)
 
--- | Build the content that gets signed.
--- Format: [varint(len(domain))][domain][payload_type][payload]
+-- | Build the content that gets signed (RFC 0002).
+-- Format: [varint(len(domain))][domain][varint(len(payload_type))][payload_type][varint(len(payload))][payload]
+-- Each field is independently varint-length-prefixed.
 buildSigningContent :: ByteString -> ByteString -> ByteString -> ByteString
 buildSigningContent domain payloadType payload =
-  let domainLen = encodeUvarint (fromIntegral (BS.length domain) :: Word64)
-  in domainLen <> domain <> payloadType <> payload
+  let lenPrefix bs = encodeUvarint (fromIntegral (BS.length bs) :: Word64) <> bs
+  in lenPrefix domain <> lenPrefix payloadType <> lenPrefix payload
 
 -- | Create a signed envelope.
 createEnvelope :: PrivateKey -> PublicKey -> ByteString -> ByteString -> ByteString -> Either String SignedEnvelope
