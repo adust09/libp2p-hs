@@ -209,16 +209,21 @@ handleDataFrame sess hdr = do
           StreamSYNSent -> writeTVar (ysState stream) StreamEstablished
           _ -> pure ()
       Nothing -> pure ()
-  -- Deliver payload to stream buffer
+  -- Deliver payload to stream buffer (with flow-control check)
   when (BS.length payload > 0) $ do
     mStream <- atomically $ Map.lookup sid <$> readTVar (ysStreams sess)
     case mStream of
       Just stream -> do
-        atomically $ do
-          writeTQueue (ysRecvBuf stream) payload
-          -- Decrement recv window
+        let payloadLen = fromIntegral (BS.length payload)
+        overWindow <- atomically $ do
           w <- readTVar (ysRecvWindow stream)
-          writeTVar (ysRecvWindow stream) (w - fromIntegral (BS.length payload))
+          if w < payloadLen
+            then pure True
+            else do
+              writeTQueue (ysRecvBuf stream) payload
+              writeTVar (ysRecvWindow stream) (w - payloadLen)
+              pure False
+        when overWindow $ sendGoAway sess GoAwayProtocol
       Nothing -> pure ()
   -- Handle FIN flag
   when (flagFIN flags) $ do
