@@ -193,12 +193,16 @@ handleDataFrame sess hdr = do
       else pure BS.empty
   let sid = yhStreamId hdr
       flags = yhFlags hdr
-  -- Handle SYN flag: create new inbound stream
+  -- Handle SYN flag: create new inbound stream (with parity + duplicate validation)
   when (flagSYN flags) $ do
-    stream <- newStream sess sid StreamSYNReceived
-    atomically $ do
-      modifyTVar' (ysStreams sess) (Map.insert sid stream)
-      writeTQueue (ysAcceptCh sess) stream
+    valid <- atomically $ validateInboundSYN sess sid
+    if not valid
+      then sendGoAway sess GoAwayProtocol
+      else do
+        stream <- newStream sess sid StreamSYNReceived
+        atomically $ do
+          modifyTVar' (ysStreams sess) (Map.insert sid stream)
+          writeTQueue (ysAcceptCh sess) stream
   -- Handle ACK flag: transition SYNSent -> Established
   when (flagACK flags) $ do
     mStream <- atomically $ Map.lookup sid <$> readTVar (ysStreams sess)
@@ -250,12 +254,16 @@ handleWindowUpdate sess hdr = do
   let sid = yhStreamId hdr
       flags = yhFlags hdr
       delta = yhLength hdr
-  -- Handle SYN flag: create new inbound stream
+  -- Handle SYN flag: create new inbound stream (with parity + duplicate validation)
   when (flagSYN flags) $ do
-    stream <- newStream sess sid StreamSYNReceived
-    atomically $ do
-      modifyTVar' (ysStreams sess) (Map.insert sid stream)
-      writeTQueue (ysAcceptCh sess) stream
+    valid <- atomically $ validateInboundSYN sess sid
+    if not valid
+      then sendGoAway sess GoAwayProtocol
+      else do
+        stream <- newStream sess sid StreamSYNReceived
+        atomically $ do
+          modifyTVar' (ysStreams sess) (Map.insert sid stream)
+          writeTQueue (ysAcceptCh sess) stream
   -- Handle ACK flag
   when (flagACK flags) $ do
     mStream <- atomically $ Map.lookup sid <$> readTVar (ysStreams sess)
@@ -352,6 +360,22 @@ newStream sess sid initState = do
       , ysSendNotify = sendNotify
       , ysSession = sess
       }
+
+-- | Validate an inbound SYN stream ID for parity and uniqueness.
+-- Returns True if valid, False if protocol error (caller must send GoAway).
+-- Remote peers must use the opposite parity: client expects even, server expects odd.
+validateInboundSYN :: YamuxSession -> Word32 -> STM Bool
+validateInboundSYN sess sid = do
+  let validParity = case ysRole sess of
+        -- Server expects odd IDs (from client)
+        RoleServer -> odd sid
+        -- Client expects even IDs (from server)
+        RoleClient -> even sid
+  if sid == 0 || not validParity
+    then pure False
+    else do
+      streams <- readTVar (ysStreams sess)
+      pure (not (Map.member sid streams))
 
 -- | Helper: execute action when condition is True.
 when :: Bool -> IO () -> IO ()

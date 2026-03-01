@@ -232,6 +232,56 @@ spec = do
         stClient <- readTVarIO (ysState clientStream)
         stClient `shouldBe` StreamClosed
 
+  describe "SYN validation" $ do
+    it "SYN with wrong parity triggers GoAway (server rejects even ID)" $ do
+      -- Server expects odd IDs from client; inject even SYN
+      ((writeA, readA), (writeB, readB)) <- mkMemoryTransportPair
+      server <- newSession RoleServer writeB readB
+      -- We send a SYN Data frame with stream ID 2 (even = same parity as server)
+      -- This should be rejected because server expects odd (client) IDs
+      let synHdr = YamuxHeader
+            { yhVersion = 0
+            , yhType = FrameData
+            , yhFlags = defaultFlags { flagSYN = True }
+            , yhStreamId = 2  -- even ID, invalid for client->server direction
+            , yhLength = 0
+            }
+      writeA (encodeHeader synHdr)
+      withAsync (sendLoop server) $ \_ -> do
+        withAsync (recvLoop server) $ \_ -> do
+          atomically $ do
+            shut <- readTVar (ysShutdown server)
+            check shut
+
+    it "SYN with duplicate stream ID triggers GoAway" $ do
+      withSessionPair $ \(client, server) -> do
+        -- Open a normal stream (ID 1)
+        (_, _) <- concurrently
+          (openStream client >>= \(Right s) -> pure s)
+          (acceptStream server >>= \(Right s) -> pure s)
+        -- Inject duplicate SYN for stream ID 1 via raw frame
+        -- We write directly to the transport that feeds the server's recvLoop
+        let dupSynHdr = YamuxHeader
+              { yhVersion = 0
+              , yhType = FrameData
+              , yhFlags = defaultFlags { flagSYN = True }
+              , yhStreamId = 1  -- duplicate of existing stream
+              , yhLength = 0
+              }
+        -- Send raw frame bytes through client's write function (goes to server's read)
+        ysWrite client (encodeHeader dupSynHdr)
+        atomically $ do
+          shut <- readTVar (ysShutdown server)
+          check shut
+
+    it "valid SYN with correct parity accepted normally" $ do
+      withSessionPair $ \(client, server) -> do
+        (_, serverStream) <- concurrently
+          (openStream client >>= \(Right s) -> pure s)
+          (acceptStream server >>= \(Right s) -> pure s)
+        -- Stream ID 1 (odd) should have been accepted
+        ysStreamId serverStream `shouldBe` 1
+
   describe "Flow control: window underflow protection" $ do
     it "payload exceeding recv window triggers GoAway protocol error" $ do
       withSessionPair $ \(client, server) -> do
