@@ -3,7 +3,8 @@
 
 IMAGE_NAME := libp2p-hs-interop
 
-.PHONY: build image self-test cross-test-go-listener cross-test-hs-listener
+.PHONY: build image self-test cross-test-go-listener cross-test-hs-listener \
+        cross-gossipsub-rust-listener cross-gossipsub-hs-listener cross-gossipsub
 
 image:
 	docker build -t $(IMAGE_NAME) ..
@@ -21,3 +22,14 @@ cross-test-go-listener:
 # Cross-test: hs listener, go dialer
 cross-test-hs-listener:
 	cd .. && docker compose -f docker-compose.cross.yml up --build hs-listener go-dialer redis --abort-on-container-exit
+
+# GossipSub cross-test: rust listener, hs dialer
+cross-gossipsub-rust-listener:
+	cd .. && docker compose -f docker-compose.gossipsub.yml up --build rust-listener hs-dialer redis --abort-on-container-exit
+
+# GossipSub cross-test: hs listener, rust dialer
+cross-gossipsub-hs-listener:
+	cd .. && docker compose -f docker-compose.gossipsub.yml up --build hs-listener rust-dialer redis --abort-on-container-exit
+
+# GossipSub cross-test: both directions
+cross-gossipsub: cross-gossipsub-rust-listener cross-gossipsub-hs-listener

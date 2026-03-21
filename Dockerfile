@@ -12,8 +12,11 @@ COPY src/ src/
 COPY interop/ interop/
 
 # Fix ppad-sha256 ARM SHA2 intrinsic compilation on Docker (GCC 12)
-RUN echo 'package ppad-sha256' >> cabal.project && \
-    echo '  ghc-options: -optc-march=armv8-a+crypto' >> cabal.project
+# Only apply ARM-specific flags on aarch64; skip on x86_64
+RUN if [ "$(uname -m)" = "aarch64" ]; then \
+      echo 'package ppad-sha256' >> cabal.project && \
+      echo '  ghc-options: -optc-march=armv8-a+crypto' >> cabal.project; \
+    fi
 
 # Build the interop executable
 RUN cabal update && cabal build libp2p-interop \
