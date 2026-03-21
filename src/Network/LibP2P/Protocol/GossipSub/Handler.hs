@@ -26,7 +26,7 @@ module Network.LibP2P.Protocol.GossipSub.Handler
   , gossipSubProtocolId
   ) where
 
-import Control.Concurrent.Async (Async, cancel)
+import Control.Concurrent.Async (Async, async, cancel)
 import Control.Concurrent.STM
   ( TVar
   , atomically
@@ -57,12 +57,15 @@ import Network.LibP2P.Protocol.GossipSub.Router
   , publish
   , removePeer
   )
+import qualified Data.Set as Set
 import Network.LibP2P.Protocol.GossipSub.Types
   ( GossipSubParams
   , GossipSubRouter (..)
   , PeerProtocol (..)
-  , RPC
+  , RPC (..)
+  , SubOpts (..)
   , Topic
+  , emptyRPC
   , maxRPCSize
   )
 import Network.LibP2P.Switch.ConnPool (lookupConn)
@@ -195,7 +198,8 @@ startGossipSub node = do
   atomically $ writeTVar (gsnHeartbeat node) (Just hbAsync)
 
 -- | Called on new connection: open a GossipSub stream to the peer.
--- This registers the peer in the router and creates a read loop.
+-- Caches the stream for outbound writes and starts a read loop
+-- on it to receive RPCs sent back by the remote peer (e.g. subscriptions).
 onNewConnection :: GossipSubNode -> Connection -> IO ()
 onNewConnection node conn = do
   let pid = connPeerId conn
@@ -206,9 +210,47 @@ onNewConnection node conn = do
     Just stream -> do
       -- Cache the outbound stream
       atomically $ modifyTVar' (gsnStreams node) (Map.insert pid stream)
-      -- Register peer and start read loop (blocks until disconnect)
+      -- Register peer
       now <- getCurrentTime
       addPeer (gsnRouter node) pid GossipSubPeer True now
+      -- Send current subscriptions to the new peer
+      sendCurrentSubscriptions node stream
+      -- Start read loop on this stream to receive RPCs from the peer
+      -- (e.g. subscription announcements sent back on the same yamux stream)
+      _ <- async $ outboundReadLoop node stream pid
+      pure ()
+
+-- | Send current topic subscriptions to a newly connected peer.
+-- This ensures peers joining after we've already subscribed still learn
+-- about our subscriptions (standard GossipSub behavior).
+-- Writes directly to the stream to avoid any routing issues.
+sendCurrentSubscriptions :: GossipSubNode -> StreamIO -> IO ()
+sendCurrentSubscriptions node stream = do
+  let router = gsnRouter node
+  meshTopics <- atomically $ Map.keysSet <$> readTVar (gsMesh router)
+  let topics = Set.toList meshTopics
+  if null topics
+    then pure ()
+    else do
+      let subRPC = emptyRPC
+            { rpcSubscriptions = map (\t -> SubOpts True t) topics }
+      _ <- trySend stream subRPC
+      pure ()
+
+-- | Read loop on the outbound stream.
+-- Handles RPCs sent back by the remote peer on the same yamux stream
+-- (e.g. subscription announcements). Does NOT remove the peer on
+-- EOF since the inbound handler or another mechanism manages peer lifecycle.
+outboundReadLoop :: GossipSubNode -> StreamIO -> PeerId -> IO ()
+outboundReadLoop node stream pid = loop
+  where
+    loop = do
+      result <- readRPCMessage stream maxRPCSize
+      case result of
+        Left _ -> pure ()  -- EOF or error: stop
+        Right rpc -> do
+          handleRPC (gsnRouter node) pid rpc
+          loop
 
 -- | Stop the GossipSub node: cancel heartbeat and unregister handler.
 stopGossipSub :: GossipSubNode -> IO ()

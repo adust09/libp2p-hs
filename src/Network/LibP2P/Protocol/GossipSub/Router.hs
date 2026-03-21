@@ -84,20 +84,23 @@ newRouter params localPid sendRPC getTime = do
 
 -- Peer management
 
--- | Register a connected peer.
+-- | Register a connected peer. If the peer already exists, preserves
+-- accumulated state (topics, scores) to avoid overwriting subscriptions.
 addPeer :: GossipSubRouter -> PeerId -> PeerProtocol -> Bool -> UTCTime -> IO ()
 addPeer router pid proto isOutbound now = atomically $
-  modifyTVar' (gsPeers router) $
-    Map.insert pid PeerState
-      { psProtocol        = proto
-      , psTopics          = Set.empty
-      , psIsOutbound      = isOutbound
-      , psConnectedAt     = now
-      , psTopicState      = Map.empty
-      , psBehaviorPenalty = 0
-      , psIPAddress       = Nothing
-      , psCachedScore     = 0
-      }
+  modifyTVar' (gsPeers router) $ \m ->
+    case Map.lookup pid m of
+      Just _existing -> m  -- Peer already registered, keep existing state
+      Nothing -> Map.insert pid PeerState
+        { psProtocol        = proto
+        , psTopics          = Set.empty
+        , psIsOutbound      = isOutbound
+        , psConnectedAt     = now
+        , psTopicState      = Map.empty
+        , psBehaviorPenalty = 0
+        , psIPAddress       = Nothing
+        , psCachedScore     = 0
+        } m
 
 -- | Remove a disconnected peer and clean up mesh/fanout membership.
 removePeer :: GossipSubRouter -> PeerId -> IO ()
@@ -469,6 +472,8 @@ mkSignedMessage router topic payload kp = do
     Left _err -> pure unsigned  -- Signing failed, send unsigned
     Right sig -> pure unsigned { msgSignature = Just sig }
 
--- | Marshal a message for signature computation (protobuf encoding, minus signature).
+-- | Marshal a message for signature computation.
+-- Per the libp2p spec, the signed data excludes both signature and key fields.
 marshalForSigning :: PubSubMessage -> ByteString
-marshalForSigning msg = encodePubSubMessageBS (msg { msgSignature = Nothing })
+marshalForSigning msg = encodePubSubMessageBS
+  (msg { msgSignature = Nothing, msgKey = Nothing })

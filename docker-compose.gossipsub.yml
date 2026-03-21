@@ -1,0 +1,60 @@
+# GossipSub cross-implementation interop test: libp2p-hs <-> rust-libp2p.
+#
+# Test 1 (Rust listener, HS dialer):
+#   docker compose -f docker-compose.gossipsub.yml up --build rust-listener hs-dialer redis --abort-on-container-exit
+#
+# Test 2 (HS listener, Rust dialer):
+#   docker compose -f docker-compose.gossipsub.yml up --build hs-listener rust-dialer redis --abort-on-container-exit
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379"
+
+  # --- Test 1: Rust listener, HS dialer ---
+  rust-listener:
+    build:
+      context: ./interop/rust-peer
+    depends_on:
+      - redis
+    environment:
+      is_dialer: "false"
+      redis_addr: "redis:6379"
+
+  hs-dialer:
+    build: .
+    depends_on:
+      - redis
+      - rust-listener
+    environment:
+      transport: tcp
+      security: noise
+      muxer: yamux
+      is_dialer: "true"
+      redis_addr: "redis:6379"
+      test_timeout_seconds: "180"
+      test_mode: gossipsub
+
+  # --- Test 2: HS listener, Rust dialer ---
+  hs-listener:
+    build: .
+    depends_on:
+      - redis
+    environment:
+      transport: tcp
+      security: noise
+      muxer: yamux
+      is_dialer: "false"
+      redis_addr: "redis:6379"
+      test_timeout_seconds: "180"
+      test_mode: gossipsub
+
+  rust-dialer:
+    build:
+      context: ./interop/rust-peer
+    depends_on:
+      - redis
+      - hs-listener
+    environment:
+      is_dialer: "true"
+      redis_addr: "redis:6379"
