@@ -1,0 +1,54 @@
+name: Interop
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  transport-interop:
+    name: transport-interop (hs <-> go, tcp+noise+yamux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Pinned go-libp2p release; docker-compose.cross.yml builds its PingDockerfile.
+      - name: Clone go-libp2p (pinned)
+        run: git clone --depth 1 --branch v0.48.0 https://github.com/libp2p/go-libp2p.git go-libp2p
+
+      # Build the libp2p-hs interop image once, with a GHA-backed Docker layer
+      # cache. The Dockerfile builds dependencies in a separate layer, so this
+      # is fast unless libp2p-hs.cabal changes. Both compose hs services consume
+      # this image via `image: libp2p-hs-interop:latest`.
+      - name: Build libp2p-hs interop image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: libp2p-hs-interop:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Direction 1 — go listener, hs dialer
+        run: >
+          docker compose -f docker-compose.cross.yml up
+          --exit-code-from hs-dialer
+          redis go-listener hs-dialer
+
+      - name: Reset between directions
+        run: docker compose -f docker-compose.cross.yml down
+
+      - name: Direction 2 — hs listener, go dialer
+        run: >
+          docker compose -f docker-compose.cross.yml up
+          --exit-code-from go-dialer
+          redis hs-listener go-dialer
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.cross.yml down -v
