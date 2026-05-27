@@ -168,9 +168,13 @@ runListener sw pid ip redisConn timeoutS = do
           exitFailure
         Right _ -> do
           logInfo "Address published to Redis, waiting..."
-          -- Block until timeout (framework kills container)
+          -- The test runner kills this process once the dialer finishes.
+          -- Reaching the timeout means we were never successfully dialed,
+          -- which is a test failure (transport-interop README, Listener step 5).
           threadDelay (timeoutS * 1000000)
+          hPutStrLn stderr "Listener timed out waiting to be dialed"
           switchClose sw
+          exitFailure
 
 -- | Dialer mode: get address from Redis, dial, ping, output JSON.
 runDialer :: Switch -> PeerId -> Redis.Connection -> Int -> IO ()
@@ -207,7 +211,8 @@ runDialer sw _pid redisConn timeoutS = do
           Just (transportAddr, remotePeerId) -> do
             logInfo $ "Dialing peer: " ++ T.unpack (toBase58 remotePeerId)
 
-            -- Measure handshake + first ping
+            -- handshakeStartInstant, recorded before connecting
+            -- (transport-interop README, Dialer step 4).
             t0 <- getCurrentTime
 
             dialResult <- dial sw remotePeerId [transportAddr]
@@ -217,38 +222,30 @@ runDialer sw _pid redisConn timeoutS = do
                 switchClose sw
                 exitFailure
               Right conn -> do
-                -- First ping (included in handshake timing)
-                pingResult1 <- sendPing conn
+                -- A single ping (README steps 5-6): its round-trip time is
+                -- pingRTT, and the total elapsed since t0 is handshakePlusOneRTT.
+                pingResult <- sendPing conn
                 t1 <- getCurrentTime
 
-                case pingResult1 of
+                case pingResult of
                   Left err -> do
-                    hPutStrLn stderr $ "First ping failed: " ++ show err
+                    hPutStrLn stderr $ "Ping failed: " ++ show err
                     switchClose sw
                     exitFailure
-                  Right _ -> do
+                  Right pr -> do
                     let handshakePlusOneRTT = realToFrac (diffUTCTime t1 t0) * 1000 :: Double
+                        pingRTTMs = realToFrac (pingRTT pr) * 1000 :: Double
 
-                    -- Second ping (standalone RTT measurement)
-                    pingResult2 <- sendPing conn
-                    case pingResult2 of
-                      Left err -> do
-                        hPutStrLn stderr $ "Second ping failed: " ++ show err
-                        switchClose sw
-                        exitFailure
-                      Right pr -> do
-                        let pingRTTMs = realToFrac (pingRTT pr) * 1000 :: Double
+                    -- Output JSON (pingRTTMilllis triple-L is the upstream spelling)
+                    let jsonOutput = object
+                          [ "handshakePlusOneRTTMillis" .= handshakePlusOneRTT
+                          , "pingRTTMilllis" .= pingRTTMs
+                          ]
+                    LBS8.putStrLn (Aeson.encode jsonOutput)
+                    hFlush stdout
 
-                        -- Output JSON (note: pingRTTMilllis has 3 L's - intentional)
-                        let jsonOutput = object
-                              [ "handshakePlusOneRTTMillis" .= handshakePlusOneRTT
-                              , "pingRTTMilllis" .= pingRTTMs
-                              ]
-                        LBS8.putStrLn (Aeson.encode jsonOutput)
-                        hFlush stdout
-
-                        switchClose sw
-                        exitSuccess
+                    switchClose sw
+                    exitSuccess
 
 -- | GossipSub listener: join topic, wait for message, reply, report to Redis.
 runGossipSubListener :: Switch -> PeerId -> String -> Redis.Connection -> Int -> IO ()
