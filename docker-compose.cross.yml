@@ -1,18 +1,28 @@
 # Cross-implementation interop test: libp2p-hs <-> go-libp2p.
 #
 # Prerequisites:
-#   git clone https://github.com/libp2p/go-libp2p.git go-libp2p
+#   git clone --depth 1 --branch v0.48.0 https://github.com/libp2p/go-libp2p.git go-libp2p
 #
 # Test 1: go-libp2p listener, libp2p-hs dialer
-#   docker compose -f docker-compose.cross.yml up --build go-listener hs-dialer redis --abort-on-container-exit
+#   docker compose -f docker-compose.cross.yml up --build --exit-code-from hs-dialer redis go-listener hs-dialer
 #
 # Test 2: libp2p-hs listener, go-libp2p dialer
-#   docker compose -f docker-compose.cross.yml up --build hs-listener go-dialer redis --abort-on-container-exit
+#   docker compose -f docker-compose.cross.yml up --build --exit-code-from go-dialer redis hs-listener go-dialer
+#
+# --exit-code-from <dialer> makes `up` return the dialer's exit code (0 on success),
+# so failures are not masked when another container exits 0 first.
 services:
   redis:
     image: redis:7-alpine
+    # Disable persistence so a stale listenerAddr never survives across runs.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
 
   # --- Test 1: go listener, hs dialer ---
   go-listener:
@@ -20,7 +30,8 @@ services:
       context: ./go-libp2p
       dockerfile: test-plans/PingDockerfile
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
       transport: tcp
       security: noise
@@ -31,9 +42,12 @@ services:
 
   hs-dialer:
     build: .
+    image: libp2p-hs-interop:latest
     depends_on:
-      - redis
-      - go-listener
+      redis:
+        condition: service_healthy
+      go-listener:
+        condition: service_started
     environment:
       transport: tcp
       security: noise
@@ -45,8 +59,10 @@ services:
   # --- Test 2: hs listener, go dialer ---
   hs-listener:
     build: .
+    image: libp2p-hs-interop:latest
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
       transport: tcp
       security: noise
@@ -60,8 +76,10 @@ services:
       context: ./go-libp2p
       dockerfile: test-plans/PingDockerfile
     depends_on:
-      - redis
-      - hs-listener
+      redis:
+        condition: service_healthy
+      hs-listener:
+        condition: service_started
     environment:
       transport: tcp
       security: noise
