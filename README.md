@@ -33,49 +33,6 @@ main = do
   switchClose sw
 ```
 
-## Architecture
-
-```
-Application (GossipSub, DHT, Identify, Ping)
-         |
-   multistream-select (protocol negotiation)
-         |
-   Yamux (stream multiplexing)
-         |
-   multistream-select (muxer negotiation)
-         |
-   Noise XX (encryption + authentication)
-         |
-   multistream-select (security negotiation)
-         |
-   TCP (transport)
-```
-
-The **Switch** is the central coordinator managing the full upgrade pipeline,
-connection pool, protocol handler dispatch, and resource limits.
-
-## Component Status
-
-| Component | Module | Status |
-|-----------|--------|--------|
-| Varint / Multihash | `Core.Varint`, `Core.Multihash` | Complete |
-| Multiaddr | `Multiaddr.*` | Complete |
-| Peer Identity (Ed25519) | `Crypto.*` | Complete |
-| multistream-select | `MultistreamSelect.*` | Complete |
-| Noise XX handshake | `Security.Noise.*` | Complete |
-| Yamux multiplexer | `Mux.Yamux.*` | Complete |
-| TCP transport | `Transport.TCP` | Complete |
-| Switch (core + dial + listen) | `Switch.*` | Complete |
-| Resource manager | `Switch.ResourceManager` | Complete |
-| Identify protocol | `Protocol.Identify.*` | Complete |
-| Ping protocol | `Protocol.Ping.*` | Complete |
-| Kademlia DHT | `DHT.*` | Complete |
-| AutoNAT | `NAT.AutoNAT.*` | Complete |
-| Circuit Relay v2 | `NAT.Relay.*` | Complete |
-| DCUtR | `NAT.DCUtR.*` | Complete |
-| GossipSub | `Protocol.GossipSub.*` | Complete |
-| Public API | `Network.LibP2P` | Complete |
-
 ## Building
 
 Requires **GHC 9.10.x** (the `cacophony` dependency requires `base < 4.22`).
