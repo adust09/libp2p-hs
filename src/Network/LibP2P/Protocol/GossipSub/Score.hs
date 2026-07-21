@@ -1,4 +1,4 @@
--- | GossipSub peer scoring (P1-P7) per docs/11-pubsub.md.
+-- | GossipSub peer scoring (P1-P7) per 11-pubsub.md.
 --
 -- Score formula:
 --   Score(p) = TopicCap(Sum(t_i * (w1*P1 + w2*P2 + w3*P3 + w3b*P3b + w4*P4)))
@@ -94,7 +94,7 @@ computeP6 params ps ipMap = case psIPAddress ps of
 computeP7 :: PeerState -> Double
 computeP7 ps = psBehaviorPenalty ps * psBehaviorPenalty ps
 
--- | Compute full peer score per the formula in docs/11-pubsub.md.
+-- | Compute full peer score per the formula in 11-pubsub.md.
 -- Takes explicit PeerId for the P5 application-specific callback.
 computeScore :: PeerScoreParams -> PeerState -> Map.Map ByteString (Set.Set PeerId) -> UTCTime -> Double
 computeScore params ps ipMap now =

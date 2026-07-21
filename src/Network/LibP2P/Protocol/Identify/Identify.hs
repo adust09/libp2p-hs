@@ -1,4 +1,4 @@
--- | Identify protocol implementation (docs/07-protocols.md).
+-- | Identify protocol implementation (07-protocols.md).
 --
 -- Protocol ID: /ipfs/id/1.0.0
 --

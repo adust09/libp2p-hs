@@ -1,4 +1,4 @@
--- | GossipSub heartbeat procedure (docs/11-pubsub.md).
+-- | GossipSub heartbeat procedure (11-pubsub.md).
 --
 -- The heartbeat runs periodically and performs:
 -- 1. Mesh maintenance: prune negative-score, fill undersubscribed, trim oversubscribed

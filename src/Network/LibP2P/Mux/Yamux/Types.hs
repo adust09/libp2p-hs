@@ -1,6 +1,6 @@
 -- | Shared types for Yamux session management.
 --
--- Types follow the HashiCorp yamux spec.md and docs/06-multiplexing.md.
+-- Types follow the HashiCorp yamux spec.md and 06-multiplexing.md.
 -- SessionRole determines stream ID parity, StreamState tracks the
 -- stream lifecycle state machine, and YamuxSession/YamuxStream hold
 -- per-session/per-stream mutable state via STM.
