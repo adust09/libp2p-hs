@@ -4,33 +4,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-libp2p-hs is a Haskell implementation of the [libp2p](https://libp2p.io/) networking stack. The project is in early stage — the `docs/` directory contains a 12-chapter implementation-level textbook (7,270 lines) that serves as the authoritative reference for all implementation work.
+libp2p-hs is a Haskell implementation of the [libp2p](https://libp2p.io/) networking stack. The authoritative references for all implementation work are the [upstream libp2p specs](https://github.com/libp2p/specs) and the mature reference implementations (go-libp2p, rust-libp2p).
 
 ## Current State
 
 All implementation phases (0–10d) are complete: the full libp2p stack from transport through application protocols, including TCP, Noise XX, Yamux, Switch, Identify, Ping, Kademlia DHT, AutoNAT, Circuit Relay v2, DCUtR, GossipSub, end-to-end integration tests, and public API facade. 547 tests pass across all modules. The project uses a single Cabal library (not internal libraries, due to linker issues with shared `hs-source-dirs`).
 
+### Ongoing: interoperability testing
+
+Following an invitation from a libp2p maintainer, the project is joining the [`libp2p/unified-testing`](https://github.com/libp2p/unified-testing) cross-implementation effort. Local interop harness lives in `interop/` (hs ↔ go transport: tcp+noise+yamux) with CI in `.github/workflows/interop.yml`. Upstream test-app submissions are tracked as GitHub issues, in priority order:
+
+- **#129** transport interop test app → `libp2p/unified-testing` (adapt existing `interop/` to the upstream contract; ref nim PR #77)
+- **#130** perf monitoring test app (new binary; ref nim PR #93)
+- **#131** hole punching / DCUtR interop test app (ref nim PR #78)
+- **#132** P2P spreadsheet example over GossipSub (optional showcase)
+
 ## Documentation Reference
 
-The textbook in `docs/` covers wire formats, protobuf definitions, handshake sequences, and byte-level structures. Always consult the relevant chapter before implementing a component:
+Always consult the relevant upstream spec before touching a component (paths relative to [libp2p/specs](https://github.com/libp2p/specs) unless noted):
 
-| Component | Chapter | Key Content |
-|-----------|---------|-------------|
-| Multiaddr | `docs/03-addressing.md` | Binary format, protocol codes, varint encoding |
-| Peer ID | `docs/02-peer-identity.md` | Ed25519/RSA/Secp256k1 key encoding, Peer ID derivation algorithm |
-| multistream-select | `docs/07-protocols.md` | Wire format (varint-prefixed UTF-8 + newline), negotiation flow |
-| Noise handshake | `docs/05-secure-channels.md` | XX pattern, handshake payload protobuf, framing |
-| Yamux | `docs/06-multiplexing.md` | 12-byte frame header, flow control, stream lifecycle |
-| Switch/Swarm | `docs/08-switch.md` | Connection upgrading pipeline, resource management |
-| Identify/Ping | `docs/07-protocols.md` | Protobuf definitions, wire format |
-| Kademlia DHT | `docs/09-dht.md` | XOR distance, k-buckets, RPC protobuf, iterative lookup |
-| NAT traversal | `docs/10-nat-traversal.md` | AutoNAT, Circuit Relay v2, DCUtR protobuf definitions |
-| GossipSub | `docs/11-pubsub.md` | Mesh management, peer scoring (P1-P7), heartbeat |
-| Connection flow | `docs/12-connection-flow.md` | End-to-end TCP/QUIC walkthrough with byte-level detail |
+| Component | Spec | Key Content |
+|-----------|------|-------------|
+| Multiaddr | `addressing/`, [multiformats/multiaddr](https://github.com/multiformats/multiaddr) | Binary format, protocol codes, varint encoding |
+| Peer ID | `peer-ids/` | Ed25519/RSA/Secp256k1 key encoding, Peer ID derivation algorithm |
+| multistream-select | [multiformats/multistream-select](https://github.com/multiformats/multistream-select) | Wire format (varint-prefixed UTF-8 + newline), negotiation flow |
+| Noise handshake | `noise/` | XX pattern, handshake payload protobuf, framing |
+| Yamux | `yamux/`, [HashiCorp yamux spec](https://github.com/hashicorp/yamux/blob/master/spec.md) | 12-byte frame header, flow control, stream lifecycle |
+| Switch/Swarm | go-libp2p `p2p/net/swarm` | Connection upgrading pipeline, resource management |
+| Identify/Ping | `identify/`, `ping/` | Protobuf definitions, wire format |
+| Kademlia DHT | `kad-dht/` | XOR distance, k-buckets, RPC protobuf, iterative lookup |
+| NAT traversal | `autonat/`, `relay/`, `dcutr/` | AutoNAT, Circuit Relay v2, DCUtR protobuf definitions |
+| GossipSub | `pubsub/gossipsub/` | Mesh management, peer scoring (P1-P7), heartbeat |
 
 ## Planned Implementation Order
 
-Follow this sequence (defined in `docs/INDEX.md`):
+Follow this sequence:
 
 1. Multiaddr parsing/encoding
 2. Peer ID generation (Ed25519 first)

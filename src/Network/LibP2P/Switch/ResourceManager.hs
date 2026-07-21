@@ -1,4 +1,4 @@
--- | Hierarchical resource management for the Switch (docs/08-switch.md §Resource Limits).
+-- | Hierarchical resource management for the Switch.
 --
 -- Implements a scope tree (System → Peer → Connection → Stream) with
 -- STM-based reserve/release that atomically walks leaf→root to enforce

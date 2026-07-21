@@ -1,4 +1,4 @@
--- | GossipSub core types and parameters (docs/11-pubsub.md).
+-- | GossipSub core types and parameters (specs/pubsub/gossipsub).
 --
 -- Protocol ID: /meshsub/1.1.0
 --

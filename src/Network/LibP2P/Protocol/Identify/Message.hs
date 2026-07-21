@@ -1,6 +1,6 @@
 -- | Identify protocol message encoding/decoding (protobuf).
 --
--- Wire format from docs/07-protocols.md and specs/identify/README.md:
+-- Wire format from specs/identify/README.md:
 --   Field 1: publicKey       (bytes, optional)
 --   Field 2: listenAddrs     (repeated bytes)
 --   Field 3: protocols       (repeated string)

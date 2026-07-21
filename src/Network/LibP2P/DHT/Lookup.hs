@@ -1,7 +1,7 @@
 -- | Iterative lookup algorithms for the Kademlia DHT.
 --
 -- Implements FIND_NODE, GET_VALUE, and GET_PROVIDERS iterative lookups
--- per docs/09-dht.md. Uses STM for shared state and async for concurrent
+-- per specs/kad-dht. Uses STM for shared state and async for concurrent
 -- queries (alpha=10 parallelism).
 --
 -- Candidates are maintained as a list sorted by XOR distance to the

@@ -3,7 +3,7 @@
 -- Protocol: /libp2p/autonat/1.0.0
 -- Flow: Client sends DIAL with addresses, server dials back, responds with result.
 --
--- Security rules (from docs/10-nat-traversal.md):
+-- Security rules (from specs/autonat):
 --   - Server MUST NOT dial addresses unless they match the requester's observed IP
 --   - Server MUST NOT accept dial requests over relayed connections
 module Network.LibP2P.NAT.AutoNAT.AutoNAT

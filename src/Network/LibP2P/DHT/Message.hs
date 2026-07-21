@@ -1,6 +1,6 @@
 -- | DHT RPC message encoding/decoding (protobuf).
 --
--- Wire format from docs/09-dht.md:
+-- Wire format from specs/kad-dht (dht.proto):
 --   Message framing: [uvarint length][protobuf message]
 --   Message fields: type(1), key(2), record(3), closerPeers(8), providerPeers(9)
 --   Record fields: key(1), value(2), timeReceived(5)

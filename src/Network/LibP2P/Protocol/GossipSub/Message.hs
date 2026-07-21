@@ -1,6 +1,6 @@
 -- | GossipSub RPC message encoding/decoding (protobuf).
 --
--- Wire format from docs/11-pubsub.md:
+-- Wire format from specs/pubsub (rpc.proto):
 --   Message framing: [uvarint length][protobuf RPC]
 --   RPC fields: subscriptions(1), publish(2), control(3)
 --   SubOpts: subscribe(1), topicid(2)

@@ -1,4 +1,4 @@
--- | Dial logic for the Switch (docs/08-switch.md §Dialing).
+-- | Dial logic for the Switch.
 --
 -- Implements connection reuse, exponential backoff, dial deduplication,
 -- and parallel staggered dialing (Happy Eyeballs, RFC 8305).
@@ -118,7 +118,7 @@ data PendingCheck
 
 -- | Dial a peer, reusing existing connections or establishing new ones.
 --
--- Implements the full dial flow from docs/08-switch.md §Dial Flow:
+-- Implements the full dial flow:
 --   1. Pool reuse: return existing Open connection if available
 --   2. Backoff check: reject if peer recently failed
 --   3. Deduplication: coalesce concurrent dials to same peer via TMVar

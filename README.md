@@ -65,9 +65,7 @@ cabal test --test-option="--match=Integration"
 
 **[API Reference](https://adust09.github.io/libp2p-hs/)** — Generated Haddock documentation.
 
-The `docs/` directory contains a 12-chapter implementation-level textbook
-covering wire formats, protobuf definitions, handshake sequences, and
-byte-level structures for every component.
+Interop test evidence lives in `interop/RESULTS.md`.
 
 ## Specification
 

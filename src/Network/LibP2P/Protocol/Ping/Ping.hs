@@ -1,4 +1,4 @@
--- | Ping protocol implementation (docs/07-protocols.md).
+-- | Ping protocol implementation (specs/ping).
 --
 -- Protocol ID: /ipfs/ping/1.0.0
 --
