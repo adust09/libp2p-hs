@@ -6,7 +6,7 @@
 --
 -- Two background loops run per session:
 --   recvLoop: reads 12-byte headers from transport, dispatches to streams
---   sendLoop: dequeues from ysSendCh, writes to transport
+--   sendLoop: dequeues from ysessSendCh, writes to transport
 module Network.LibP2P.Mux.Yamux.Session
   ( newSession
   , closeSession
@@ -43,17 +43,17 @@ newSession role writeFn readFn = do
   nextPingId <- newTVarIO 1
   pure
     YamuxSession
-      { ysRole = role
-      , ysNextStreamId = nextId
-      , ysStreams = streams
-      , ysAcceptCh = acceptCh
-      , ysSendCh = sendCh
-      , ysShutdown = shutdown
-      , ysRemoteGoAway = remoteGoAway
-      , ysPings = pings
-      , ysNextPingId = nextPingId
-      , ysWrite = writeFn
-      , ysRead = readFn
+      { ysessRole = role
+      , ysessNextStreamId = nextId
+      , ysessStreams = streams
+      , ysessAcceptCh = acceptCh
+      , ysessSendCh = sendCh
+      , ysessShutdown = shutdown
+      , ysessRemoteGoAway = remoteGoAway
+      , ysessPings = pings
+      , ysessNextPingId = nextPingId
+      , ysessWrite = writeFn
+      , ysessRead = readFn
       }
 
 -- | Gracefully close the session by sending GoAway Normal.
@@ -66,21 +66,21 @@ openStream :: YamuxSession -> IO (Either YamuxError YamuxStream)
 openStream sess = do
   -- Check shutdown state
   canOpen <- atomically $ do
-    shut <- readTVar (ysShutdown sess)
-    remote <- readTVar (ysRemoteGoAway sess)
+    shut <- readTVar (ysessShutdown sess)
+    remote <- readTVar (ysessRemoteGoAway sess)
     pure (not shut && not remote)
   if not canOpen
     then pure (Left YamuxSessionShutdown)
     else do
       -- Allocate stream ID (atomically increment by 2)
       sid <- atomically $ do
-        nextId <- readTVar (ysNextStreamId sess)
-        writeTVar (ysNextStreamId sess) (nextId + 2)
+        nextId <- readTVar (ysessNextStreamId sess)
+        writeTVar (ysessNextStreamId sess) (nextId + 2)
         pure nextId
       -- Create stream in SYNSent state
       stream <- newStream sess sid StreamSYNSent
       -- Register stream
-      atomically $ modifyTVar' (ysStreams sess) (Map.insert sid stream)
+      atomically $ modifyTVar' (ysessStreams sess) (Map.insert sid stream)
       -- Send SYN frame (Data frame with SYN flag, no payload)
       let hdr =
             YamuxHeader
@@ -90,14 +90,14 @@ openStream sess = do
               , yhStreamId = sid
               , yhLength = 0
               }
-      atomically $ writeTQueue (ysSendCh sess) (hdr, BS.empty)
+      atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
       pure (Right stream)
 
 -- | Accept an inbound stream. Blocks until a remote SYN arrives.
 -- Returns YamuxSessionShutdown if the session is shut down.
 acceptStream :: YamuxSession -> IO (Either YamuxError YamuxStream)
 acceptStream sess = do
-  stream <- atomically $ readTQueue (ysAcceptCh sess)
+  stream <- atomically $ readTQueue (ysessAcceptCh sess)
   -- Send ACK (WindowUpdate frame with ACK flag)
   let hdr =
         YamuxHeader
@@ -107,7 +107,7 @@ acceptStream sess = do
           , yhStreamId = ysStreamId stream
           , yhLength = 0
           }
-  atomically $ writeTQueue (ysSendCh sess) (hdr, BS.empty)
+  atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
   -- Transition to Established
   atomically $ writeTVar (ysState stream) StreamEstablished
   pure (Right stream)
@@ -117,10 +117,10 @@ acceptStream sess = do
 ping :: YamuxSession -> IO (Either YamuxError ())
 ping sess = do
   (pingId, waiter) <- atomically $ do
-    pid <- readTVar (ysNextPingId sess)
-    writeTVar (ysNextPingId sess) (pid + 1)
+    pid <- readTVar (ysessNextPingId sess)
+    writeTVar (ysessNextPingId sess) (pid + 1)
     w <- newEmptyTMVar
-    modifyTVar' (ysPings sess) (Map.insert pid w)
+    modifyTVar' (ysessPings sess) (Map.insert pid w)
     pure (pid, w)
   -- Send Ping SYN frame
   let hdr =
@@ -131,18 +131,18 @@ ping sess = do
           , yhStreamId = 0
           , yhLength = pingId
           }
-  atomically $ writeTQueue (ysSendCh sess) (hdr, BS.empty)
+  atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
   -- Wait for ACK
   atomically $ takeTMVar waiter
   -- Cleanup
-  atomically $ modifyTVar' (ysPings sess) (Map.delete pingId)
+  atomically $ modifyTVar' (ysessPings sess) (Map.delete pingId)
   pure (Right ())
 
 -- | Send a GoAway frame with the specified error code.
--- Sets ysShutdown to True so no new streams can be opened.
+-- Sets ysessShutdown to True so no new streams can be opened.
 sendGoAway :: YamuxSession -> GoAwayCode -> IO ()
 sendGoAway sess code = do
-  atomically $ writeTVar (ysShutdown sess) True
+  atomically $ writeTVar (ysessShutdown sess) True
   let errCode = case code of
         GoAwayNormal -> 0x00
         GoAwayProtocol -> 0x01
@@ -155,7 +155,7 @@ sendGoAway sess code = do
           , yhStreamId = 0
           , yhLength = errCode
           }
-  atomically $ writeTQueue (ysSendCh sess) (hdr, BS.empty)
+  atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
 
 -- | Receive loop: reads 12-byte headers from transport and dispatches frames.
 -- This loop runs until the transport connection is closed or an error occurs.
@@ -164,7 +164,7 @@ recvLoop sess = go
   where
     go = do
       -- Read 12-byte header
-      headerBytes <- ysRead sess headerSize
+      headerBytes <- ysessRead sess headerSize
       case decodeHeader headerBytes of
         Left _err -> pure () -- Protocol error, stop
         Right hdr -> do
@@ -189,7 +189,7 @@ handleDataFrame sess hdr = do
   -- Read payload
   payload <-
     if yhLength hdr > 0
-      then ysRead sess (fromIntegral (yhLength hdr))
+      then ysessRead sess (fromIntegral (yhLength hdr))
       else pure BS.empty
   let sid = yhStreamId hdr
       flags = yhFlags hdr
@@ -201,11 +201,11 @@ handleDataFrame sess hdr = do
       else do
         stream <- newStream sess sid StreamSYNReceived
         atomically $ do
-          modifyTVar' (ysStreams sess) (Map.insert sid stream)
-          writeTQueue (ysAcceptCh sess) stream
+          modifyTVar' (ysessStreams sess) (Map.insert sid stream)
+          writeTQueue (ysessAcceptCh sess) stream
   -- Handle ACK flag: transition SYNSent -> Established
   when (flagACK flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysStreams sess)
+    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
     case mStream of
       Just stream -> atomically $ do
         st <- readTVar (ysState stream)
@@ -215,7 +215,7 @@ handleDataFrame sess hdr = do
       Nothing -> pure ()
   -- Deliver payload to stream buffer (with flow-control check)
   when (BS.length payload > 0) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysStreams sess)
+    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
     case mStream of
       Just stream -> do
         let payloadLen = fromIntegral (BS.length payload)
@@ -231,7 +231,7 @@ handleDataFrame sess hdr = do
       Nothing -> pure ()
   -- Handle FIN flag
   when (flagFIN flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysStreams sess)
+    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
     case mStream of
       Just stream -> atomically $ do
         st <- readTVar (ysState stream)
@@ -243,7 +243,7 @@ handleDataFrame sess hdr = do
       Nothing -> pure ()
   -- Handle RST flag
   when (flagRST flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysStreams sess)
+    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
     case mStream of
       Just stream -> atomically $ writeTVar (ysState stream) StreamReset
       Nothing -> pure ()
@@ -262,11 +262,11 @@ handleWindowUpdate sess hdr = do
       else do
         stream <- newStream sess sid StreamSYNReceived
         atomically $ do
-          modifyTVar' (ysStreams sess) (Map.insert sid stream)
-          writeTQueue (ysAcceptCh sess) stream
+          modifyTVar' (ysessStreams sess) (Map.insert sid stream)
+          writeTQueue (ysessAcceptCh sess) stream
   -- Handle ACK flag
   when (flagACK flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysStreams sess)
+    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
     case mStream of
       Just stream -> atomically $ do
         st <- readTVar (ysState stream)
@@ -276,7 +276,7 @@ handleWindowUpdate sess hdr = do
       Nothing -> pure ()
   -- Update send window
   when (delta > 0) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysStreams sess)
+    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
     case mStream of
       Just stream -> atomically $ do
         w <- readTVar (ysSendWindow stream)
@@ -284,7 +284,7 @@ handleWindowUpdate sess hdr = do
       Nothing -> pure ()
   -- Handle FIN flag
   when (flagFIN flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysStreams sess)
+    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
     case mStream of
       Just stream -> atomically $ do
         st <- readTVar (ysState stream)
@@ -295,7 +295,7 @@ handleWindowUpdate sess hdr = do
       Nothing -> pure ()
   -- Handle RST flag
   when (flagRST flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysStreams sess)
+    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
     case mStream of
       Just stream -> atomically $ writeTVar (ysState stream) StreamReset
       Nothing -> pure ()
@@ -315,31 +315,31 @@ handlePing sess hdr
               , yhStreamId = 0
               , yhLength = yhLength hdr -- echo opaque value
               }
-      atomically $ writeTQueue (ysSendCh sess) (respHdr, BS.empty)
+      atomically $ writeTQueue (ysessSendCh sess) (respHdr, BS.empty)
   | flagACK (yhFlags hdr) = do
       -- Resolve pending ping
       let pingId = yhLength hdr
       atomically $ do
-        pMap <- readTVar (ysPings sess)
+        pMap <- readTVar (ysessPings sess)
         case Map.lookup pingId pMap of
           Just waiter -> putTMVar waiter ()
           Nothing -> pure ()
   | otherwise = pure ()
 
 -- | Handle a GoAway frame (StreamID must be 0).
--- Parse error code and set ysRemoteGoAway.
+-- Parse error code and set ysessRemoteGoAway.
 handleGoAway :: YamuxSession -> YamuxHeader -> IO ()
 handleGoAway sess _hdr = do
-  atomically $ writeTVar (ysRemoteGoAway sess) True
+  atomically $ writeTVar (ysessRemoteGoAway sess) True
 
--- | Send loop: dequeues frames from ysSendCh and writes to transport.
+-- | Send loop: dequeues frames from ysessSendCh and writes to transport.
 sendLoop :: YamuxSession -> IO ()
 sendLoop sess = go
   where
     go = do
-      (hdr, payload) <- atomically $ readTQueue (ysSendCh sess)
-      ysWrite sess (encodeHeader hdr)
-      when (BS.length payload > 0) $ ysWrite sess payload
+      (hdr, payload) <- atomically $ readTQueue (ysessSendCh sess)
+      ysessWrite sess (encodeHeader hdr)
+      when (BS.length payload > 0) $ ysessWrite sess payload
       go
 
 -- | Create a new YamuxStream with the given initial state.
@@ -366,7 +366,7 @@ newStream sess sid initState = do
 -- Remote peers must use the opposite parity: client expects even, server expects odd.
 validateInboundSYN :: YamuxSession -> Word32 -> STM Bool
 validateInboundSYN sess sid = do
-  let validParity = case ysRole sess of
+  let validParity = case ysessRole sess of
         -- Server expects odd IDs (from client)
         RoleServer -> odd sid
         -- Client expects even IDs (from server)
@@ -374,7 +374,7 @@ validateInboundSYN sess sid = do
   if sid == 0 || not validParity
     then pure False
     else do
-      streams <- readTVar (ysStreams sess)
+      streams <- readTVar (ysessStreams sess)
       pure (not (Map.member sid streams))
 
 -- | Helper: execute action when condition is True.
