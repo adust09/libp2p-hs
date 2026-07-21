@@ -38,6 +38,8 @@ library
     Network.LibP2P.Multiaddr.Codec
     Network.LibP2P.Crypto.Key
     Network.LibP2P.Crypto.Ed25519
+    Network.LibP2P.Crypto.RSA
+    Network.LibP2P.Crypto.Secp256k1
     Network.LibP2P.Crypto.Protobuf
     Network.LibP2P.Crypto.PeerId
     Network.LibP2P.MultistreamSelect.Wire
@@ -89,6 +91,9 @@ library
     text        >= 1.2  && < 2.2,
     cacophony   >= 0.11 && < 0.12,
     crypton     >= 1.0   && < 1.1,
+    crypton-x509 >= 1.7  && < 1.9,
+    crypton-asn1-types >= 0.4 && < 0.5,
+    crypton-asn1-encoding >= 0.9 && < 0.11,
     memory      >= 0.18  && < 0.19,
     ppad-base58 >= 0.2  && < 0.3,
     iproute     >= 1.7  && < 1.8,
@@ -126,6 +131,8 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Core.MultihashSpec
     Test.Network.LibP2P.Multiaddr.MultiaddrSpec
     Test.Network.LibP2P.Crypto.PeerIdSpec
+    Test.Network.LibP2P.Crypto.RSASpec
+    Test.Network.LibP2P.Crypto.Secp256k1Spec
     Test.Network.LibP2P.MultistreamSelect.NegotiationSpec
     Test.Network.LibP2P.Mux.Yamux.FrameSpec
     Test.Network.LibP2P.Mux.Yamux.StreamSpec
