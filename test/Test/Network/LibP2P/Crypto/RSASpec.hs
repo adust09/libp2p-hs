@@ -40,13 +40,6 @@ spec = do
           verify (kpPublic kp) "tampered" sig `shouldBe` False
 
   describe "protobuf key-type decoding" $ do
-    it "fails gracefully on the unsupported ECDSA key type" $ do
-      -- Field 1 (Type) = 3 (ECDSA), Field 2 (Data) = empty.
-      let bs = BS.pack [0x08, 0x03, 0x12, 0x00]
-      case decodePublicKey bs of
-        Left err -> null err `shouldBe` False
-        Right _ -> expectationFailure "expected decode to fail for ECDSA"
-
     it "fails gracefully on an unknown key type" $ do
       let bs = BS.pack [0x08, 0x63, 0x12, 0x00]
       case decodePublicKey bs of

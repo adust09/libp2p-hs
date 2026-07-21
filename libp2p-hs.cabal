@@ -40,6 +40,7 @@ library
     Network.LibP2P.Crypto.Ed25519
     Network.LibP2P.Crypto.RSA
     Network.LibP2P.Crypto.Secp256k1
+    Network.LibP2P.Crypto.ECDSA
     Network.LibP2P.Crypto.Protobuf
     Network.LibP2P.Crypto.PeerId
     Network.LibP2P.MultistreamSelect.Wire
@@ -133,6 +134,7 @@ test-suite libp2p-hs-test
     Test.Network.LibP2P.Crypto.PeerIdSpec
     Test.Network.LibP2P.Crypto.RSASpec
     Test.Network.LibP2P.Crypto.Secp256k1Spec
+    Test.Network.LibP2P.Crypto.ECDSASpec
     Test.Network.LibP2P.MultistreamSelect.NegotiationSpec
     Test.Network.LibP2P.Mux.Yamux.FrameSpec
     Test.Network.LibP2P.Mux.Yamux.StreamSpec

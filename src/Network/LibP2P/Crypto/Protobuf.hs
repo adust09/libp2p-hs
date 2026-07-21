@@ -17,17 +17,18 @@ import Network.LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import Network.LibP2P.Crypto.Key (KeyType (..), PublicKey (..))
 
 -- | Protobuf KeyType enum values (per libp2p peer-ids spec: RSA=0, Ed25519=1,
--- Secp256k1=2, ECDSA=3). ECDSA is not yet supported and decodes to a typed error.
+-- Secp256k1=2, ECDSA=3).
 keyTypeToProto :: KeyType -> Word64
 keyTypeToProto RSA = 0
 keyTypeToProto Ed25519 = 1
 keyTypeToProto Secp256k1 = 2
+keyTypeToProto ECDSA = 3
 
 keyTypeFromProto :: Word64 -> Either String KeyType
 keyTypeFromProto 0 = Right RSA
 keyTypeFromProto 1 = Right Ed25519
 keyTypeFromProto 2 = Right Secp256k1
-keyTypeFromProto 3 = Left "unsupported KeyType: ECDSA (3)"
+keyTypeFromProto 3 = Right ECDSA
 keyTypeFromProto n = Left $ "unknown KeyType: " <> show n
 
 -- | Deterministic protobuf encoding of a PublicKey message.
