@@ -7,7 +7,7 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Network.LibP2P.Crypto.Ed25519 (generateKeyPair)
 import Network.LibP2P.Crypto.Key (KeyPair, publicKey)
 import Network.LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..))
+import Network.LibP2P.Multiaddr (Multiaddr (..))
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
 import Network.LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
@@ -23,14 +23,14 @@ import Network.LibP2P.Switch.Listen
   , handleInbound
   , streamAcceptLoop
   )
-import Network.LibP2P.Switch.Switch (newSwitch, setStreamHandler)
+import Network.LibP2P.Switch (newSwitch, setStreamHandler)
 import Network.LibP2P.Switch.Types
   ( Connection (..)
   , MuxerSession (..)
   , Switch (..)
   )
 import Network.LibP2P.Switch.Upgrade (upgradeInbound, upgradeOutbound)
-import Network.LibP2P.Transport.Transport (RawConnection (..))
+import Network.LibP2P.Transport (RawConnection (..))
 import System.Timeout (timeout)
 import Test.Hspec
 

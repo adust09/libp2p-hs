@@ -5,7 +5,7 @@ import Data.Text (Text)
 import Network.LibP2P.Core.Varint (encodeUvarint)
 import Network.LibP2P.Crypto.PeerId (PeerId (..))
 import Network.LibP2P.Multiaddr.Codec
-import Network.LibP2P.Multiaddr.Multiaddr
+import Network.LibP2P.Multiaddr
 import Network.LibP2P.Multiaddr.Protocol
 import Test.Hspec
 

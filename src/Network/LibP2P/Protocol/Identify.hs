@@ -9,7 +9,7 @@
 --
 -- Also implements Identify Push (/ipfs/id/push/1.0.0) for proactive
 -- updates when local state changes.
-module Network.LibP2P.Protocol.Identify.Identify
+module Network.LibP2P.Protocol.Identify
   ( -- * Protocol IDs
     identifyProtocolId
   , identifyPushProtocolId
@@ -33,7 +33,7 @@ import Network.LibP2P.Crypto.PeerId (PeerId)
 import Network.LibP2P.Crypto.Protobuf (encodePublicKey)
 import Network.LibP2P.Crypto.Key (kpPublic)
 import Network.LibP2P.Multiaddr.Codec (encodeProtocols)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..))
+import Network.LibP2P.Multiaddr (Multiaddr (..))
 import Network.LibP2P.MultistreamSelect.Negotiation
   ( ProtocolId
   , StreamIO (..)

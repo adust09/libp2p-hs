@@ -2,7 +2,7 @@
 --
 -- A multiaddr is a binary-encoded, composable network address that describes
 -- the entire protocol stack needed to reach a peer.
-module Network.LibP2P.Multiaddr.Multiaddr
+module Network.LibP2P.Multiaddr
   ( Multiaddr (..)
   , fromText
   , toText

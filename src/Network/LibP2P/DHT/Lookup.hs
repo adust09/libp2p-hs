@@ -27,7 +27,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Time (UTCTime, getCurrentTime)
 import Network.LibP2P.Crypto.PeerId (PeerId (..))
-import Network.LibP2P.DHT.DHT (DHTNode (..), ProviderEntry (..), Validator (..))
+import Network.LibP2P.DHT (DHTNode (..), ProviderEntry (..), Validator (..))
 import Network.LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
 import Network.LibP2P.DHT.Message
 import Network.LibP2P.DHT.RoutingTable (closestPeers, insertPeer, allPeers)

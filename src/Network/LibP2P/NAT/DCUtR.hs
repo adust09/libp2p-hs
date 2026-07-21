@@ -11,7 +11,7 @@
 --   B waits RTT/2, then dials A's addresses
 --   A receives SYNC, then dials B's addresses immediately
 --   Both peers attempt direct connections at approximately the same time
-module Network.LibP2P.NAT.DCUtR.DCUtR
+module Network.LibP2P.NAT.DCUtR
   ( -- * Types
     DCUtRConfig (..)
   , DCUtRResult (..)
@@ -30,7 +30,7 @@ import Control.Concurrent (threadDelay)
 import Data.Time.Clock (getCurrentTime, diffUTCTime, NominalDiffTime)
 import Network.LibP2P.NAT.DCUtR.Message
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr, toBytes, fromBytes)
+import Network.LibP2P.Multiaddr (Multiaddr, toBytes, fromBytes)
 
 -- | DCUtR configuration.
 data DCUtRConfig = DCUtRConfig

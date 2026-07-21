@@ -8,9 +8,9 @@ import Control.Concurrent.STM (newTQueueIO, atomically, writeTQueue, readTQueue,
 import Data.IORef (newIORef, readIORef, modifyIORef')
 import Data.Word (Word8)
 import Network.LibP2P.NAT.DCUtR.Message
-import Network.LibP2P.NAT.DCUtR.DCUtR
+import Network.LibP2P.NAT.DCUtR
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..), toBytes)
+import Network.LibP2P.Multiaddr (Multiaddr (..), toBytes)
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
 
 -- | Create an in-memory stream pair for testing.

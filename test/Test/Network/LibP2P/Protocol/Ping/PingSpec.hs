@@ -23,8 +23,8 @@ import Network.LibP2P.Crypto.Ed25519 (generateKeyPair)
 import Network.LibP2P.Crypto.Key (kpPublic)
 import Network.LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey)
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import Network.LibP2P.Protocol.Ping.Ping
-import Network.LibP2P.Switch.Switch (newSwitch)
+import Network.LibP2P.Protocol.Ping
+import Network.LibP2P.Switch (newSwitch)
 import Network.LibP2P.Switch.Types (Switch (..))
 import System.IO.Error (mkIOError, eofErrorType)
 import Test.Hspec

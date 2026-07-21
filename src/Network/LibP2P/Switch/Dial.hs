@@ -42,7 +42,7 @@ import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Time.Clock (NominalDiffTime, addUTCTime, getCurrentTime)
 import Network.LibP2P.Crypto.PeerId (PeerId)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
+import Network.LibP2P.Multiaddr (Multiaddr)
 import Network.LibP2P.Switch.ConnPool (addConn, lookupConn)
 import Network.LibP2P.Switch.Listen (streamAcceptLoop)
 import Network.LibP2P.Switch.ResourceManager (Direction (..), releaseConnection, reserveConnection)
@@ -54,7 +54,7 @@ import Network.LibP2P.Switch.Types
   , Switch (..)
   )
 import Network.LibP2P.Switch.Upgrade (upgradeOutbound)
-import Network.LibP2P.Transport.Transport (Transport (..))
+import Network.LibP2P.Transport (Transport (..))
 
 -- | Initial backoff duration after first failure: 5 seconds.
 initialBackoffSeconds :: NominalDiffTime

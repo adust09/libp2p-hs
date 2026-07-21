@@ -9,7 +9,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Time (getCurrentTime)
 import Network.LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
-import Network.LibP2P.DHT.DHT
+import Network.LibP2P.DHT
 import Network.LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
 import Network.LibP2P.DHT.Lookup
 import Network.LibP2P.DHT.Message

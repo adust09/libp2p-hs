@@ -6,7 +6,7 @@
 -- The handler runs an echo loop: reads 32 bytes, writes them back,
 -- until the stream closes. The initiator sends 32 random bytes,
 -- measures round-trip time, and verifies the echo matches.
-module Network.LibP2P.Protocol.Ping.Ping
+module Network.LibP2P.Protocol.Ping
   ( -- * Protocol ID
     pingProtocolId
     -- * Types

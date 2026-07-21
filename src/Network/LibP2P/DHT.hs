@@ -6,7 +6,7 @@
 --
 -- For testability, sendDHTRequest is a field of DHTNode, allowing mock
 -- injection in tests without real network connections.
-module Network.LibP2P.DHT.DHT
+module Network.LibP2P.DHT
   ( -- * Types
     DHTNode (..)
   , DHTMode (..)
@@ -38,9 +38,9 @@ import Network.LibP2P.DHT.Distance (peerIdToKey)
 import Network.LibP2P.DHT.Message
 import Network.LibP2P.DHT.RoutingTable (RoutingTable, closestPeers, newRoutingTable)
 import Network.LibP2P.DHT.Types
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
+import Network.LibP2P.Multiaddr (Multiaddr)
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import Network.LibP2P.Switch.Switch (setStreamHandler)
+import Network.LibP2P.Switch (setStreamHandler)
 import Network.LibP2P.Switch.Types (Switch (..))
 
 -- | DHT protocol identifier for multistream-select.

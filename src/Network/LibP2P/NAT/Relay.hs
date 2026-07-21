@@ -7,7 +7,7 @@
 --   - Reservation management (with expiration and limits)
 --   - Stream bridging between source and target
 --   - Resource limits (max reservations, max circuits, data/duration limits)
-module Network.LibP2P.NAT.Relay.Relay
+module Network.LibP2P.NAT.Relay
   ( -- * Types
     RelayConfig (..)
   , RelayState (..)

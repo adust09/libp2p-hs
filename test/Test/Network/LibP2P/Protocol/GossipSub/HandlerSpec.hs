@@ -52,7 +52,7 @@ import Network.LibP2P.Protocol.GossipSub.Types
   , defaultGossipSubParams
   , maxRPCSize
   )
-import Network.LibP2P.Switch.Switch (lookupStreamHandler, newSwitch, setStreamHandler)
+import Network.LibP2P.Switch (lookupStreamHandler, newSwitch, setStreamHandler)
 import Network.LibP2P.Switch.Types (Switch (..))
 import System.Timeout (timeout)
 import Test.Hspec

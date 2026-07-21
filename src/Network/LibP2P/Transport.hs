@@ -3,13 +3,13 @@
 -- Defines the record-of-functions pattern for transport-agnostic
 -- connection management. Each transport (TCP, QUIC, etc.) provides
 -- a Transport value with dial/listen/canDial implementations.
-module Network.LibP2P.Transport.Transport
+module Network.LibP2P.Transport
   ( RawConnection (..)
   , Listener (..)
   , Transport (..)
   ) where
 
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
+import Network.LibP2P.Multiaddr (Multiaddr)
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 
 -- | A raw (unencrypted, un-muxed) connection from a transport.

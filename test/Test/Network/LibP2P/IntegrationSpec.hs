@@ -16,7 +16,7 @@ import qualified Data.Map.Strict as Map
 import Network.LibP2P.Crypto.Ed25519 (generateKeyPair)
 import Network.LibP2P.Crypto.Key (KeyPair, publicKey)
 import Network.LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..))
+import Network.LibP2P.Multiaddr (Multiaddr (..))
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
 import Network.LibP2P.Protocol.GossipSub.Handler
   ( gossipJoin
@@ -32,12 +32,12 @@ import Network.LibP2P.Protocol.GossipSub.Types
   , defaultGossipSubParams
   , GossipSubParams (..)
   )
-import Network.LibP2P.Protocol.Identify.Identify
+import Network.LibP2P.Protocol.Identify
   ( registerIdentifyHandlers
   , requestIdentify
   )
 import Network.LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
-import Network.LibP2P.Protocol.Ping.Ping
+import Network.LibP2P.Protocol.Ping
   ( PingResult (..)
   , registerPingHandler
   , sendPing
@@ -49,7 +49,7 @@ import Network.LibP2P.Switch.Listen
   , defaultConnectionGater
   , switchListen
   )
-import Network.LibP2P.Switch.Switch (addTransport, newSwitch, switchClose)
+import Network.LibP2P.Switch (addTransport, newSwitch, switchClose)
 import Network.LibP2P.Switch.Types (Connection (..), DialError (..), Switch (..))
 import Network.LibP2P.Transport.TCP (newTCPTransport)
 import System.Timeout (timeout)

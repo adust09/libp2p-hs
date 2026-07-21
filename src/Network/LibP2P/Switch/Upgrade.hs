@@ -69,7 +69,7 @@ import Network.LibP2P.Switch.Types
   , Direction (..)
   , MuxerSession (..)
   )
-import Network.LibP2P.Transport.Transport (RawConnection (..))
+import Network.LibP2P.Transport (RawConnection (..))
 import qualified Network.LibP2P.Crypto.Protobuf as Proto
 import qualified Network.LibP2P.Security.Noise.Handshake as HS
 

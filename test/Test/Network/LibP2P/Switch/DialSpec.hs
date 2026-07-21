@@ -8,7 +8,7 @@ import Data.Time.Clock (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCu
 import Network.LibP2P.Crypto.Ed25519 (generateKeyPair)
 import Network.LibP2P.Crypto.Key (KeyPair, publicKey)
 import Network.LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..))
+import Network.LibP2P.Multiaddr (Multiaddr (..))
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
 import Network.LibP2P.Switch.ConnPool (addConn, lookupConn)
@@ -20,7 +20,7 @@ import Network.LibP2P.Switch.Dial
   , maxBackoffSeconds
   , recordBackoff
   )
-import Network.LibP2P.Switch.Switch (addTransport, newSwitch, switchClose)
+import Network.LibP2P.Switch (addTransport, newSwitch, switchClose)
 import Network.LibP2P.Switch.Types
   ( BackoffEntry (..)
   , ConnState (..)
@@ -31,7 +31,7 @@ import Network.LibP2P.Switch.Types
   , Switch (..)
   )
 import Network.LibP2P.Switch.Upgrade (upgradeInbound)
-import Network.LibP2P.Transport.Transport (RawConnection (..), Transport (..))
+import Network.LibP2P.Transport (RawConnection (..), Transport (..))
 import Test.Hspec
 
 -- | Generate a test identity (PeerId, KeyPair).

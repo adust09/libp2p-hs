@@ -9,7 +9,7 @@ import Control.Concurrent (threadDelay)
 import Data.Word (Word8)
 import Data.IORef (newIORef, readIORef, modifyIORef')
 import Network.LibP2P.NAT.Relay.Message
-import Network.LibP2P.NAT.Relay.Relay
+import Network.LibP2P.NAT.Relay
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import Network.LibP2P.Crypto.PeerId (PeerId (..))
 
