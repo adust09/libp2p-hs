@@ -1,4 +1,4 @@
--- | GossipSub sliding-window message cache operations (11-pubsub.md).
+-- | GossipSub sliding-window message cache operations (specs/pubsub/gossipsub).
 --
 -- Stores recently seen messages in circular windows for IWANT responses
 -- and IHAVE gossip emission. Each heartbeat calls 'cacheShift' to rotate

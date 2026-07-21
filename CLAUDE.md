@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-libp2p-hs is a Haskell implementation of the [libp2p](https://libp2p.io/) networking stack. A 12-chapter implementation-level textbook (7,270 lines) serves as the authoritative reference for all implementation work; it lives in the `research-notes` repository at `~/research-notes/Projects/libp2p-hs/`.
+libp2p-hs is a Haskell implementation of the [libp2p](https://libp2p.io/) networking stack. The authoritative references for all implementation work are the [upstream libp2p specs](https://github.com/libp2p/specs) and the mature reference implementations (go-libp2p, rust-libp2p).
 
 ## Current State
 
@@ -21,25 +21,24 @@ Following an invitation from a libp2p maintainer, the project is joining the [`l
 
 ## Documentation Reference
 
-The textbook (in `~/research-notes/Projects/libp2p-hs/`) covers wire formats, protobuf definitions, handshake sequences, and byte-level structures. Always consult the relevant chapter before implementing a component:
+Always consult the relevant upstream spec before touching a component (paths relative to [libp2p/specs](https://github.com/libp2p/specs) unless noted):
 
-| Component | Chapter | Key Content |
-|-----------|---------|-------------|
-| Multiaddr | `03-addressing.md` | Binary format, protocol codes, varint encoding |
-| Peer ID | `02-peer-identity.md` | Ed25519/RSA/Secp256k1 key encoding, Peer ID derivation algorithm |
-| multistream-select | `07-protocols.md` | Wire format (varint-prefixed UTF-8 + newline), negotiation flow |
-| Noise handshake | `05-secure-channels.md` | XX pattern, handshake payload protobuf, framing |
-| Yamux | `06-multiplexing.md` | 12-byte frame header, flow control, stream lifecycle |
-| Switch/Swarm | `08-switch.md` | Connection upgrading pipeline, resource management |
-| Identify/Ping | `07-protocols.md` | Protobuf definitions, wire format |
-| Kademlia DHT | `09-dht.md` | XOR distance, k-buckets, RPC protobuf, iterative lookup |
-| NAT traversal | `10-nat-traversal.md` | AutoNAT, Circuit Relay v2, DCUtR protobuf definitions |
-| GossipSub | `11-pubsub.md` | Mesh management, peer scoring (P1-P7), heartbeat |
-| Connection flow | `12-connection-flow.md` | End-to-end TCP/QUIC walkthrough with byte-level detail |
+| Component | Spec | Key Content |
+|-----------|------|-------------|
+| Multiaddr | `addressing/`, [multiformats/multiaddr](https://github.com/multiformats/multiaddr) | Binary format, protocol codes, varint encoding |
+| Peer ID | `peer-ids/` | Ed25519/RSA/Secp256k1 key encoding, Peer ID derivation algorithm |
+| multistream-select | [multiformats/multistream-select](https://github.com/multiformats/multistream-select) | Wire format (varint-prefixed UTF-8 + newline), negotiation flow |
+| Noise handshake | `noise/` | XX pattern, handshake payload protobuf, framing |
+| Yamux | `yamux/`, [HashiCorp yamux spec](https://github.com/hashicorp/yamux/blob/master/spec.md) | 12-byte frame header, flow control, stream lifecycle |
+| Switch/Swarm | go-libp2p `p2p/net/swarm` | Connection upgrading pipeline, resource management |
+| Identify/Ping | `identify/`, `ping/` | Protobuf definitions, wire format |
+| Kademlia DHT | `kad-dht/` | XOR distance, k-buckets, RPC protobuf, iterative lookup |
+| NAT traversal | `autonat/`, `relay/`, `dcutr/` | AutoNAT, Circuit Relay v2, DCUtR protobuf definitions |
+| GossipSub | `pubsub/gossipsub/` | Mesh management, peer scoring (P1-P7), heartbeat |
 
 ## Planned Implementation Order
 
-Follow this sequence (defined in `INDEX.md`):
+Follow this sequence:
 
 1. Multiaddr parsing/encoding
 2. Peer ID generation (Ed25519 first)

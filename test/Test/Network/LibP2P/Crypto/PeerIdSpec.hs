@@ -15,7 +15,7 @@ spec :: Spec
 spec = do
   describe "Protobuf encoding" $ do
     it "encodes Ed25519 pubkey to 36 bytes" $ do
-      -- From 02-peer-identity.md:
+      -- From specs/peer-ids:
       -- Ed25519 pubkey 0x1ed1e8fa... → protobuf 0x08011220... (36 bytes)
       let rawPubKey =
             BS.pack

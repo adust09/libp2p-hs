@@ -1,6 +1,6 @@
 -- | AutoNAT v1 message encoding/decoding (protobuf).
 --
--- Wire format from 10-nat-traversal.md:
+-- Wire format from specs/autonat (autonat.proto):
 --   Message framing: [uvarint length][protobuf message]
 --   AutoNAT Message fields: type(1), dial(2), dialResponse(3)
 --   PeerInfo fields: id(1), addrs(2)

@@ -1,4 +1,4 @@
--- | Listen loop for the Switch (08-switch.md §Listening).
+-- | Listen loop for the Switch.
 --
 -- Accepts inbound connections, applies connection gating policy,
 -- upgrades to secure multiplexed connections, and dispatches
@@ -41,7 +41,7 @@ import Network.LibP2P.Switch.Types
 import Network.LibP2P.Switch.Upgrade (upgradeInbound)
 import Network.LibP2P.Transport.Transport (Listener (..), RawConnection (..), Transport (..))
 
--- | Connection gater: policy-based admission control (08-switch.md §Connection Gating).
+-- | Connection gater: policy-based admission control.
 --
 -- Called at multiple points during connection establishment to allow
 -- or deny based on policy (IP blocklist, Peer ID allowlist, etc.).

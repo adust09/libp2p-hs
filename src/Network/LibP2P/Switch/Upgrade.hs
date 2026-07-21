@@ -7,7 +7,7 @@
 --   3. multistream-select: negotiate muxer ("/yamux/1.0.0")
 --   4. Yamux session init: multiplexed streams
 --
--- See 08-switch.md §Connection Upgrading Pipeline.
+-- Implements the connection upgrading pipeline.
 module Network.LibP2P.Switch.Upgrade
   ( -- * Streaming handshake
     performStreamHandshake

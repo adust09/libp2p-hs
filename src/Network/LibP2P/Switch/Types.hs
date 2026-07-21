@@ -2,7 +2,7 @@
 --
 -- Defines connection states, direction, muxer session abstraction,
 -- connection records, switch events, and the Switch itself.
--- See 08-switch.md for the full specification.
+--
 module Network.LibP2P.Switch.Types
   ( ConnState (..)
   , Direction (..)
@@ -29,7 +29,7 @@ import Network.LibP2P.Protocol.Identify.Message (IdentifyInfo)
 import Network.LibP2P.Switch.ResourceManager (Direction (..), ResourceError (..), ResourceManager)
 import Network.LibP2P.Transport.Transport (Listener, Transport)
 
--- | Connection state machine (08-switch.md §Connection States).
+-- | Connection state machine.
 --
 -- Connecting → ConnOpen → Closing → Closed
 data ConnState
@@ -72,7 +72,7 @@ data SwitchEvent
   | Disconnected !PeerId !Direction !Multiaddr  -- ^ Connection closed
   deriving (Show, Eq)
 
--- | Errors that can occur during a dial operation (08-switch.md §Dialing).
+-- | Errors that can occur during a dial operation.
 data DialError
   = DialBackoff               -- ^ Peer is in backoff period (recently failed)
   | DialNoAddresses           -- ^ No addresses provided for dialing
@@ -84,7 +84,7 @@ data DialError
   | DialPeerIdMismatch !PeerId !PeerId  -- ^ Expected vs actual remote PeerId
   deriving (Show, Eq)
 
--- | Per-peer dial backoff state (08-switch.md §Dial Backoff).
+-- | Per-peer dial backoff state.
 --
 -- After a failed dial, subsequent dials are rejected until the backoff
 -- expires. Duration doubles on each consecutive failure up to 300s max.

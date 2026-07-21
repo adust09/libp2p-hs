@@ -10,7 +10,7 @@ spec :: Spec
 spec = do
   describe "encodeHeader" $ do
     it "encodes Data SYN stream=1 len=5 (docs example)" $ do
-      -- From 06-multiplexing.md:
+      -- From the HashiCorp yamux spec:
       -- 00 00 0001 00000001 00000005
       let hdr =
             YamuxHeader
