@@ -11,7 +11,7 @@ import Data.Bits (Bits (..))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as Builder
-import qualified Data.ByteString.Lazy as LBS
+import qualified Data.ByteString.Lazy as BL
 import Data.Word (Word64)
 
 -- | Maximum number of bytes for a valid unsigned varint (ceil(64/7) = 10).
@@ -20,7 +20,7 @@ maxVarintBytes = 10
 
 -- | Encode a Word64 as an unsigned LEB128 varint.
 encodeUvarint :: Word64 -> ByteString
-encodeUvarint = LBS.toStrict . Builder.toLazyByteString . go
+encodeUvarint = BL.toStrict . Builder.toLazyByteString . go
   where
     go :: Word64 -> Builder.Builder
     go n
