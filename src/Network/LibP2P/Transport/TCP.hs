@@ -12,10 +12,10 @@ import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import qualified Data.ByteString as BS
 import Data.IP (IPv6, fromHostAddress6, toHostAddress6)
 import Data.Word (Word16, Word32, Word8)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..))
+import Network.LibP2P.Multiaddr (Multiaddr (..))
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import Network.LibP2P.Transport.Transport (Listener (..), RawConnection (..), Transport (..))
+import Network.LibP2P.Transport (Listener (..), RawConnection (..), Transport (..))
 import qualified Network.Socket as NS
 import qualified Network.Socket.ByteString as NSB
 

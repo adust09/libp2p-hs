@@ -14,7 +14,7 @@ import Data.Time (getCurrentTime)
 import Data.Word (Word8)
 import Network.LibP2P.Crypto.Key (KeyPair (..), PublicKey (..), PrivateKey (..), KeyType (..))
 import Network.LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
-import Network.LibP2P.DHT.DHT
+import Network.LibP2P.DHT
 import Network.LibP2P.DHT.Distance (peerIdToKey)
 import Network.LibP2P.DHT.Message
 import Network.LibP2P.DHT.RoutingTable (insertPeer)

@@ -2,7 +2,7 @@ module Test.Network.LibP2P.Switch.ConnPoolSpec (spec) where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
 import Network.LibP2P.Crypto.PeerId (PeerId (..))
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..))
+import Network.LibP2P.Multiaddr (Multiaddr (..))
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import Network.LibP2P.Switch.ConnPool

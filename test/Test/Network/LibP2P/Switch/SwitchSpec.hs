@@ -5,12 +5,12 @@ import qualified Data.Map.Strict as Map
 import Network.LibP2P.Crypto.Ed25519 (generateKeyPair)
 import Network.LibP2P.Crypto.Key (KeyPair, publicKey)
 import Network.LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..), fromText)
+import Network.LibP2P.Multiaddr (Multiaddr (..), fromText)
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
-import Network.LibP2P.Switch.Switch
+import Network.LibP2P.Switch
 import Network.LibP2P.Switch.Types
 import Network.LibP2P.Transport.TCP (newTCPTransport)
-import Network.LibP2P.Transport.Transport (Transport (..))
+import Network.LibP2P.Transport (Transport (..))
 import Test.Hspec
 
 -- | Generate a PeerId and KeyPair for testing.

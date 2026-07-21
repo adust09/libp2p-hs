@@ -33,7 +33,7 @@ library
     Network.LibP2P.Core.Binary
     Network.LibP2P.Core.Varint
     Network.LibP2P.Core.Multihash
-    Network.LibP2P.Multiaddr.Multiaddr
+    Network.LibP2P.Multiaddr
     Network.LibP2P.Multiaddr.Protocol
     Network.LibP2P.Multiaddr.Codec
     Network.LibP2P.Crypto.Key
@@ -46,32 +46,32 @@ library
     Network.LibP2P.Mux.Yamux.Types
     Network.LibP2P.Mux.Yamux.Stream
     Network.LibP2P.Mux.Yamux.Session
-    Network.LibP2P.Transport.Transport
+    Network.LibP2P.Transport
     Network.LibP2P.Transport.TCP
     Network.LibP2P.Switch.Types
     Network.LibP2P.Switch.ConnPool
-    Network.LibP2P.Switch.Switch
+    Network.LibP2P.Switch
     Network.LibP2P.Switch.Dial
     Network.LibP2P.Switch.Listen
     Network.LibP2P.Switch.Upgrade
     Network.LibP2P.Switch.ResourceManager
     Network.LibP2P.Protocol.Identify.Message
-    Network.LibP2P.Protocol.Identify.Identify
-    Network.LibP2P.Protocol.Ping.Ping
+    Network.LibP2P.Protocol.Identify
+    Network.LibP2P.Protocol.Ping
     Network.LibP2P.DHT.Types
     Network.LibP2P.DHT.Distance
     Network.LibP2P.DHT.RoutingTable
     Network.LibP2P.DHT.Message
-    Network.LibP2P.DHT.DHT
+    Network.LibP2P.DHT
     Network.LibP2P.DHT.Lookup
     Network.LibP2P.NAT.AutoNAT.Message
-    Network.LibP2P.NAT.AutoNAT.AutoNAT
+    Network.LibP2P.NAT.AutoNAT
     Network.LibP2P.Crypto.SignedEnvelope
     Network.LibP2P.NAT.Relay.Message
-    Network.LibP2P.NAT.Relay.Relay
+    Network.LibP2P.NAT.Relay
     Network.LibP2P.NAT.Relay.Client
     Network.LibP2P.NAT.DCUtR.Message
-    Network.LibP2P.NAT.DCUtR.DCUtR
+    Network.LibP2P.NAT.DCUtR
     Network.LibP2P.Security.Noise.Framing
     Network.LibP2P.Security.Noise.Handshake
     Network.LibP2P.Security.Noise.Session

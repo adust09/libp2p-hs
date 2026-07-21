@@ -69,7 +69,7 @@ import Network.LibP2P.Protocol.GossipSub.Types
   , maxRPCSize
   )
 import Network.LibP2P.Switch.ConnPool (lookupConn)
-import Network.LibP2P.Switch.Switch (removeStreamHandler, setStreamHandler)
+import Network.LibP2P.Switch (removeStreamHandler, setStreamHandler)
 import Network.LibP2P.Switch.Types
   ( Connection (..)
   , MuxerSession (..)

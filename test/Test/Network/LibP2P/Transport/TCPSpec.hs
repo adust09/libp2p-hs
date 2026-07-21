@@ -4,10 +4,10 @@ import Control.Concurrent.Async (concurrently)
 import Control.Exception (SomeException, try)
 import qualified Data.ByteString as BS
 import Data.Word (Word8)
-import Network.LibP2P.Multiaddr.Multiaddr (fromText)
+import Network.LibP2P.Multiaddr (fromText)
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import Network.LibP2P.Transport.TCP (multiaddrToHostPort, newTCPTransport)
-import Network.LibP2P.Transport.Transport
+import Network.LibP2P.Transport
 import Test.Hspec
 
 spec :: Spec

@@ -23,11 +23,11 @@ import Data.Map.Strict (Map)
 import Data.Time.Clock (UTCTime)
 import Network.LibP2P.Crypto.Key (KeyPair)
 import Network.LibP2P.Crypto.PeerId (PeerId)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
+import Network.LibP2P.Multiaddr (Multiaddr)
 import Network.LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO)
 import Network.LibP2P.Protocol.Identify.Message (IdentifyInfo)
 import Network.LibP2P.Switch.ResourceManager (Direction (..), ResourceError (..), ResourceManager)
-import Network.LibP2P.Transport.Transport (Listener, Transport)
+import Network.LibP2P.Transport (Listener, Transport)
 
 -- | Connection state machine.
 --

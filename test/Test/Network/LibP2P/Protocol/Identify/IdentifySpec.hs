@@ -22,9 +22,9 @@ import Network.LibP2P.Crypto.Key (kpPublic)
 import Network.LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey)
 import Network.LibP2P.Crypto.Protobuf (encodePublicKey)
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import Network.LibP2P.Protocol.Identify.Identify
+import Network.LibP2P.Protocol.Identify
 import Network.LibP2P.Protocol.Identify.Message (IdentifyInfo (..), decodeIdentify, encodeIdentify)
-import Network.LibP2P.Switch.Switch (newSwitch, setStreamHandler)
+import Network.LibP2P.Switch (newSwitch, setStreamHandler)
 import Network.LibP2P.Switch.Types (Switch (..))
 import Data.Word (Word8)
 import System.IO.Error (mkIOError, eofErrorType)

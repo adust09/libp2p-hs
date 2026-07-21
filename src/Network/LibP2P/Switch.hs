@@ -3,7 +3,7 @@
 -- The Switch is the central coordinator of the libp2p stack.
 -- This module provides construction, transport management,
 -- protocol handler registration, and shutdown.
-module Network.LibP2P.Switch.Switch
+module Network.LibP2P.Switch
   ( newSwitch
   , addTransport
   , selectTransport
@@ -20,11 +20,11 @@ import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Network.LibP2P.Crypto.Key (KeyPair)
 import Network.LibP2P.Crypto.PeerId (PeerId)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
+import Network.LibP2P.Multiaddr (Multiaddr)
 import Network.LibP2P.MultistreamSelect.Negotiation (ProtocolId)
 import Network.LibP2P.Switch.ResourceManager (DefaultLimits (..), defaultPeerLimits, defaultSystemLimits, newResourceManager)
 import Network.LibP2P.Switch.Types (ActiveListener (..), StreamHandler, Switch (..))
-import Network.LibP2P.Transport.Transport (Listener (..), Transport (..))
+import Network.LibP2P.Transport (Listener (..), Transport (..))
 
 -- | Create a new Switch with the given local identity.
 -- All internal state is initialized empty.

@@ -15,7 +15,7 @@ module Network.LibP2P.DHT.Types
 import Data.ByteString (ByteString)
 import Data.Time (UTCTime)
 import Network.LibP2P.Crypto.PeerId (PeerId)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
+import Network.LibP2P.Multiaddr (Multiaddr)
 
 -- | 256-bit key in the DHT keyspace (always exactly 32 bytes, SHA-256 output).
 newtype DHTKey = DHTKey ByteString

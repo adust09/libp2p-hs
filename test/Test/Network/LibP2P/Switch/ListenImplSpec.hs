@@ -12,7 +12,7 @@ import Control.Exception (SomeException, try)
 import Network.LibP2P.Crypto.Ed25519 (generateKeyPair)
 import Network.LibP2P.Crypto.Key (KeyPair, publicKey)
 import Network.LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..))
+import Network.LibP2P.Multiaddr (Multiaddr (..))
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
 import Network.LibP2P.Switch.ConnPool (lookupConn)
 import Network.LibP2P.Switch.Dial (dial)
@@ -22,7 +22,7 @@ import Network.LibP2P.Switch.Listen
   , switchListen
   , switchListenAddrs
   )
-import Network.LibP2P.Switch.Switch (addTransport, newSwitch, setStreamHandler, switchClose)
+import Network.LibP2P.Switch (addTransport, newSwitch, setStreamHandler, switchClose)
 import Network.LibP2P.Switch.Types (Connection (..), Switch (..))
 import Network.LibP2P.Transport.TCP (newTCPTransport)
 import System.Timeout (timeout)

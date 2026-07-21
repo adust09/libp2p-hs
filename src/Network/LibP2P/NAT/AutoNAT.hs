@@ -6,7 +6,7 @@
 -- Security rules (from specs/autonat):
 --   - Server MUST NOT dial addresses unless they match the requester's observed IP
 --   - Server MUST NOT accept dial requests over relayed connections
-module Network.LibP2P.NAT.AutoNAT.AutoNAT
+module Network.LibP2P.NAT.AutoNAT
   ( -- * Types
     NATStatus (..)
   , AutoNATConfig (..)
@@ -23,7 +23,7 @@ import qualified Data.Text as T
 import Data.Word (Word32)
 import Network.LibP2P.NAT.AutoNAT.Message
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..), toBytes, fromBytes)
+import Network.LibP2P.Multiaddr (Multiaddr (..), toBytes, fromBytes)
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
 import Network.LibP2P.Crypto.PeerId (PeerId (..))
 

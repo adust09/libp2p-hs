@@ -24,7 +24,7 @@ import Control.Exception (SomeException, catch)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Network.LibP2P.Crypto.PeerId (PeerId)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr)
+import Network.LibP2P.Multiaddr (Multiaddr)
 import Network.LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO
@@ -39,7 +39,7 @@ import Network.LibP2P.Switch.Types
   , Switch (..)
   )
 import Network.LibP2P.Switch.Upgrade (upgradeInbound)
-import Network.LibP2P.Transport.Transport (Listener (..), RawConnection (..), Transport (..))
+import Network.LibP2P.Transport (Listener (..), RawConnection (..), Transport (..))
 
 -- | Connection gater: policy-based admission control.
 --

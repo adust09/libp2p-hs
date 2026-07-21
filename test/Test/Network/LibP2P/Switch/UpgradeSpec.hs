@@ -6,13 +6,13 @@ import Data.IORef (newIORef)
 import Network.LibP2P.Crypto.Ed25519 (generateKeyPair)
 import Network.LibP2P.Crypto.Key (KeyPair, publicKey)
 import Network.LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import Network.LibP2P.Multiaddr.Multiaddr (Multiaddr (..))
+import Network.LibP2P.Multiaddr (Multiaddr (..))
 import Network.LibP2P.Multiaddr.Protocol (Protocol (..))
 import Network.LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
 import Network.LibP2P.Security.Noise.Handshake (HandshakeResult (..))
 import Network.LibP2P.Switch.Types (Connection (..), Direction (..), MuxerSession (..))
 import Network.LibP2P.Switch.Upgrade
-import Network.LibP2P.Transport.Transport (RawConnection (..))
+import Network.LibP2P.Transport (RawConnection (..))
 import Test.Hspec
 
 -- | Generate a test identity (PeerId, KeyPair).
