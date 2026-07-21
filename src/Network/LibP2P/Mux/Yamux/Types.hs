@@ -58,15 +58,15 @@ data YamuxStream = YamuxStream
 
 -- | Session state.
 data YamuxSession = YamuxSession
-  { ysRole :: !SessionRole
-  , ysNextStreamId :: !(TVar Word32) -- ^ Next ID to allocate
-  , ysStreams :: !(TVar (Map.Map Word32 YamuxStream)) -- ^ Active streams
-  , ysAcceptCh :: !(TQueue YamuxStream) -- ^ Inbound streams (max 256 pending)
-  , ysSendCh :: !(TQueue (YamuxHeader, ByteString)) -- ^ Outbound frame queue
-  , ysShutdown :: !(TVar Bool) -- ^ Local GoAway sent
-  , ysRemoteGoAway :: !(TVar Bool) -- ^ Remote GoAway received
-  , ysPings :: !(TVar (Map.Map Word32 (TMVar ()))) -- ^ Pending ping responses
-  , ysNextPingId :: !(TVar Word32)
-  , ysWrite :: !(ByteString -> IO ()) -- ^ Underlying transport write
-  , ysRead :: !(Int -> IO ByteString) -- ^ Underlying transport read exact N bytes
+  { ysessRole :: !SessionRole
+  , ysessNextStreamId :: !(TVar Word32) -- ^ Next ID to allocate
+  , ysessStreams :: !(TVar (Map.Map Word32 YamuxStream)) -- ^ Active streams
+  , ysessAcceptCh :: !(TQueue YamuxStream) -- ^ Inbound streams (max 256 pending)
+  , ysessSendCh :: !(TQueue (YamuxHeader, ByteString)) -- ^ Outbound frame queue
+  , ysessShutdown :: !(TVar Bool) -- ^ Local GoAway sent
+  , ysessRemoteGoAway :: !(TVar Bool) -- ^ Remote GoAway received
+  , ysessPings :: !(TVar (Map.Map Word32 (TMVar ()))) -- ^ Pending ping responses
+  , ysessNextPingId :: !(TVar Word32)
+  , ysessWrite :: !(ByteString -> IO ()) -- ^ Underlying transport write
+  , ysessRead :: !(Int -> IO ByteString) -- ^ Underlying transport read exact N bytes
   }

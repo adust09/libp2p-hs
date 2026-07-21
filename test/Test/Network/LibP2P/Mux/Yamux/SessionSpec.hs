@@ -173,10 +173,10 @@ spec = do
         result `shouldBe` Right ()
 
   describe "GoAway" $ do
-    it "GoAway Normal (0x00) sets ysShutdown" $ do
+    it "GoAway Normal (0x00) sets ysessShutdown" $ do
       withSessionPair $ \(client, _server) -> do
         sendGoAway client GoAwayNormal
-        shutdown <- readTVarIO (ysShutdown client)
+        shutdown <- readTVarIO (ysessShutdown client)
         shutdown `shouldBe` True
 
     it "openStream fails after local GoAway sent" $ do
@@ -189,7 +189,7 @@ spec = do
       withSessionPair $ \(client, server) -> do
         sendGoAway server GoAwayNormal
         atomically $ do
-          got <- readTVar (ysRemoteGoAway client)
+          got <- readTVar (ysessRemoteGoAway client)
           check got
         result <- openStream client
         shouldBeLeft YamuxSessionShutdown result
@@ -250,7 +250,7 @@ spec = do
       withAsync (sendLoop server) $ \_ -> do
         withAsync (recvLoop server) $ \_ -> do
           atomically $ do
-            shut <- readTVar (ysShutdown server)
+            shut <- readTVar (ysessShutdown server)
             check shut
 
     it "SYN with duplicate stream ID triggers GoAway" $ do
@@ -269,9 +269,9 @@ spec = do
               , yhLength = 0
               }
         -- Send raw frame bytes through client's write function (goes to server's read)
-        ysWrite client (encodeHeader dupSynHdr)
+        ysessWrite client (encodeHeader dupSynHdr)
         atomically $ do
-          shut <- readTVar (ysShutdown server)
+          shut <- readTVar (ysessShutdown server)
           check shut
 
     it "valid SYN with correct parity accepted normally" $ do
@@ -298,7 +298,7 @@ spec = do
         _ <- streamWrite clientStream (BS.replicate 100 0xAA)
         -- Server should detect over-window and enter shutdown
         atomically $ do
-          shut <- readTVar (ysShutdown server)
+          shut <- readTVar (ysessShutdown server)
           check shut
 
   describe "Flow control integration" $ do
