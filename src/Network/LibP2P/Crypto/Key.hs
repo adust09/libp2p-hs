@@ -9,12 +9,14 @@ module Network.LibP2P.Crypto.Key
   , verify
   , generateRSAKeyPair
   , generateSecp256k1KeyPair
+  , generateECDSAKeyPair
   ) where
 
 import qualified Crypto.Error as CE
 import qualified Crypto.PubKey.Ed25519 as Ed
 import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
+import qualified Network.LibP2P.Crypto.ECDSA as ECDSA
 import qualified Network.LibP2P.Crypto.RSA as RSA
 import qualified Network.LibP2P.Crypto.Secp256k1 as Secp256k1
 
@@ -23,6 +25,7 @@ data KeyType
   = Ed25519
   | RSA
   | Secp256k1
+  | ECDSA
   deriving (Show, Eq, Ord)
 
 -- | A public key with its type.
@@ -65,6 +68,8 @@ sign (PrivateKey Ed25519 skRaw) msg =
 sign (PrivateKey RSA skRaw) msg = RSA.sign skRaw msg
 sign (PrivateKey Secp256k1 _) _ =
   Left "sign: secp256k1 signing runs in IO (Network.LibP2P.Crypto.Secp256k1.signIO)"
+sign (PrivateKey ECDSA _) _ =
+  Left "sign: ECDSA signing runs in IO (Network.LibP2P.Crypto.ECDSA.signIO)"
 
 -- | Verify a signature against a public key and message.
 -- Supports every libp2p key type so remote peers of any type can be authenticated.
@@ -75,6 +80,7 @@ verify (PublicKey Ed25519 pkRaw) msg sigRaw =
     _ -> False
 verify (PublicKey RSA pkRaw) msg sigRaw = RSA.verify pkRaw msg sigRaw
 verify (PublicKey Secp256k1 pkRaw) msg sigRaw = Secp256k1.verify pkRaw msg sigRaw
+verify (PublicKey ECDSA pkRaw) msg sigRaw = ECDSA.verify pkRaw msg sigRaw
 
 -- | Generate a new RSA key pair (2048-bit) with libp2p wire-format key bytes.
 generateRSAKeyPair :: IO KeyPair
@@ -87,3 +93,9 @@ generateSecp256k1KeyPair :: IO KeyPair
 generateSecp256k1KeyPair = do
   (pub, priv) <- Secp256k1.generate
   pure $ KeyPair (PublicKey Secp256k1 pub) (PrivateKey Secp256k1 priv)
+
+-- | Generate a new ECDSA (P-256) key pair with libp2p wire-format key bytes.
+generateECDSAKeyPair :: IO KeyPair
+generateECDSAKeyPair = do
+  (pub, priv) <- ECDSA.generate
+  pure $ KeyPair (PublicKey ECDSA pub) (PrivateKey ECDSA priv)
