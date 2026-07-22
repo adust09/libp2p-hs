@@ -45,10 +45,10 @@ library
     LibP2P.Crypto.PeerId
     LibP2P.MultistreamSelect.Wire
     LibP2P.MultistreamSelect.Negotiation
-    LibP2P.Mux.Yamux.Frame
-    LibP2P.Mux.Yamux.Types
-    LibP2P.Mux.Yamux.Stream
-    LibP2P.Mux.Yamux.Session
+    LibP2P.Yamux.Frame
+    LibP2P.Yamux.Types
+    LibP2P.Yamux.Stream
+    LibP2P.Yamux.Session
     LibP2P.Transport
     LibP2P.Transport.TCP
     LibP2P.Switch.Types
@@ -75,9 +75,9 @@ library
     LibP2P.NAT.Relay.Client
     LibP2P.NAT.DCUtR.Message
     LibP2P.NAT.DCUtR
-    LibP2P.Security.Noise.Framing
-    LibP2P.Security.Noise.Handshake
-    LibP2P.Security.Noise.Session
+    LibP2P.Noise.Framing
+    LibP2P.Noise.Handshake
+    LibP2P.Noise.Session
     LibP2P.Protocol.GossipSub.Types
     LibP2P.Protocol.GossipSub.Message
     LibP2P.Protocol.GossipSub.Router
@@ -136,9 +136,9 @@ test-suite libp2p-hs-test
     LibP2P.Crypto.Secp256k1Spec
     LibP2P.Crypto.ECDSASpec
     LibP2P.MultistreamSelect.NegotiationSpec
-    LibP2P.Mux.Yamux.FrameSpec
-    LibP2P.Mux.Yamux.StreamSpec
-    LibP2P.Mux.Yamux.SessionSpec
+    LibP2P.Yamux.FrameSpec
+    LibP2P.Yamux.StreamSpec
+    LibP2P.Yamux.SessionSpec
     LibP2P.Transport.TCPSpec
     LibP2P.Switch.ConnPoolSpec
     LibP2P.Switch.SwitchSpec
@@ -150,7 +150,7 @@ test-suite libp2p-hs-test
     LibP2P.Protocol.Identify.MessageSpec
     LibP2P.Protocol.Identify.IdentifySpec
     LibP2P.Protocol.Ping.PingSpec
-    LibP2P.Security.Noise.HandshakeSpec
+    LibP2P.Noise.HandshakeSpec
     LibP2P.DHT.DistanceSpec
     LibP2P.DHT.RoutingTableSpec
     LibP2P.DHT.MessageSpec

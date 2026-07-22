@@ -2,7 +2,7 @@
 --
 -- All Noise messages (handshake and transport) are framed as:
 -- [2 bytes BE length][noise_message]
-module LibP2P.Security.Noise.Framing
+module LibP2P.Noise.Framing
   ( encodeFrame
   , decodeFrame
   , maxNoiseMessageSize

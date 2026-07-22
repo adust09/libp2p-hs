@@ -4,7 +4,7 @@
 -- with libp2p-specific payload injection (identity key + signature).
 --
 -- Uses cacophony for the core Noise protocol state machine.
-module LibP2P.Security.Noise.Handshake
+module LibP2P.Noise.Handshake
   ( -- * Handshake types
     HandshakeResult (..)
   , NoisePayload (..)
@@ -66,7 +66,7 @@ import LibP2P.Crypto.Key
 import qualified LibP2P.Crypto.Key as Key
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.Crypto.Protobuf (decodePublicKey, encodePublicKey)
-import LibP2P.Security.Noise.Session (NoiseSession, mkNoiseSession)
+import LibP2P.Noise.Session (NoiseSession, mkNoiseSession)
 
 -- | Type alias for the Noise state with our fixed cipher suite.
 type CacophonyState = NoiseState ChaChaPoly1305 Curve25519 SHA256

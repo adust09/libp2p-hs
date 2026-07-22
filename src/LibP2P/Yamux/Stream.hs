@@ -2,7 +2,7 @@
 --
 -- Implements per-stream data transfer with flow control
 -- per HashiCorp yamux spec.md §Data/WindowUpdate/Stream Close.
-module LibP2P.Mux.Yamux.Stream
+module LibP2P.Yamux.Stream
   ( streamWrite
   , streamRead
   , streamClose
@@ -12,8 +12,8 @@ module LibP2P.Mux.Yamux.Stream
 import Control.Concurrent.STM
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import LibP2P.Mux.Yamux.Frame
-import LibP2P.Mux.Yamux.Types
+import LibP2P.Yamux.Frame
+import LibP2P.Yamux.Types
 
 -- | Write data to a stream. Blocks when send window is 0.
 -- Writable states: SYNSent (optimistic), Established, RemoteClose.

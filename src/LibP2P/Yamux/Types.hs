@@ -4,7 +4,7 @@
 -- SessionRole determines stream ID parity, StreamState tracks the
 -- stream lifecycle state machine, and YamuxSession/YamuxStream hold
 -- per-session/per-stream mutable state via STM.
-module LibP2P.Mux.Yamux.Types
+module LibP2P.Yamux.Types
   ( SessionRole (..)
   , StreamState (..)
   , YamuxError (..)
@@ -16,7 +16,7 @@ import Control.Concurrent.STM (TMVar, TQueue, TVar)
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word32)
-import LibP2P.Mux.Yamux.Frame (GoAwayCode, YamuxHeader)
+import LibP2P.Yamux.Frame (GoAwayCode, YamuxHeader)
 
 -- | SessionRole determines stream ID parity (spec.md §Stream Identification).
 -- Client uses odd IDs (1, 3, 5, ...), Server uses even IDs (2, 4, 6, ...).

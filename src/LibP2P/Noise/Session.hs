@@ -3,7 +3,7 @@
 -- After the XX handshake completes, cacophony's NoiseState transitions
 -- to transport mode with two CipherStates (one for each direction).
 -- This module wraps that state for encrypted message exchange.
-module LibP2P.Security.Noise.Session
+module LibP2P.Noise.Session
   ( NoiseSession
   , mkNoiseSession
   , encryptMessage

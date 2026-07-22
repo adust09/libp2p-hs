@@ -1,13 +1,13 @@
-module LibP2P.Mux.Yamux.StreamSpec (spec) where
+module LibP2P.Yamux.StreamSpec (spec) where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, concurrently, withAsync)
 import Control.Concurrent.STM
 import qualified Data.ByteString as BS
-import LibP2P.Mux.Yamux.Frame (initialWindowSize)
-import LibP2P.Mux.Yamux.Session (acceptStream, newSession, openStream, recvLoop, sendLoop)
-import LibP2P.Mux.Yamux.Stream (streamClose, streamRead, streamReset, streamWrite)
-import LibP2P.Mux.Yamux.Types
+import LibP2P.Yamux.Frame (initialWindowSize)
+import LibP2P.Yamux.Session (acceptStream, newSession, openStream, recvLoop, sendLoop)
+import LibP2P.Yamux.Stream (streamClose, streamRead, streamReset, streamWrite)
+import LibP2P.Yamux.Types
 import Test.Hspec
 
 -- | Create an in-memory transport pair for testing.

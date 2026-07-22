@@ -9,7 +9,7 @@ import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
-import LibP2P.Security.Noise.Handshake (HandshakeResult (..))
+import LibP2P.Noise.Handshake (HandshakeResult (..))
 import LibP2P.Switch.Types (Connection (..), Direction (..), MuxerSession (..))
 import LibP2P.Switch.Upgrade
 import LibP2P.Transport (RawConnection (..))

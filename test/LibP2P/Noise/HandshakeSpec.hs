@@ -1,13 +1,13 @@
-module LibP2P.Security.Noise.HandshakeSpec (spec) where
+module LibP2P.Noise.HandshakeSpec (spec) where
 
 import qualified Data.ByteString as BS
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
-import LibP2P.Security.Noise.Framing
-import LibP2P.Security.Noise.Handshake
-import LibP2P.Security.Noise.Session
+import LibP2P.Noise.Framing
+import LibP2P.Noise.Handshake
+import LibP2P.Noise.Session
 import Test.Hspec
 
 spec :: Spec

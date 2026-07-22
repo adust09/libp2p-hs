@@ -2,7 +2,7 @@
 --
 -- Every Yamux frame has a fixed 12-byte header:
 -- Version (1) | Type (1) | Flags (2 BE) | StreamID (4 BE) | Length (4 BE)
-module LibP2P.Mux.Yamux.Frame
+module LibP2P.Yamux.Frame
   ( FrameType (..)
   , Flags (..)
   , YamuxHeader (..)

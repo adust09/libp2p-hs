@@ -7,7 +7,7 @@
 -- Two background loops run per session:
 --   recvLoop: reads 12-byte headers from transport, dispatches to streams
 --   sendLoop: dequeues from ysessSendCh, writes to transport
-module LibP2P.Mux.Yamux.Session
+module LibP2P.Yamux.Session
   ( newSession
   , closeSession
   , openStream
@@ -23,8 +23,8 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Word (Word32)
-import LibP2P.Mux.Yamux.Frame
-import LibP2P.Mux.Yamux.Types
+import LibP2P.Yamux.Frame
+import LibP2P.Yamux.Types
 
 -- | Create a new Yamux session over a transport connection.
 -- Client uses odd stream IDs starting at 1, server uses even starting at 2.

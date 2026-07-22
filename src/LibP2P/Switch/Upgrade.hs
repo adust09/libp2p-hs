@@ -33,19 +33,19 @@ import Data.Word (Word8)
 import LibP2P.Core.Binary (readWord16BE)
 import LibP2P.Crypto.Key (KeyPair (..))
 import LibP2P.Crypto.PeerId (fromPublicKey)
-import LibP2P.Mux.Yamux.Session (closeSession, newSession, recvLoop, sendLoop)
-import qualified LibP2P.Mux.Yamux.Session as Yamux
-import LibP2P.Mux.Yamux.Stream (streamRead)
-import qualified LibP2P.Mux.Yamux.Stream as YS
-import LibP2P.Mux.Yamux.Types (SessionRole (..), YamuxSession, YamuxStream)
+import LibP2P.Yamux.Session (closeSession, newSession, recvLoop, sendLoop)
+import qualified LibP2P.Yamux.Session as Yamux
+import LibP2P.Yamux.Stream (streamRead)
+import qualified LibP2P.Yamux.Stream as YS
+import LibP2P.Yamux.Types (SessionRole (..), YamuxSession, YamuxStream)
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
   , negotiateInitiator
   , negotiateResponder
   )
-import LibP2P.Security.Noise.Framing (encodeFrame)
-import LibP2P.Security.Noise.Handshake
+import LibP2P.Noise.Framing (encodeFrame)
+import LibP2P.Noise.Handshake
   ( HandshakeResult (..)
   , buildHandshakePayload
   , decodeNoisePayload
@@ -57,7 +57,7 @@ import LibP2P.Security.Noise.Handshake
   , verifyStaticKey
   , writeHandshakeMsg
   )
-import LibP2P.Security.Noise.Session
+import LibP2P.Noise.Session
   ( NoiseSession
   , decryptMessage
   , encryptMessage
@@ -71,7 +71,7 @@ import LibP2P.Switch.Types
   )
 import LibP2P.Transport (RawConnection (..))
 import qualified LibP2P.Crypto.Protobuf as Proto
-import qualified LibP2P.Security.Noise.Handshake as HS
+import qualified LibP2P.Noise.Handshake as HS
 
 -- | Read exactly n bytes from a StreamIO.
 readExact :: StreamIO -> Int -> IO ByteString

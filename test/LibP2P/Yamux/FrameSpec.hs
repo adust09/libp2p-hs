@@ -1,8 +1,8 @@
-module LibP2P.Mux.Yamux.FrameSpec (spec) where
+module LibP2P.Yamux.FrameSpec (spec) where
 
 import qualified Data.ByteString as BS
 import Data.Word (Word32)
-import LibP2P.Mux.Yamux.Frame
+import LibP2P.Yamux.Frame
 import Test.Hspec
 import Test.QuickCheck
 
