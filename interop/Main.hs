@@ -27,7 +27,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import qualified Database.Redis as Redis
-import Network.LibP2P
+import LibP2P
   ( GossipSubNode (..)
   , Multiaddr (..)
   , PeerId
@@ -57,9 +57,9 @@ import Network.LibP2P
   , toText
   , GossipSubParams (..)
   )
-import Network.LibP2P.Crypto.Key (publicKey)
-import Network.LibP2P.Protocol.GossipSub.Types (GossipSubRouter (..), PubSubMessage (..))
-import Network.LibP2P.Switch.Types (Switch)
+import LibP2P.Crypto.Key (publicKey)
+import LibP2P.Protocol.GossipSub.Types (GossipSubRouter (..), PubSubMessage (..))
+import LibP2P.Switch.Types (Switch)
 import Network.Socket
   ( AddrInfo (..)
   , SockAddr (..)

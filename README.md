@@ -5,8 +5,8 @@ A Haskell implementation of the [libp2p](https://libp2p.io/) modular peer-to-pee
 ## Quickstart
 
 ```haskell
-import Network.LibP2P
-import Network.LibP2P.Crypto.Key (publicKey)
+import LibP2P
+import LibP2P.Crypto.Key (publicKey)
 
 main :: IO ()
 main = do
