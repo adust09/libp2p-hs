@@ -10,9 +10,14 @@ import qualified Data.Set as Set
 import Data.IORef
 import Data.Time (UTCTime, addUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
-import LibP2P.Crypto.PeerId (PeerId (..))
+import Control.Exception (try)
+import LibP2P.Crypto.Ed25519 (generateKeyPair)
+import LibP2P.Crypto.Key (KeyPair (..), sign)
+import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey)
+import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Protocol.GossipSub.Types
 import LibP2P.Protocol.GossipSub.Router
+import LibP2P.Protocol.GossipSub.Validation (signingBytes, validateMessage)
 
 -- Test helpers
 
@@ -58,6 +63,35 @@ mkTestRouterWithTime localPid t = do
 
 localPid :: PeerId
 localPid = mkPeerId 0
+
+-- | A fresh Ed25519 identity for signing test messages.
+newKeyPair :: IO KeyPair
+newKeyPair = either (error . ("keygen failed: " <>)) id <$> generateKeyPair
+
+-- | Build a correctly signed message, mirroring the publish path.
+signedMessage :: KeyPair -> Topic -> ByteString -> PubSubMessage
+signedMessage kp topic payload =
+  let PeerId from = fromPublicKey (kpPublic kp)
+      unsigned = PubSubMessage
+        { msgFrom      = Just from
+        , msgData      = payload
+        , msgSeqNo     = Just (BS.pack [0, 0, 0, 0, 0, 0, 0, 1])
+        , msgTopic     = topic
+        , msgSignature = Nothing
+        , msgKey       = Just (encodePublicKey (kpPublic kp))
+        }
+  in case sign (kpPrivate kp) (signingBytes unsigned) of
+       Left err  -> error ("test fixture signing failed: " <> err)
+       Right sig -> unsigned { msgSignature = Just sig }
+
+-- | P4 invalid-message counter recorded for a peer on a topic.
+invalidCount :: GossipSubRouter -> PeerId -> Topic -> IO Double
+invalidCount router pid topic = do
+  peers <- readTVarIO (gsPeers router)
+  pure $ case Map.lookup pid peers of
+    Nothing -> 0
+    Just ps -> tpsInvalidMessages
+      (Map.findWithDefault defaultTopicPeerState topic (psTopicState ps))
 
 -- | Add a peer that is subscribed to a topic.
 addSubscribedPeer :: GossipSubRouter -> PeerId -> Topic -> IO ()
@@ -385,7 +419,8 @@ spec = do
         addSubscribedPeer router peerA "blocks"
         addSubscribedPeer router peerB "blocks"
         addPeer router peerC GossipSubPeer False fixedTime
-        publish router "blocks" (BS.pack [1, 2, 3]) Nothing
+        kp <- newKeyPair
+        publish router "blocks" (BS.pack [1, 2, 3]) (Just kp)
         sent <- readIORef logRef
         -- peerA and peerB should receive, but not peerC
         let publishedTo = map fst $ filter (\(_, rpc) -> not (null (rpcPublish rpc))) sent
@@ -395,9 +430,33 @@ spec = do
         (router, _) <- mkTestRouter localPid
         let peerA = mkPeerId 1
         addSubscribedPeer router peerA "blocks"
-        publish router "blocks" (BS.pack [1, 2, 3]) Nothing
+        kp <- newKeyPair
+        publish router "blocks" (BS.pack [1, 2, 3]) (Just kp)
         seen <- readTVarIO (gsSeen router)
         Map.size seen `shouldBe` 1
+
+      it "signs the message and the result verifies under StrictSign" $ do
+        kp <- newKeyPair
+        (router, logRef) <- mkTestRouter (fromPublicKey (kpPublic kp))
+        let peerA = mkPeerId 1
+        addSubscribedPeer router peerA "blocks"
+        publish router "blocks" (BS.pack [1, 2, 3]) (Just kp)
+        sent <- readIORef logRef
+        case concatMap (rpcPublish . snd) sent of
+          [msg] -> do
+            msgSignature msg `shouldSatisfy` (/= Nothing)
+            validateMessage StrictSign msg `shouldBe` Right ()
+          other -> expectationFailure ("expected one published message, got " <> show (length other))
+
+      it "fails loudly instead of publishing unsigned under StrictSign" $ do
+        (router, logRef) <- mkTestRouter localPid
+        addSubscribedPeer router (mkPeerId 1) "blocks"
+        result <- try (publish router "blocks" (BS.pack [1]) Nothing)
+        case result of
+          Left (SigningFailed _) -> pure ()
+          Right ()               -> expectationFailure "expected SigningFailed"
+        sent <- readIORef logRef
+        sent `shouldBe` []
 
       it "delivers message to local application callback" $ do
         (router, _) <- mkTestRouter localPid
@@ -406,7 +465,8 @@ spec = do
           modifyIORef' deliveredRef (++ [(topic, msgData msg)])
         let peerA = mkPeerId 1
         addSubscribedPeer router peerA "blocks"
-        publish router "blocks" (BS.pack [42]) Nothing
+        kp <- newKeyPair
+        publish router "blocks" (BS.pack [42]) (Just kp)
         delivered <- readIORef deliveredRef
         length delivered `shouldBe` 1
         snd (head delivered) `shouldBe` BS.pack [42]
@@ -469,14 +529,118 @@ spec = do
         deliveredRef <- newIORef (0 :: Int)
         atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
           modifyIORef' deliveredRef (+ 1)
-        let msg = PubSubMessage (Just (BS.pack [1])) (BS.pack [1]) (Just (BS.pack [0,0,0,0,0,0,0,1])) "t" Nothing Nothing
-            rpc = emptyRPC { rpcPublish = [msg] }
+        kp <- newKeyPair
+        let rpc = emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [1])] }
         -- Send same message twice
         handleRPC router sender rpc
         handleRPC router sender rpc
         delivered <- readIORef deliveredRef
         -- Should only be delivered once
         delivered `shouldBe` 1
+
+    describe "inbound message validation" $ do
+      it "delivers and forwards a correctly signed message" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            meshPeer = mkPeerId 2
+        addPeer router sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "t" (Set.fromList [sender, meshPeer])
+        deliveredRef <- newIORef (0 :: Int)
+        atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
+          modifyIORef' deliveredRef (+ 1)
+        kp <- newKeyPair
+        handleRPC router sender emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [1])] }
+        readIORef deliveredRef `shouldReturn` 1
+        sent <- readIORef logRef
+        map fst sent `shouldBe` [meshPeer]
+
+      it "drops a message with a forged signature without forwarding or delivering" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            meshPeer = mkPeerId 2
+        addPeer router sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "t" (Set.fromList [sender, meshPeer])
+        deliveredRef <- newIORef (0 :: Int)
+        atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
+          modifyIORef' deliveredRef (+ 1)
+        kp <- newKeyPair
+        let forged = (signedMessage kp "t" (BS.pack [1])) { msgData = BS.pack [99] }
+        handleRPC router sender emptyRPC { rpcPublish = [forged] }
+        readIORef deliveredRef `shouldReturn` 0
+        readIORef logRef `shouldReturn` []
+        -- Not cached for IWANT, and not marked seen
+        cache <- readTVarIO (gsMessageCache router)
+        Map.size (mcIndex cache) `shouldBe` 0
+        seen <- readTVarIO (gsSeen router)
+        Map.size seen `shouldBe` 0
+
+      it "drops a message whose from does not match its key" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        deliveredRef <- newIORef (0 :: Int)
+        atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
+          modifyIORef' deliveredRef (+ 1)
+        kp <- newKeyPair
+        impostor <- newKeyPair
+        let PeerId spoofed = fromPublicKey (kpPublic impostor)
+            msg = (signedMessage kp "t" (BS.pack [1])) { msgFrom = Just spoofed }
+        handleRPC router sender emptyRPC { rpcPublish = [msg] }
+        readIORef deliveredRef `shouldReturn` 0
+
+      it "charges the sender a P4 invalid delivery for a rejected message" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        kp <- newKeyPair
+        let forged = (signedMessage kp "t" (BS.pack [1])) { msgData = BS.pack [99] }
+        handleRPC router sender emptyRPC { rpcPublish = [forged] }
+        invalidCount router sender "t" `shouldReturn` 1
+
+    describe "topic validators" $ do
+      it "drops a message the topic validator rejects" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            meshPeer = mkPeerId 2
+        addPeer router sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "t" (Set.fromList [sender, meshPeer])
+        deliveredRef <- newIORef (0 :: Int)
+        atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
+          modifyIORef' deliveredRef (+ 1)
+        registerValidator router "t" (\_ _ -> pure False)
+        kp <- newKeyPair
+        handleRPC router sender emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [1])] }
+        readIORef deliveredRef `shouldReturn` 0
+        readIORef logRef `shouldReturn` []
+        invalidCount router sender "t" `shouldReturn` 1
+
+      it "propagates a message the topic validator accepts" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        deliveredRef <- newIORef (0 :: Int)
+        atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
+          modifyIORef' deliveredRef (+ 1)
+        registerValidator router "t" (\_ _ -> pure True)
+        kp <- newKeyPair
+        handleRPC router sender emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [1])] }
+        readIORef deliveredRef `shouldReturn` 1
+
+      it "unregisterValidator restores unvalidated propagation" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        deliveredRef <- newIORef (0 :: Int)
+        atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
+          modifyIORef' deliveredRef (+ 1)
+        registerValidator router "t" (\_ _ -> pure False)
+        unregisterValidator router "t"
+        kp <- newKeyPair
+        handleRPC router sender emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [1])] }
+        readIORef deliveredRef `shouldReturn` 1
 
     describe "peerScore" $ do
       it "returns 0 for unknown peer" $ do

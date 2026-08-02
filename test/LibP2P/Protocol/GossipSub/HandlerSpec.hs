@@ -17,8 +17,9 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
-import LibP2P.Crypto.Key (KeyPair, publicKey)
-import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
+import LibP2P.Crypto.Key (KeyPair (..), publicKey, sign)
+import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey)
+import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
@@ -41,6 +42,7 @@ import LibP2P.Protocol.GossipSub.Message
   , writeRPCMessage
   )
 import LibP2P.Protocol.GossipSub.Router (addPeer)
+import LibP2P.Protocol.GossipSub.Validation (signingBytes)
 import LibP2P.Protocol.GossipSub.Types
   ( GossipSubParams (..)
   , GossipSubRouter (..)
@@ -64,6 +66,22 @@ mkTestIdentity = do
   Right kp <- generateKeyPair
   let pid = fromPublicKey (publicKey kp)
   pure (pid, kp)
+
+-- | Build a correctly signed message, as a remote peer would publish it.
+signedMessage :: KeyPair -> Topic -> BS.ByteString -> PubSubMessage
+signedMessage kp topic payload =
+  let PeerId from = fromPublicKey (publicKey kp)
+      unsigned = PubSubMessage
+        { msgFrom      = Just from
+        , msgData      = payload
+        , msgSeqNo     = Just (BS.pack [0, 0, 0, 0, 0, 0, 0, 1])
+        , msgTopic     = topic
+        , msgSignature = Nothing
+        , msgKey       = Just (encodePublicKey (publicKey kp))
+        }
+  in case sign (kpPrivate kp) (signingBytes unsigned) of
+       Left err  -> error ("test fixture signing failed: " <> err)
+       Right sig -> unsigned { msgSignature = Just sig }
 
 -- | Create a test Switch (no transport needed for handler unit tests).
 mkTestSwitch :: IO (Switch, PeerId)
@@ -131,7 +149,7 @@ spec = do
     it "processes publish RPCs and delivers to onMessage callback" $ do
       (sw, _localPid) <- mkTestSwitch
       node <- newGossipSubNode sw testParams
-      (remotePid, _kp) <- mkTestIdentity
+      (remotePid, remoteKp) <- mkTestIdentity
       -- Set up message callback
       msgMVar <- newEmptyMVar
       atomically $ writeTVar (gsOnMessage (gsnRouter node))
@@ -145,14 +163,7 @@ spec = do
       -- Spawn handler
       _ <- async $ handleGossipSubStream node handlerStream remotePid
       -- Send a publish RPC
-      let msg = PubSubMessage
-            { msgFrom      = Just (BS.pack [1,2,3])
-            , msgData      = "hello gossipsub"
-            , msgSeqNo     = Just (BS.pack [0,0,0,0,0,0,0,1])
-            , msgTopic     = "pub-topic"
-            , msgSignature = Nothing
-            , msgKey       = Nothing
-            }
+      let msg = signedMessage remoteKp "pub-topic" "hello gossipsub"
       writeRPCMessage remoteStream (emptyRPC { rpcPublish = [msg] })
       -- Wait for callback
       result <- timeout 2000000 $ takeMVar msgMVar

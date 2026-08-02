@@ -14,6 +14,9 @@ module LibP2P.Protocol.GossipSub.Router
   , leave
     -- * Publishing
   , publish
+    -- * Topic validation
+  , registerValidator
+  , unregisterValidator
     -- * Inbound RPC handling
   , handleRPC
     -- * Control message handlers
@@ -29,6 +32,7 @@ module LibP2P.Protocol.GossipSub.Router
   ) where
 
 import Prelude
+import Control.Exception (throwIO)
 import Control.Monad (unless)
 import Control.Concurrent.STM
 import Data.ByteString (ByteString)
@@ -42,9 +46,9 @@ import LibP2P.Crypto.PeerId (PeerId, peerIdBytes)
 import LibP2P.Crypto.Key (KeyPair (..), sign)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Protocol.GossipSub.Types
-import LibP2P.Protocol.GossipSub.Message (encodePubSubMessageBS)
 import LibP2P.Protocol.GossipSub.MessageCache (newMessageCache, cachePut, cacheGet)
-import LibP2P.Protocol.GossipSub.Score (computeScore, addP7Penalty, recordMeshFailure)
+import LibP2P.Protocol.GossipSub.Score (computeScore, addP7Penalty, recordMeshFailure, recordInvalidMessage)
+import LibP2P.Protocol.GossipSub.Validation (validateMessage, signingBytes)
 
 -- | Create a new GossipSub router with empty state.
 newRouter :: GossipSubParams
@@ -63,6 +67,7 @@ newRouter params localPid sendRPC getTime = do
   mcache   <- newTVarIO (newMessageCache (paramMcacheLen params) (paramMcacheGossip params))
   hbCount  <- newTVarIO 0
   onMsg    <- newTVarIO (\_ _ -> pure ())
+  validators <- newTVarIO Map.empty
   pure GossipSubRouter
     { gsParams         = params
     , gsLocalPeerId    = localPid
@@ -80,7 +85,21 @@ newRouter params localPid sendRPC getTime = do
     , gsSendRPC        = sendRPC
     , gsGetTime        = getTime
     , gsOnMessage      = onMsg
+    , gsValidators     = validators
     }
+
+-- Topic validation
+
+-- | Attach an application validator to a topic. Messages the validator rejects
+-- are dropped without propagation and count against the sender's P4 score.
+registerValidator :: GossipSubRouter -> Topic -> TopicValidator -> IO ()
+registerValidator router topic v = atomically $
+  modifyTVar' (gsValidators router) (Map.insert topic v)
+
+-- | Remove a topic's validator.
+unregisterValidator :: GossipSubRouter -> Topic -> IO ()
+unregisterValidator router topic = atomically $
+  modifyTVar' (gsValidators router) (Map.delete topic)
 
 -- Peer management
 
@@ -190,7 +209,7 @@ publish router topic payload mKeyPair = do
   -- Build message (with signing if StrictSign)
   msg <- case paramSignaturePolicy (gsParams router) of
     StrictSign -> case mKeyPair of
-      Nothing -> pure $ mkUnsignedMessage topic payload
+      Nothing -> throwIO (SigningFailed "StrictSign publish requires a key pair")
       Just kp -> mkSignedMessage router topic payload kp
     StrictNoSign -> pure $ mkUnsignedMessage topic payload
 
@@ -265,34 +284,61 @@ handleRPC router sender rpc = do
       handleGraft router sender (ctrlGraft ctrl)
       handlePrune router sender (ctrlPrune ctrl)
 
--- | Process a published message: deduplicate, validate, forward, deliver.
+-- | Process a published message: verify, deduplicate, validate, forward, deliver.
+--
+-- Signature verification runs before deduplication so that an invalid message
+-- is never cached, forwarded or delivered, and never poisons the seen cache for
+-- the genuine message with the same ID.
 handlePublishedMessage :: GossipSubRouter -> PeerId -> PubSubMessage -> IO ()
-handlePublishedMessage router sender msg = do
-  let msgId = paramMessageIdFn (gsParams router) msg
-  now <- gsGetTime router
+handlePublishedMessage router sender msg =
+  case validateMessage (paramSignaturePolicy (gsParams router)) msg of
+    Left _err -> rejectMessage router sender msg
+    Right ()  -> do
+      let msgId = paramMessageIdFn (gsParams router) msg
+      now <- gsGetTime router
 
-  -- Deduplicate
-  alreadySeen <- atomically $ do
-    s <- readTVar (gsSeen router)
-    if Map.member msgId s
-      then pure True
-      else do
-        writeTVar (gsSeen router) (Map.insert msgId now s)
-        pure False
+      -- Deduplicate
+      alreadySeen <- atomically $ do
+        s <- readTVar (gsSeen router)
+        if Map.member msgId s
+          then pure True
+          else do
+            writeTVar (gsSeen router) (Map.insert msgId now s)
+            pure False
 
-  if alreadySeen
-    then pure ()
-    else do
-      -- Cache the message for IWANT responses
-      atomically $ modifyTVar' (gsMessageCache router) $
-        cachePut msgId msg
+      unless alreadySeen $ do
+        accepted <- runTopicValidator router sender msg
+        if not accepted
+          then rejectMessage router sender msg
+          else do
+            -- Cache the message for IWANT responses
+            atomically $ modifyTVar' (gsMessageCache router) $
+              cachePut msgId msg
 
-      -- Forward to mesh peers (excluding sender)
-      forwardMessage router sender msg
+            -- Forward to mesh peers (excluding sender)
+            forwardMessage router sender msg
 
-      -- Deliver to application
-      onMsg <- readTVarIO (gsOnMessage router)
-      onMsg (msgTopic msg) msg
+            -- Deliver to application
+            onMsg <- readTVarIO (gsOnMessage router)
+            onMsg (msgTopic msg) msg
+
+-- | Run the topic validator, if one is registered. No validator means accept.
+runTopicValidator :: GossipSubRouter -> PeerId -> PubSubMessage -> IO Bool
+runTopicValidator router sender msg = do
+  validators <- readTVarIO (gsValidators router)
+  case Map.lookup (msgTopic msg) validators of
+    Nothing -> pure True
+    Just v  -> v sender msg
+
+-- | Drop a message and charge the propagation source a P4 invalid delivery.
+rejectMessage :: GossipSubRouter -> PeerId -> PubSubMessage -> IO ()
+rejectMessage router sender msg = atomically $
+  modifyTVar' (gsPeers router) $ Map.adjust bumpInvalid sender
+  where
+    topic = msgTopic msg
+    bumpInvalid ps =
+      let tps = Map.findWithDefault defaultTopicPeerState topic (psTopicState ps)
+      in ps { psTopicState = Map.insert topic (recordInvalidMessage tps) (psTopicState ps) }
 
 -- Control message handlers
 
@@ -466,14 +512,8 @@ mkSignedMessage router topic payload kp = do
         , msgSignature = Nothing
         , msgKey       = Just pubKeyBytes
         }
-      -- Sign: prefix "libp2p-pubsub:" + marshalled message
-      signData = "libp2p-pubsub:" <> marshalForSigning unsigned
-  case sign (kpPrivate kp) signData of
-    Left _err -> pure unsigned  -- Signing failed, send unsigned
+  case sign (kpPrivate kp) (signingBytes unsigned) of
+    -- Publishing unsigned under StrictSign would emit a message every
+    -- compliant receiver must drop, so fail loudly instead.
+    Left err  -> throwIO (SigningFailed err)
     Right sig -> pure unsigned { msgSignature = Just sig }
-
--- | Marshal a message for signature computation.
--- Per the libp2p spec, the signed data excludes both signature and key fields.
-marshalForSigning :: PubSubMessage -> ByteString
-marshalForSigning msg = encodePubSubMessageBS
-  (msg { msgSignature = Nothing, msgKey = Nothing })

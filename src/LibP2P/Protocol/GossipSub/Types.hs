@@ -26,6 +26,10 @@ module LibP2P.Protocol.GossipSub.Types
   , RPC (..)
     -- * Signature policy
   , SignaturePolicy (..)
+    -- * Errors
+  , GossipSubError (..)
+    -- * Topic validation
+  , TopicValidator
     -- * Configuration
   , GossipSubParams (..)
   , defaultGossipSubParams
@@ -53,6 +57,7 @@ module LibP2P.Protocol.GossipSub.Types
   ) where
 
 import Control.Concurrent.STM (TVar)
+import Control.Exception (Exception)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Map.Strict (Map)
@@ -147,6 +152,25 @@ data SignaturePolicy
   = StrictSign       -- ^ All messages must be signed
   | StrictNoSign     -- ^ No signatures allowed
   deriving (Show, Eq)
+
+-- Errors
+
+-- | Fatal GossipSub errors surfaced to the caller.
+data GossipSubError
+  = SigningFailed String
+    -- ^ StrictSign publish could not sign the message. Emitting it unsigned
+    -- would produce a message every compliant receiver must reject, so the
+    -- publish fails instead.
+  deriving (Show, Eq)
+
+instance Exception GossipSubError
+
+-- Topic validation
+
+-- | Application validator for a topic. Receives the propagation source and the
+-- message; returning False drops the message without propagation
+-- (specs/pubsub/README.md, "Topic validation").
+type TopicValidator = PeerId -> PubSubMessage -> IO Bool
 
 -- Configuration
 
@@ -389,6 +413,8 @@ data GossipSubRouter = GossipSubRouter
     -- ^ Time source (injectable for deterministic tests)
   , gsOnMessage   :: !(TVar (Topic -> PubSubMessage -> IO ()))
     -- ^ Application message callback
+  , gsValidators  :: !(TVar (Map Topic TopicValidator))
+    -- ^ Per-topic application validators, applied before propagation
   }
 
 -- Defaults
