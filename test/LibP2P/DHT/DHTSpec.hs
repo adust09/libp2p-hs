@@ -8,6 +8,8 @@ module LibP2P.DHT.DHTSpec
 import Test.Hspec
 
 import Control.Concurrent.STM
+import Crypto.Hash (Digest, SHA256, hash)
+import Data.ByteArray (convert)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Time (getCurrentTime)
@@ -15,7 +17,7 @@ import Data.Word (Word8)
 import LibP2P.Crypto.Key (KeyPair (..), PublicKey (..), PrivateKey (..), KeyType (..))
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT
-import LibP2P.DHT.Distance (peerIdToKey)
+import LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
 import LibP2P.DHT.Message
 import LibP2P.DHT.RoutingTable (insertPeer)
 import LibP2P.DHT.Types
@@ -74,6 +76,10 @@ mkMockSwitch pid = do
 -- | Create a mock resource manager with no limits (tests don't need resource enforcement).
 mkMockResourceMgr :: IO ResourceManager
 mkMockResourceMgr = newResourceManager (DefaultLimits noLimits noLimits)
+
+-- | Independent SHA-256 (not via DHT.Distance) for asserting the spec metric.
+sha256 :: BS.ByteString -> BS.ByteString
+sha256 bs = convert (hash bs :: Digest SHA256)
 
 -- | Dummy key pair for mock Switch (DHT never accesses identity key).
 dummyKeyPair :: KeyPair
@@ -143,6 +149,78 @@ spec = do
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
         Right resp -> length (msgCloserPeers resp) `shouldSatisfy` (>= 0)
+        Left err -> expectationFailure $ "Failed: " ++ err
+
+    -- Per specs/kad-dht: "the distance between two keys is
+    -- XOR(sha256(key1), sha256(key2))". The wire key arrives raw and must be
+    -- hashed before comparing against routing-table entries (which cache
+    -- sha256 of the peer ID). Wrapping raw wire bytes in DHTKey (the old
+    -- behaviour) sorts by a different, non-spec metric.
+    it "FIND_NODE orders closerPeers by XOR distance over SHA-256 of the wire key" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let peers = [mkPeerId (BS.pack [i]) | i <- [2..10]]
+          entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        foldl (\r e -> fst (insertPeer e r)) rt entries
+
+      -- Raw wire key, as a remote peer would send it (a binary peer ID).
+      let wireKey = BS.pack [42, 42, 42]
+          hashedTarget = DHTKey (sha256 wireKey)
+          expectedOrder = map (peerIdBytes . entryPeerId) (sortByDistance hashedTarget entries)
+
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage { msgType = FindNode, msgKey = wireKey }
+      writeFramedMessage clientStream request
+      handleDHTRequest node serverStream remotePid
+
+      result <- readFramedMessage clientStream maxDHTMessageSize
+      case result of
+        Right resp -> map dhtPeerId (msgCloserPeers resp) `shouldBe` expectedOrder
+        Left err -> expectationFailure $ "Failed: " ++ err
+
+    it "GET_VALUE orders closerPeers by XOR distance over SHA-256 of the wire key" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let peers = [mkPeerId (BS.pack [i]) | i <- [2..10]]
+          entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        foldl (\r e -> fst (insertPeer e r)) rt entries
+
+      let wireKey = BS.pack [0xCA, 0xFE, 0x01]
+          hashedTarget = DHTKey (sha256 wireKey)
+          expectedOrder = map (peerIdBytes . entryPeerId) (sortByDistance hashedTarget entries)
+
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage { msgType = GetValue, msgKey = wireKey }
+      writeFramedMessage clientStream request
+      handleDHTRequest node serverStream remotePid
+
+      result <- readFramedMessage clientStream maxDHTMessageSize
+      case result of
+        Right resp -> map dhtPeerId (msgCloserPeers resp) `shouldBe` expectedOrder
+        Left err -> expectationFailure $ "Failed: " ++ err
+
+    it "GET_PROVIDERS orders closerPeers by XOR distance over SHA-256 of the wire key" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let peers = [mkPeerId (BS.pack [i]) | i <- [2..10]]
+          entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        foldl (\r e -> fst (insertPeer e r)) rt entries
+
+      let wireKey = BS.pack [0xDD, 0xEE]
+          hashedTarget = DHTKey (sha256 wireKey)
+          expectedOrder = map (peerIdBytes . entryPeerId) (sortByDistance hashedTarget entries)
+
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage { msgType = GetProviders, msgKey = wireKey }
+      writeFramedMessage clientStream request
+      handleDHTRequest node serverStream remotePid
+
+      result <- readFramedMessage clientStream maxDHTMessageSize
+      case result of
+        Right resp -> map dhtPeerId (msgCloserPeers resp) `shouldBe` expectedOrder
         Left err -> expectationFailure $ "Failed: " ++ err
 
     it "GET_VALUE with stored record returns it" $ do

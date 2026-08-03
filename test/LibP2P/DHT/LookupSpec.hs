@@ -39,6 +39,27 @@ mockSendFromNetwork network pid msg =
 spec :: Spec
 spec = do
   describe "iterativeFindNode" $ do
+    -- Issue #146: per specs/kad-dht the FIND_NODE wire key must be the
+    -- binary Peer ID. The old code sent sha256(peer id); a remote hashes
+    -- the key again, landing the query at sha256(sha256(peer id)).
+    it "sends the raw target peer ID as the wire key, not its SHA-256 digest" $ do
+      now <- getCurrentTime
+      sentKeysRef <- newIORef ([] :: [BS.ByteString])
+      let targetPid = mkPeerId (BS.pack [42, 42, 42, 42])
+          mockSend _pid msg = do
+            atomicModifyIORef' sentKeysRef (\ks -> (ks ++ [msgKey msg], ()))
+            pure (Right (emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] }))
+      node <- mkNodeWithMock localPid mockSend
+      let pidA = mkPeerId (BS.pack [10])
+          entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        fst (insertPeer entryA rt)
+
+      _ <- iterativeFindNode node targetPid
+      sentKeys <- readIORef sentKeysRef
+      sentKeys `shouldSatisfy` (not . null)
+      mapM_ (`shouldBe` peerIdBytes targetPid) sentKeys
+
     it "with local-only routing table returns local peers" $ do
       now <- getCurrentTime
       -- Create node with some peers in routing table, no network
@@ -48,8 +69,7 @@ spec = do
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
         foldl (\r e -> fst (insertPeer e r)) rt entries
 
-      let targetKey = peerIdToKey (mkPeerId (BS.pack [42]))
-      result <- iterativeFindNode node targetKey
+      result <- iterativeFindNode node (mkPeerId (BS.pack [42]))
       -- Should return peers even though network queries fail
       length result `shouldSatisfy` (> 0)
       length result `shouldSatisfy` (<= kValue)
@@ -60,7 +80,7 @@ spec = do
       let pidA = mkPeerId (BS.pack [10])
           pidB = mkPeerId (BS.pack [20])
           pidC = mkPeerId (BS.pack [30])
-          target = BS.pack [42, 42, 42, 42]
+          targetPid = mkPeerId (BS.pack [42, 42, 42, 42])
           -- Mock network: A returns B as closer, B returns C as closer
           network = Map.fromList
             [ (pidA, \_ -> emptyDHTMessage
@@ -82,7 +102,7 @@ spec = do
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
         fst (insertPeer entryA rt)
 
-      result <- iterativeFindNode node (DHTKey target)
+      result <- iterativeFindNode node targetPid
       -- Should have discovered A, B, C through the lookup chain
       let foundPids = map entryPeerId result
       foundPids `shouldSatisfy` (\ps -> pidA `elem` ps)
@@ -101,7 +121,7 @@ spec = do
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
         foldl (\r e -> fst (insertPeer e r)) rt entries
 
-      result <- iterativeFindNode node (DHTKey (BS.pack [0xFF, 0xFF]))
+      result <- iterativeFindNode node (mkPeerId (BS.pack [0xFF, 0xFF]))
       length result `shouldBe` length peers
 
     it "handles query failures gracefully" $ do
@@ -113,7 +133,7 @@ spec = do
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
         foldl (\r e -> fst (insertPeer e r)) rt entries
 
-      result <- iterativeFindNode node (DHTKey (BS.pack [42]))
+      result <- iterativeFindNode node (mkPeerId (BS.pack [42]))
       -- Should still return the local peers
       length result `shouldSatisfy` (> 0)
 
@@ -129,7 +149,7 @@ spec = do
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
         foldl (\r e -> fst (insertPeer e r)) rt entries
 
-      result <- iterativeFindNode node (DHTKey (BS.pack [99]))
+      result <- iterativeFindNode node (mkPeerId (BS.pack [99]))
       length result `shouldBe` 3  -- only 3 peers total, less than k=20
 
     it "queries peers in XOR distance order, not lexicographic key order" $ do
@@ -138,7 +158,10 @@ spec = do
 
       -- Create 15 peers so that alpha (10) < total, forcing batch selection
       let peers = [mkPeerId (BS.pack [i]) | i <- [10..24]]
-          targetKey = DHTKey (BS.replicate 32 0xFF)
+          targetPid = mkPeerId (BS.replicate 32 0xFF)
+          -- Distance is over sha256(key) (specs/kad-dht), so the expected
+          -- ordering must use the hashed target, matching the lookup.
+          targetKey = peerIdToKey targetPid
 
       -- Compute expected first batch: the 10 closest by XOR distance
       let entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
@@ -154,7 +177,7 @@ spec = do
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
         foldl (\r e -> fst (insertPeer e r)) rt entries
 
-      _ <- iterativeFindNode node targetKey
+      _ <- iterativeFindNode node targetPid
 
       -- The first alpha peers queried should be the closest by XOR distance
       -- (mapConcurrently doesn't preserve order within batch, so compare as sets)
@@ -165,7 +188,9 @@ spec = do
     it "returns results sorted by XOR distance to target" $ do
       now <- getCurrentTime
       let peers = [mkPeerId (BS.pack [i]) | i <- [10..20]]
-          targetKey = DHTKey (BS.replicate 32 0xAA)
+          targetPid = mkPeerId (BS.replicate 32 0xAA)
+          -- Expected order uses sha256(target peer id), the spec metric.
+          targetKey = peerIdToKey targetPid
           entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
           expectedOrder = map entryPeerId (sortByDistance targetKey entries)
 
@@ -176,11 +201,32 @@ spec = do
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
         foldl (\r e -> fst (insertPeer e r)) rt entries
 
-      result <- iterativeFindNode node targetKey
+      result <- iterativeFindNode node targetPid
       -- Results should be sorted by XOR distance to the target
       map entryPeerId result `shouldBe` expectedOrder
 
   describe "iterativeGetValue" $ do
+    it "sends the raw record key as the wire key" $ do
+      now <- getCurrentTime
+      sentKeysRef <- newIORef ([] :: [BS.ByteString])
+      let key = BS.pack [0xCA, 0xFE]
+          record = DHTRecord key (BS.pack [0xDE, 0xAD]) "2024-01-01T00:00:00Z"
+          mockSend _pid msg = do
+            atomicModifyIORef' sentKeysRef (\ks -> (ks ++ [msgKey msg], ()))
+            pure (Right (emptyDHTMessage
+              { msgType = GetValue, msgRecord = Just record, msgCloserPeers = [] }))
+          validator = Validator (\_ _ -> Right ()) (\_ _ -> Right 0)
+      node <- mkNodeWithMock localPid mockSend
+      let pidA = mkPeerId (BS.pack [10])
+          entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        fst (insertPeer entryA rt)
+
+      _ <- iterativeGetValue node validator key
+      sentKeys <- readIORef sentKeysRef
+      sentKeys `shouldSatisfy` (not . null)
+      mapM_ (`shouldBe` key) sentKeys
+
     it "finds value from mock network" $ do
       now <- getCurrentTime
       let pidA = mkPeerId (BS.pack [10])
@@ -287,6 +333,25 @@ spec = do
         Left err -> expectationFailure $ "Expected value, got: " ++ err
 
   describe "iterativeGetProviders" $ do
+    it "sends the raw content key as the wire key" $ do
+      now <- getCurrentTime
+      sentKeysRef <- newIORef ([] :: [BS.ByteString])
+      let key = BS.pack [0xDD, 0xEE, 0xFF]
+          mockSend _pid msg = do
+            atomicModifyIORef' sentKeysRef (\ks -> (ks ++ [msgKey msg], ()))
+            pure (Right (emptyDHTMessage
+              { msgType = GetProviders, msgCloserPeers = [], msgProviderPeers = [] }))
+      node <- mkNodeWithMock localPid mockSend
+      let pidA = mkPeerId (BS.pack [10])
+          entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        fst (insertPeer entryA rt)
+
+      _ <- iterativeGetProviders node key
+      sentKeys <- readIORef sentKeysRef
+      sentKeys `shouldSatisfy` (not . null)
+      mapM_ (`shouldBe` key) sentKeys
+
     it "collects providers from multiple hops" $ do
       now <- getCurrentTime
       let pidA = mkPeerId (BS.pack [10])
@@ -316,6 +381,24 @@ spec = do
       length result `shouldSatisfy` (>= 2)
 
   describe "bootstrap" $ do
+    it "self-lookup sends raw peer IDs as wire keys" $ do
+      sentKeysRef <- newIORef ([] :: [BS.ByteString])
+      let seedPid = mkPeerId (BS.pack [10])
+          mockSend _pid msg = do
+            atomicModifyIORef' sentKeysRef (\ks -> (ks ++ [msgKey msg], ()))
+            pure (Right (emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] }))
+      node <- mkNodeWithMock localPid mockSend
+
+      bootstrap node [seedPid]
+
+      sentKeys <- readIORef sentKeysRef
+      sentKeys `shouldSatisfy` (not . null)
+      -- The self-lookup queries for our own binary peer ID (not its digest).
+      take 1 sentKeys `shouldBe` [peerIdBytes localPid]
+      -- Bucket refresh queries also carry raw peer IDs.
+      mapM_ (\k -> k `shouldSatisfy` (`elem` [peerIdBytes localPid, peerIdBytes seedPid]))
+            sentKeys
+
     it "performs self-lookup and populates nearby buckets" $ do
       now <- getCurrentTime
       let seedPid = mkPeerId (BS.pack [10])

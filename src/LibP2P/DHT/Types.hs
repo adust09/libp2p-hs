@@ -18,6 +18,10 @@ import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
 
 -- | 256-bit key in the DHT keyspace (always exactly 32 bytes, SHA-256 output).
+--
+-- Construct via 'LibP2P.DHT.Distance.keyToDHTKey' (or 'peerIdToKey' for peer
+-- IDs) — never wrap raw wire bytes directly. Per specs/kad-dht the distance
+-- metric is XOR over SHA-256 digests, while RPC messages carry the raw key.
 newtype DHTKey = DHTKey ByteString
   deriving (Eq, Ord, Show)
 

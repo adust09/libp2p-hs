@@ -26,9 +26,9 @@ import Data.ByteString (ByteString)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Time (UTCTime, getCurrentTime)
-import LibP2P.Crypto.PeerId (PeerId (..))
+import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT (DHTNode (..), ProviderEntry (..), Validator (..))
-import LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
+import LibP2P.DHT.Distance (keyToDHTKey, peerIdToKey, sortByDistance)
 import LibP2P.DHT.Message
 import LibP2P.DHT.RoutingTable (closestPeers, insertPeer, allPeers)
 import LibP2P.DHT.Types
@@ -40,17 +40,23 @@ data LookupResult
   | FoundProviders ![ProviderEntry] ![BucketEntry]
   deriving (Show)
 
--- | Iterative FIND_NODE: find the k closest peers to a target key.
+-- | Iterative FIND_NODE: find the k closest peers to a target peer.
+--
+-- Per specs/kad-dht, the FIND_NODE wire key must be the target's binary
+-- Peer ID; XOR distance is computed over SHA-256 digests, so only local
+-- comparisons use the hashed key.
 --
 -- Algorithm:
 -- 1. Seed candidates with k closest from local routing table
 -- 2. Query up to alpha unqueried candidates in parallel
 -- 3. Merge returned closerPeers into candidates
 -- 4. Terminate when top-k candidates all queried or no unqueried remain
-iterativeFindNode :: DHTNode -> DHTKey -> IO [BucketEntry]
-iterativeFindNode node targetKey = do
+iterativeFindNode :: DHTNode -> PeerId -> IO [BucketEntry]
+iterativeFindNode node targetPid = do
   rt <- readTVarIO (dhtRoutingTable node)
-  let seeds = closestPeers targetKey kValue rt
+  let wireKey = peerIdBytes targetPid   -- raw peer ID on the wire
+      targetKey = peerIdToKey targetPid -- SHA-256 for distance
+      seeds = closestPeers targetKey kValue rt
   now <- getCurrentTime
 
   -- State: candidates sorted by XOR distance, queried set, known set (for dedup)
@@ -58,19 +64,20 @@ iterativeFindNode node targetKey = do
   queriedVar    <- newTVarIO Set.empty
   knownVar      <- newTVarIO (Set.fromList (map entryPeerId seeds))
 
-  lookupLoop node targetKey candidatesVar queriedVar knownVar now FindNode
+  lookupLoop node wireKey targetKey candidatesVar queriedVar knownVar now FindNode
 
 -- | Core lookup loop shared by FIND_NODE, GET_VALUE, GET_PROVIDERS.
 lookupLoop
   :: DHTNode
-  -> DHTKey
+  -> ByteString           -- ^ Raw wire key sent in requests
+  -> DHTKey               -- ^ SHA-256 of the wire key, for distance
   -> TVar [BucketEntry]   -- ^ Candidates sorted by XOR distance to target
   -> TVar (Set PeerId)    -- ^ Already queried peers
   -> TVar (Set PeerId)    -- ^ Known peers (all candidates ever seen, for dedup)
   -> a                    -- ^ Timestamp placeholder (UTCTime)
   -> MessageType          -- ^ Query type
   -> IO [BucketEntry]
-lookupLoop node targetKey candidatesVar queriedVar knownVar _now queryType = go
+lookupLoop node wireKey targetKey candidatesVar queriedVar knownVar _now queryType = go
   where
     go = do
       -- Pick up to alpha unqueried candidates closest to target
@@ -91,7 +98,7 @@ lookupLoop node targetKey candidatesVar queriedVar knownVar _now queryType = go
           pure (take kValue candidates)
         else do
           -- Query each peer in parallel
-          results <- mapConcurrently (queryPeer node targetKey queryType) toQuery
+          results <- mapConcurrently (queryPeer node wireKey queryType) toQuery
 
           -- Merge results
           atomically $ do
@@ -122,15 +129,16 @@ lookupLoop node targetKey candidatesVar queriedVar knownVar _now queryType = go
               candidates <- readTVarIO candidatesVar
               pure (take kValue candidates)
 
-    _now = let DHTKey bs = targetKey in bs  -- placeholder, overridden by caller
-
 -- | Query a single peer and return the closerPeers from the response.
-queryPeer :: DHTNode -> DHTKey -> MessageType -> BucketEntry -> IO (Either String [DHTPeer])
-queryPeer node targetKey queryType entry = do
-  let (DHTKey keyBytes) = targetKey
-      request = emptyDHTMessage
+--
+-- The request carries the raw wire key (e.g. the binary Peer ID for
+-- FIND_NODE), never a SHA-256 digest: the remote hashes the key itself
+-- when computing distances (specs/kad-dht).
+queryPeer :: DHTNode -> ByteString -> MessageType -> BucketEntry -> IO (Either String [DHTPeer])
+queryPeer node wireKey queryType entry = do
+  let request = emptyDHTMessage
         { msgType = queryType
-        , msgKey  = keyBytes
+        , msgKey  = wireKey
         }
   result <- (dhtSendRequest node) (entryPeerId entry) request
     `catch` (\(e :: SomeException) -> pure (Left (show e)))
@@ -145,7 +153,8 @@ queryPeer node targetKey queryType entry = do
 iterativeGetValue :: DHTNode -> Validator -> ByteString -> IO (Either String DHTRecord)
 iterativeGetValue node validator key = do
   rt <- readTVarIO (dhtRoutingTable node)
-  let targetKey = DHTKey key
+  -- The raw record key goes on the wire; distance uses its SHA-256.
+  let targetKey = keyToDHTKey key
       seeds = closestPeers targetKey kValue rt
   now <- getCurrentTime
 
@@ -156,12 +165,13 @@ iterativeGetValue node validator key = do
   bestPeersVar  <- newTVarIO (Set.empty :: Set PeerId)
   outdatedVar   <- newTVarIO (Set.empty :: Set PeerId)
 
-  valueLoop node targetKey candidatesVar queriedVar knownVar bestVar bestPeersVar outdatedVar validator now
+  valueLoop node key targetKey candidatesVar queriedVar knownVar bestVar bestPeersVar outdatedVar validator now
 
 -- | Value lookup loop with best/outdated tracking.
 valueLoop
   :: DHTNode
-  -> DHTKey
+  -> ByteString           -- ^ Raw wire key sent in requests
+  -> DHTKey               -- ^ SHA-256 of the wire key, for distance
   -> TVar [BucketEntry]
   -> TVar (Set PeerId)
   -> TVar (Set PeerId)    -- ^ Known peers (dedup)
@@ -171,7 +181,7 @@ valueLoop
   -> Validator
   -> a
   -> IO (Either String DHTRecord)
-valueLoop node targetKey candidatesVar queriedVar knownVar bestVar bestPeersVar outdatedVar validator _now = go
+valueLoop node wireKey targetKey candidatesVar queriedVar knownVar bestVar bestPeersVar outdatedVar validator _now = go
   where
     go = do
       toQuery <- atomically $ do
@@ -186,7 +196,7 @@ valueLoop node targetKey candidatesVar queriedVar knownVar bestVar bestPeersVar 
       if null toQuery
         then finalize
         else do
-          results <- mapConcurrently (queryPeerForValue node targetKey) toQuery
+          results <- mapConcurrently (queryPeerForValue node wireKey) toQuery
 
           -- Process each result
           mapM_ (processValueResult node targetKey bestVar bestPeersVar outdatedVar validator _now) results
@@ -231,14 +241,11 @@ valueLoop node targetKey candidatesVar queriedVar knownVar bestVar bestPeersVar 
                 (Set.toList outdated)
           pure (Right rec)
 
-    _now = let DHTKey bs = targetKey in bs  -- placeholder
-
 -- | Query a peer for a value and return (peerId, closerPeers, Maybe record).
-queryPeerForValue :: DHTNode -> DHTKey -> BucketEntry
+queryPeerForValue :: DHTNode -> ByteString -> BucketEntry
                   -> IO (PeerId, Either String [DHTPeer], Maybe DHTRecord)
-queryPeerForValue node targetKey entry = do
-  let (DHTKey keyBytes) = targetKey
-      request = emptyDHTMessage { msgType = GetValue, msgKey = keyBytes }
+queryPeerForValue node wireKey entry = do
+  let request = emptyDHTMessage { msgType = GetValue, msgKey = wireKey }
   result <- (dhtSendRequest node) (entryPeerId entry) request
     `catch` (\(e :: SomeException) -> pure (Left (show e)))
   pure $ case result of
@@ -282,7 +289,8 @@ processValueResult _ _ _ _ _ _ _ (_, _, Nothing) = pure ()
 iterativeGetProviders :: DHTNode -> ByteString -> IO [ProviderEntry]
 iterativeGetProviders node key = do
   rt <- readTVarIO (dhtRoutingTable node)
-  let targetKey = DHTKey key
+  -- The raw content key goes on the wire; distance uses its SHA-256.
+  let targetKey = keyToDHTKey key
       seeds = closestPeers targetKey kValue rt
   now <- getCurrentTime
 
@@ -291,19 +299,20 @@ iterativeGetProviders node key = do
   knownVar      <- newTVarIO (Set.fromList (map entryPeerId seeds))
   providersVar  <- newTVarIO ([] :: [ProviderEntry])
 
-  providerLoop node targetKey candidatesVar queriedVar knownVar providersVar now
+  providerLoop node key targetKey candidatesVar queriedVar knownVar providersVar now
 
 -- | Provider lookup loop.
 providerLoop
   :: DHTNode
-  -> DHTKey
+  -> ByteString           -- ^ Raw wire key sent in requests
+  -> DHTKey               -- ^ SHA-256 of the wire key, for distance
   -> TVar [BucketEntry]
   -> TVar (Set PeerId)
   -> TVar (Set PeerId)    -- ^ Known peers (dedup)
   -> TVar [ProviderEntry]
   -> a
   -> IO [ProviderEntry]
-providerLoop node targetKey candidatesVar queriedVar knownVar providersVar _now = go
+providerLoop node wireKey targetKey candidatesVar queriedVar knownVar providersVar _now = go
   where
     go = do
       toQuery <- atomically $ do
@@ -318,7 +327,7 @@ providerLoop node targetKey candidatesVar queriedVar knownVar providersVar _now 
       if null toQuery
         then readTVarIO providersVar
         else do
-          results <- mapConcurrently (queryPeerForProviders node targetKey) toQuery
+          results <- mapConcurrently (queryPeerForProviders node wireKey) toQuery
 
           -- Collect providers and closer peers
           atomically $ do
@@ -345,14 +354,11 @@ providerLoop node targetKey candidatesVar queriedVar knownVar providersVar _now 
 
           if shouldContinue then go else readTVarIO providersVar
 
-    _now = let DHTKey bs = targetKey in bs
-
 -- | Query a peer for providers.
-queryPeerForProviders :: DHTNode -> DHTKey -> BucketEntry
+queryPeerForProviders :: DHTNode -> ByteString -> BucketEntry
                       -> IO (PeerId, Either String [DHTPeer], [DHTPeer])
-queryPeerForProviders node targetKey entry = do
-  let (DHTKey keyBytes) = targetKey
-      request = emptyDHTMessage { msgType = GetProviders, msgKey = keyBytes }
+queryPeerForProviders node wireKey entry = do
+  let request = emptyDHTMessage { msgType = GetProviders, msgKey = wireKey }
   result <- (dhtSendRequest node) (entryPeerId entry) request
     `catch` (\(e :: SomeException) -> pure (Left (show e)))
   pure $ case result of
@@ -369,8 +375,8 @@ bootstrap node seeds = do
       rt' = foldl (\r e -> fst (insertPeer e r)) rt seedEntries
   atomically $ writeTVar (dhtRoutingTable node) rt'
 
-  -- Step 2: Self-lookup (FIND_NODE for our own key)
-  _ <- iterativeFindNode node (dhtLocalKey node)
+  -- Step 2: Self-lookup (FIND_NODE for our own peer ID)
+  _ <- iterativeFindNode node (dhtLocalPeerId node)
 
   -- Step 3: Refresh non-empty buckets
   -- (simplified: just do another lookup for a peer in each occupied bucket)
@@ -378,7 +384,7 @@ bootstrap node seeds = do
   let peers = allPeers rt''
   -- For each unique bucket, pick a representative peer and do a lookup
   let bucketReps = take 10 peers  -- limit to avoid excessive lookups during bootstrap
-  mapM_ (\entry -> iterativeFindNode node (entryKey entry)
+  mapM_ (\entry -> iterativeFindNode node (entryPeerId entry)
                      `catch` (\(_ :: SomeException) -> pure []))
         bucketReps
 

@@ -2,10 +2,13 @@ module LibP2P.DHT.DistanceSpec (spec) where
 
 import Test.Hspec
 
+import Crypto.Hash (Digest, SHA256, hash)
+import Data.ByteArray (convert)
 import qualified Data.ByteString as BS
-import LibP2P.Crypto.PeerId (PeerId (..))
+import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT.Distance
-  ( peerIdToKey
+  ( keyToDHTKey
+  , peerIdToKey
   , xorDistance
   , commonPrefixLength
   , compareDistance
@@ -35,6 +38,17 @@ zeroKey = DHTKey (BS.replicate 32 0)
 
 spec :: Spec
 spec = do
+  describe "keyToDHTKey" $ do
+    it "is the SHA-256 digest of the raw key bytes" $ do
+      let raw = BS.pack [1, 2, 3, 4]
+          (DHTKey keyBytes) = keyToDHTKey raw
+      keyBytes `shouldBe` convert (hash raw :: Digest SHA256)
+      BS.length keyBytes `shouldBe` 32
+
+    it "peerIdToKey is keyToDHTKey applied to the raw peer ID bytes" $ do
+      let pid = mkPeerId (BS.pack [10, 20, 30])
+      peerIdToKey pid `shouldBe` keyToDHTKey (peerIdBytes pid)
+
   describe "peerIdToKey" $ do
     it "produces 32-byte output" $ do
       let pid = mkPeerId (BS.pack [1, 2, 3, 4])
