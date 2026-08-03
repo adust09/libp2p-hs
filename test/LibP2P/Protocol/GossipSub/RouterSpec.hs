@@ -215,6 +215,53 @@ spec = do
         -- Should have D=6 peers total (2 from fanout + 4 new)
         Set.size meshPeers `shouldBe` 6
 
+      -- gossipsub-v1.0.md JOIN: "notifies them with a GRAFT(topic) control
+      -- message" — this includes fanout peers promoted into the mesh (#155).
+      it "sends GRAFT to fanout peers promoted into the mesh" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let peerA = mkPeerId 1
+            peerB = mkPeerId 2
+        addSubscribedPeer router peerA "topic1"
+        addSubscribedPeer router peerB "topic1"
+        atomically $ modifyTVar' (gsFanout router) $
+          Map.insert "topic1" (Set.fromList [peerA, peerB])
+        join router "topic1"
+        sent <- readIORef logRef
+        let graftTargets = [ pid | (pid, rpc) <- sent
+                                 , Just ctrl <- [rpcControl rpc]
+                                 , any (\(Graft t) -> t == "topic1") (ctrlGraft ctrl) ]
+        Set.fromList graftTargets `shouldBe` Set.fromList [peerA, peerB]
+
+      -- Issue #155: a node maintains its own subscription set independent of
+      -- mesh state (gossipsub-v1.0.md "the router keeps track of the topics
+      -- its directly connected peers are subscribed to" and announces its own
+      -- subscriptions); joining with zero peers must still leave a trace.
+      it "records the subscription when the topic has no known peers" $ do
+        (router, _) <- mkTestRouter localPid
+        join router "empty-topic"
+        subs <- readTVarIO (gsSubscriptions router)
+        Set.member "empty-topic" subs `shouldBe` True
+
+      it "accepts a GRAFT for a topic joined with no peers at join time" $ do
+        -- gossipsub-v1.0.md GRAFT: "On receiving a GRAFT(topic) message, the
+        -- router will check to see if it is indeed subscribed to the topic
+        -- identified in the message. If so, the router will add the peer to
+        -- mesh[topic]." Mesh emptiness at join time is irrelevant (#155).
+        (router, logRef) <- mkTestRouter localPid
+        join router "empty-topic"
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        handleGraft router sender [Graft "empty-topic"]
+        mesh <- readTVarIO (gsMesh router)
+        Set.member sender (Map.findWithDefault Set.empty "empty-topic" mesh)
+          `shouldBe` True
+        sent <- readIORef logRef
+        let pruneMsgs = filter (\(_, rpc) ->
+              case rpcControl rpc of
+                Just ctrl -> not (null (ctrlPrune ctrl))
+                Nothing -> False) sent
+        length pruneMsgs `shouldBe` 0
+
     describe "leave" $ do
       it "announces unsubscription to all peers" $ do
         (router, logRef) <- mkTestRouter localPid
@@ -253,14 +300,21 @@ spec = do
         mesh <- readTVarIO (gsMesh router)
         Map.member "blocks" mesh `shouldBe` False
 
+      it "removes the topic from the subscription set" $ do
+        (router, _) <- mkTestRouter localPid
+        join router "blocks"
+        leave router "blocks"
+        subs <- readTVarIO (gsSubscriptions router)
+        Set.member "blocks" subs `shouldBe` False
+
     describe "handleGraft" $ do
       it "accepts graft when subscribed and no backoff" $ do
         (router, logRef) <- mkTestRouter localPid
         let sender = mkPeerId 1
         addPeer router sender GossipSubPeer False fixedTime
-        -- Create mesh entry (we're subscribed)
-        atomically $ modifyTVar' (gsMesh router) $
-          Map.insert "blocks" Set.empty
+        -- #155: subscription is tracked in gsSubscriptions, not inferred
+        -- from mesh-map key presence (gossipsub-v1.0.md GRAFT handling)
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "blocks")
         handleGraft router sender [Graft "blocks"]
         -- Sender should be in mesh
         mesh <- readTVarIO (gsMesh router)
@@ -291,8 +345,8 @@ spec = do
         (router, logRef, timeRef) <- mkTestRouterWithTime localPid fixedTime
         let sender = mkPeerId 1
         addPeer router sender GossipSubPeer False fixedTime
-        atomically $ modifyTVar' (gsMesh router) $
-          Map.insert "blocks" Set.empty
+        -- #155: mark ourselves subscribed via the subscription set
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "blocks")
         -- Set backoff that expires in the future
         let backoffExpiry = addUTCTime 60 fixedTime
         atomically $ modifyTVar' (gsBackoff router) $
@@ -426,6 +480,16 @@ spec = do
         let publishedTo = map fst $ filter (\(_, rpc) -> not (null (rpcPublish rpc))) sent
         Set.fromList publishedTo `shouldBe` Set.fromList [peerA, peerB]
 
+      -- gossipsub-v1.0.md: IWANT is answered from the mcache and IHAVE is
+      -- built from it; our own published messages must be cached too (#155).
+      it "caches own published message in the mcache" $ do
+        (router, _) <- mkTestRouter localPid
+        addSubscribedPeer router (mkPeerId 1) "blocks"
+        kp <- newKeyPair
+        publish router "blocks" (BS.pack [1, 2, 3]) (Just kp)
+        cache <- readTVarIO (gsMessageCache router)
+        Map.size (mcIndex cache) `shouldBe` 1
+
       it "marks published message as seen" $ do
         (router, _) <- mkTestRouter localPid
         let peerA = mkPeerId 1
@@ -499,9 +563,8 @@ spec = do
         (router, logRef) <- mkTestRouter localPid
         let sender = mkPeerId 1
         addPeer router sender GossipSubPeer False fixedTime
-        -- Create mesh so GRAFT can be accepted
-        atomically $ modifyTVar' (gsMesh router) $
-          Map.insert "blocks" Set.empty
+        -- #155: subscribe so GRAFT can be accepted
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "blocks")
         let rpc = RPC
               { rpcSubscriptions = [SubOpts True "blocks"]
               , rpcPublish = []
@@ -670,9 +733,8 @@ spec = do
             { psTopicState = Map.singleton "blocks"
                 (defaultTopicPeerState { tpsInvalidMessages = 10 })
             }) sender
-        -- Set up mesh entry for topic
-        atomically $ modifyTVar' (gsMesh routerWithParams) $
-          Map.insert "blocks" Set.empty
+        -- #155: mark ourselves subscribed via the subscription set
+        atomically $ modifyTVar' (gsSubscriptions routerWithParams) (Set.insert "blocks")
         handleGraft routerWithParams sender [Graft "blocks"]
         -- Sender should NOT be in mesh (rejected due to negative score)
         mesh <- readTVarIO (gsMesh routerWithParams)
@@ -689,8 +751,8 @@ spec = do
         (router, _) <- mkTestRouter localPid
         let sender = mkPeerId 1
         addPeer router sender GossipSubPeer False fixedTime
-        atomically $ modifyTVar' (gsMesh router) $
-          Map.insert "blocks" Set.empty
+        -- #155: mark ourselves subscribed via the subscription set
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "blocks")
         -- Set backoff
         let backoffExpiry = addUTCTime 60 fixedTime
         atomically $ modifyTVar' (gsBackoff router) $

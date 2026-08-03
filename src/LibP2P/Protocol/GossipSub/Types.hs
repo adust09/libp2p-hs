@@ -386,6 +386,11 @@ data MessageCache = MessageCache
 data GossipSubRouter = GossipSubRouter
   { gsParams      :: !GossipSubParams
   , gsLocalPeerId :: !PeerId
+    -- Subscription state
+  , gsSubscriptions :: !(TVar (Set Topic))
+    -- ^ Topics the local node is subscribed to. Kept independently of
+    -- mesh state: a topic joined before any peer announces it has an
+    -- empty (absent) mesh entry but is still subscribed (issue #155).
     -- Mesh and fanout state
   , gsMesh        :: !(TVar (Map Topic (Set PeerId)))
   , gsFanout      :: !(TVar (Map Topic (Set PeerId)))

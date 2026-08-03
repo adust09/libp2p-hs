@@ -57,6 +57,7 @@ newRouter :: GossipSubParams
           -> IO UTCTime                 -- ^ Time source
           -> IO GossipSubRouter
 newRouter params localPid sendRPC getTime = do
+  subs     <- newTVarIO Set.empty
   mesh     <- newTVarIO Map.empty
   fanout   <- newTVarIO Map.empty
   fanoutPub <- newTVarIO Map.empty
@@ -71,6 +72,7 @@ newRouter params localPid sendRPC getTime = do
   pure GossipSubRouter
     { gsParams         = params
     , gsLocalPeerId    = localPid
+    , gsSubscriptions  = subs
     , gsMesh           = mesh
     , gsFanout         = fanout
     , gsFanoutPub      = fanoutPub
@@ -133,13 +135,19 @@ removePeer router pid = atomically $ do
 -- | Subscribe to a topic (JOIN): announce, fanout→mesh transition, fill to D, GRAFT.
 join :: GossipSubRouter -> Topic -> IO ()
 join router topic = do
-  -- 1. Announce subscription to all known peers
+  -- 1. Record the subscription. This must happen regardless of how many
+  -- peers currently know the topic: the subscription set (not mesh key
+  -- presence) is what GRAFT acceptance and hello-packet announcements
+  -- consult (gossipsub-v1.0.md JOIN/GRAFT; issue #155).
+  atomically $ modifyTVar' (gsSubscriptions router) (Set.insert topic)
+
+  -- 2. Announce subscription to all known peers
   peers <- readTVarIO (gsPeers router)
   let allPeerIds = Map.keys peers
       subRPC = emptyRPC { rpcSubscriptions = [SubOpts True topic] }
   mapM_ (\pid -> gsSendRPC router pid subRPC) allPeerIds
 
-  -- 2. Check fanout and transition to mesh
+  -- 3. Check fanout and transition to mesh
   (fanoutPeers, topicPeers) <- atomically $ do
     fo <- readTVar (gsFanout router)
     let foPeers = Map.findWithDefault Set.empty topic fo
@@ -160,7 +168,7 @@ join router topic = do
           else acc) Set.empty peerMap
     pure (foPeers, eligible)
 
-  -- 3. Fill mesh to D if needed
+  -- 4. Fill mesh to D if needed
   currentMesh <- atomically $ do
     m <- readTVar (gsMesh router)
     pure (Map.findWithDefault Set.empty topic m)
@@ -174,20 +182,25 @@ join router topic = do
       pure newSet
     else pure Set.empty
 
-  -- 4. Send GRAFT to all new mesh peers (including former fanout peers)
-  let allNewMeshPeers = Set.union (Set.difference fanoutPeers currentMesh) newPeers
+  -- 5. Send GRAFT to all new mesh peers, including former fanout peers.
+  -- fanoutPeers was captured before the mesh insert; currentMesh already
+  -- contains the promoted peers, so it must not be subtracted here (#155).
+  let allNewMeshPeers = Set.union fanoutPeers newPeers
   mapM_ (\pid -> gsSendRPC router pid (graftRPC topic)) (Set.toList allNewMeshPeers)
 
 -- | Unsubscribe from a topic (LEAVE): announce, PRUNE with backoff, delete mesh.
 leave :: GossipSubRouter -> Topic -> IO ()
 leave router topic = do
-  -- 1. Announce unsubscription to all known peers
+  -- 1. Drop the subscription
+  atomically $ modifyTVar' (gsSubscriptions router) (Set.delete topic)
+
+  -- 2. Announce unsubscription to all known peers
   peers <- readTVarIO (gsPeers router)
   let allPeerIds = Map.keys peers
       unsubRPC = emptyRPC { rpcSubscriptions = [SubOpts False topic] }
   mapM_ (\pid -> gsSendRPC router pid unsubRPC) allPeerIds
 
-  -- 2. Send PRUNE with unsubscribe backoff to mesh peers, then delete
+  -- 3. Send PRUNE with unsubscribe backoff to mesh peers, then delete
   meshPeers <- atomically $ do
     m <- readTVar (gsMesh router)
     let mp = Map.findWithDefault Set.empty topic m
@@ -215,8 +228,11 @@ publish router topic payload mKeyPair = do
 
   let msgId = paramMessageIdFn (gsParams router) msg
 
-  -- Mark as seen
-  atomically $ modifyTVar' (gsSeen router) (Map.insert msgId now)
+  -- Mark as seen and cache for IWANT/IHAVE: gossipsub-v1.0.md answers
+  -- IWANT from the mcache, so our own messages must be cached too (#155).
+  atomically $ do
+    modifyTVar' (gsSeen router) (Map.insert msgId now)
+    modifyTVar' (gsMessageCache router) (cachePut msgId msg)
 
   -- Build RPC with published message
   let pubRPC = emptyRPC { rpcPublish = [msg] }
@@ -355,9 +371,11 @@ handleGraft router sender grafts = do
 -- | Handle a single GRAFT request.
 handleOneGraft :: GossipSubRouter -> PeerId -> UTCTime -> Graft -> IO [Prune]
 handleOneGraft router sender now (Graft topic) = do
-  -- Check if we are subscribed to this topic
-  meshMap <- readTVarIO (gsMesh router)
-  let subscribed = Map.member topic meshMap
+  -- Check the subscription set, not mesh key presence: a topic joined
+  -- with no peers has no mesh entry but its GRAFTs must be accepted
+  -- (gossipsub-v1.0.md GRAFT handling; issue #155).
+  subs <- readTVarIO (gsSubscriptions router)
+  let subscribed = Set.member topic subs
 
   if not subscribed
     then pure [Prune topic [] Nothing]  -- Not subscribed → PRUNE

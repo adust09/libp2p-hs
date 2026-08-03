@@ -15,6 +15,7 @@ module LibP2P.Protocol.GossipSub.Handler
   , newGossipSubNode
     -- * Stream handling
   , handleGossipSubStream
+  , sendCurrentSubscriptions
     -- * Lifecycle
   , startGossipSub
   , stopGossipSub
@@ -227,8 +228,10 @@ onNewConnection node conn = do
 sendCurrentSubscriptions :: GossipSubNode -> StreamIO -> IO ()
 sendCurrentSubscriptions node stream = do
   let router = gsnRouter node
-  meshTopics <- atomically $ Map.keysSet <$> readTVar (gsMesh router)
-  let topics = Set.toList meshTopics
+  -- Read the subscription set, not mesh keys: a topic joined before any
+  -- peer was known has no mesh entry but must still be announced (#155).
+  subs <- atomically $ readTVar (gsSubscriptions router)
+  let topics = Set.toList subs
   if null topics
     then pure ()
     else do
