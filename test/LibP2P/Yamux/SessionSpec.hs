@@ -1,11 +1,13 @@
 module LibP2P.Yamux.SessionSpec (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (async, concurrently, concurrently_, wait, withAsync)
+import Control.Concurrent.Async (async, concurrently, concurrently_, poll, wait, withAsync)
 import Control.Concurrent.STM
 import qualified Data.ByteString as BS
+import Data.Maybe (isNothing)
 import System.Timeout (timeout)
 import LibP2P.Yamux.Frame
+import LibP2P.Yamux.HostilePeer
 import LibP2P.Yamux.Session
 import LibP2P.Yamux.Stream (streamClose, streamRead, streamReset, streamWrite)
 import LibP2P.Yamux.Types
@@ -164,15 +166,47 @@ spec = do
         result <- ping client
         result `shouldBe` Right ()
 
-    it "Ping echoes exact opaque value in Length field" $ do
-      withSessionPair $ \(client, _server) -> do
-        result <- ping client
-        result `shouldBe` Right ()
+    it "echoes the exact opaque value in the Ping ACK" $
+      withHostilePeer RoleServer $ \hp -> do
+        injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagSYN = True}) 0 0xDEADBEEF) BS.empty
+        (ack, _) <- expectFrame hp
+        yhType ack `shouldBe` FramePing
+        flagACK (yhFlags ack) `shouldBe` True
+        yhStreamId ack `shouldBe` 0
+        yhLength ack `shouldBe` 0xDEADBEEF
 
-    it "Ping uses StreamID 0" $ do
-      withSessionPair $ \(client, _server) -> do
-        result <- ping client
-        result `shouldBe` Right ()
+    it "sends Ping SYN on StreamID 0 and resolves on the matching ACK" $
+      withHostilePeer RoleClient $ \hp -> do
+        pingA <- async (ping (hpSession hp))
+        (syn, _) <- expectFrame hp
+        yhType syn `shouldBe` FramePing
+        flagSYN (yhFlags syn) `shouldBe` True
+        yhStreamId syn `shouldBe` 0
+        injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0 (yhLength syn)) BS.empty
+        result <- timeout 1000000 (wait pingA)
+        result `shouldBe` Just (Right ())
+
+    it "does not resolve a pending ping from a mismatched opaque value" $
+      withHostilePeer RoleClient $ \hp -> do
+        pingA <- async (ping (hpSession hp))
+        (syn, _) <- expectFrame hp
+        let opaque = yhLength syn
+        injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0 (opaque + 100)) BS.empty
+        threadDelay 100000
+        stillPending <- poll pingA
+        stillPending `shouldSatisfy` isNothing
+        injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0 opaque) BS.empty
+        result <- timeout 1000000 (wait pingA)
+        result `shouldBe` Just (Right ())
+
+    it "ignores an unsolicited Ping ACK" $
+      withHostilePeer RoleServer $ \hp -> do
+        injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0 99) BS.empty
+        -- Session must survive: a subsequent Ping SYN still gets echoed
+        injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagSYN = True}) 0 7) BS.empty
+        (ack, _) <- expectFrame hp
+        yhType ack `shouldBe` FramePing
+        yhLength ack `shouldBe` 7
 
   describe "GoAway" $ do
     it "GoAway Normal (0x00) sets ysessShutdown" $ do
@@ -233,6 +267,40 @@ spec = do
           check (st == StreamClosed)
         stClient <- readTVarIO (ysState clientStream)
         stClient `shouldBe` StreamClosed
+
+  describe "Half-close semantics" $ do
+    it "keeps the remote-to-local direction open after a local FIN" $ do
+      withSessionPair $ \(client, server) -> do
+        (clientStream, serverStream) <-
+          concurrently
+            (openStream client >>= \(Right s) -> pure s)
+            (acceptStream server >>= \(Right s) -> pure s)
+        atomically $ do
+          st <- readTVar (ysState clientStream)
+          check (st == StreamEstablished)
+        -- Client half-closes: its write side is dead
+        Right () <- streamClose clientStream
+        wr <- streamWrite clientStream "late"
+        wr `shouldBe` Left YamuxStreamClosed
+        -- Server observes EOF on its read side
+        finSeen <- timeout 1000000 $ atomically $ do
+          st <- readTVar (ysState serverStream)
+          check (st == StreamRemoteClose)
+        finSeen `shouldBe` Just ()
+        eof <- streamRead serverStream
+        eof `shouldBe` Left YamuxStreamClosed
+        -- The other direction still flows: server writes, client reads
+        Right () <- streamWrite serverStream "reply"
+        Right got <- streamRead clientStream
+        got `shouldBe` "reply"
+        -- Server closes too; both ends reach Closed and client sees EOF
+        Right () <- streamClose serverStream
+        closed <- timeout 1000000 $ atomically $ do
+          st <- readTVar (ysState clientStream)
+          check (st == StreamClosed)
+        closed `shouldBe` Just ()
+        end <- streamRead clientStream
+        end `shouldBe` Left YamuxStreamClosed
 
   describe "SYN validation" $ do
     it "SYN with wrong parity triggers GoAway (server rejects even ID)" $ do

@@ -171,11 +171,13 @@ recvLoop sess = go
       -- Read 12-byte header
       headerBytes <- ysessRead sess headerSize
       case decodeHeader headerBytes of
-        Left _err -> pure () -- Protocol error, stop
-        Right hdr -> do
+        -- Malformed header (unknown frame type): tell the peer why we
+        -- are leaving before terminating, as go-yamux does
+        Left _err -> sendGoAway sess GoAwayProtocol
+        Right hdr ->
           -- Verify version
           if yhVersion hdr /= 0
-            then pure () -- Protocol error
+            then sendGoAway sess GoAwayProtocol
             else do
               continue <- dispatchFrame sess hdr
               when continue go
