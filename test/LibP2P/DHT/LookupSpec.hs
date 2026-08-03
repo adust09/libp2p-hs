@@ -15,6 +15,7 @@ import LibP2P.DHT.Lookup
 import LibP2P.DHT.Message
 import LibP2P.DHT.RoutingTable (insertPeer, allPeers)
 import LibP2P.DHT.Types
+import LibP2P.Multiaddr (fromText, toBytes)
 
 -- Reuse mock Switch helpers from DHTSpec
 import LibP2P.DHT.DHTSpec (mkTestNode, mkPeerId, localPid)
@@ -30,11 +31,17 @@ mkNodeWithMock pid mockSend = do
 type MockNetwork = Map.Map PeerId (DHTMessage -> DHTMessage)
 
 -- | Build a mock sendRequest from a MockNetwork.
+--
+-- Issue #173: mock senders must read the request rather than return a
+-- canned constant. A query without a wire key would be a client-side bug
+-- that a constant mock silently masks, so reject it like a real peer.
 mockSendFromNetwork :: MockNetwork -> PeerId -> DHTMessage -> IO (Either String DHTMessage)
-mockSendFromNetwork network pid msg =
-  case Map.lookup pid network of
-    Nothing -> pure (Left "peer not found in mock network")
-    Just handler -> pure (Right (handler msg))
+mockSendFromNetwork network pid msg
+  | BS.null (msgKey msg) = pure (Left "mock: request carries no wire key")
+  | otherwise =
+      case Map.lookup pid network of
+        Nothing -> pure (Left "peer not found in mock network")
+        Just handler -> pure (Right (handler msg))
 
 spec :: Spec
 spec = do
@@ -204,6 +211,33 @@ spec = do
       result <- iterativeFindNode node targetPid
       -- Results should be sorted by XOR distance to the target
       map entryPeerId result `shouldBe` expectedOrder
+
+    -- Issue #147 (receive side): multiaddrs carried by closerPeers must be
+    -- decoded into the resulting entries instead of being dropped —
+    -- otherwise the peers we learn about cannot be dialled.
+    it "decodes closerPeers' multiaddrs into lookup results" $ do
+      now <- getCurrentTime
+      let pidA = mkPeerId (BS.pack [10])
+          pidB = mkPeerId (BS.pack [20])
+          addrB = either error id (fromText "/ip4/192.0.2.1/tcp/4001")
+          targetPid = mkPeerId (BS.pack [42])
+          network = Map.fromList
+            [ (pidA, \_ -> emptyDHTMessage
+                { msgType = FindNode
+                , msgCloserPeers =
+                    [DHTPeer (peerIdBytes pidB) [toBytes addrB] NotConnected]
+                })
+            , (pidB, \_ -> emptyDHTMessage
+                { msgType = FindNode, msgCloserPeers = [] })
+            ]
+      node <- mkNodeWithMock localPid (mockSendFromNetwork network)
+      let entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        fst (insertPeer entryA rt)
+
+      result <- iterativeFindNode node targetPid
+      let entriesB = filter ((== pidB) . entryPeerId) result
+      map entryAddrs entriesB `shouldBe` [[addrB]]
 
   describe "iterativeGetValue" $ do
     it "sends the raw record key as the wire key" $ do
@@ -379,6 +413,29 @@ spec = do
       result <- iterativeGetProviders node key
       -- Should have collected providers from both hops
       length result `shouldSatisfy` (>= 2)
+
+    -- Issue #147 (receive side): provider records carry multiaddrs that
+    -- must be decoded so the provider can be dialled.
+    it "decodes provider multiaddrs into provider entries" $ do
+      now <- getCurrentTime
+      let pidA = mkPeerId (BS.pack [10])
+          key = BS.pack [0xD1]
+          providerAddr = either error id (fromText "/ip4/192.0.2.7/tcp/4001")
+          providerPeer = DHTPeer (BS.pack [50]) [toBytes providerAddr] Connected
+          network = Map.fromList
+            [ (pidA, \_ -> emptyDHTMessage
+                { msgType = GetProviders
+                , msgCloserPeers = []
+                , msgProviderPeers = [providerPeer]
+                })
+            ]
+      node <- mkNodeWithMock localPid (mockSendFromNetwork network)
+      let entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        fst (insertPeer entryA rt)
+
+      result <- iterativeGetProviders node key
+      map peAddrs result `shouldBe` [[providerAddr]]
 
   describe "bootstrap" $ do
     it "self-lookup sends raw peer IDs as wire keys" $ do
