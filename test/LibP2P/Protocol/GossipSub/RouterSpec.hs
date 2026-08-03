@@ -328,18 +328,20 @@ spec = do
                 Nothing -> False) sent
         length pruneMsgs `shouldBe` 0
 
-      it "rejects graft when not subscribed (sends PRUNE)" $ do
-        (router, logRef) <- mkTestRouter localPid
+      it "does not add the sender to the mesh for an unsubscribed topic" $ do
+        (router, _) <- mkTestRouter localPid
         let sender = mkPeerId 1
         addPeer router sender GossipSubPeer False fixedTime
-        -- No mesh entry = not subscribed
         handleGraft router sender [Graft "unknown-topic"]
-        sent <- readIORef logRef
-        let pruneMsgs = filter (\(pid, rpc) ->
-              pid == sender && case rpcControl rpc of
-                Just ctrl -> any (\p -> pruneTopic p == "unknown-topic") (ctrlPrune ctrl)
-                Nothing -> False) sent
-        length pruneMsgs `shouldBe` 1
+        -- The sender must never enter a mesh for a topic we are not
+        -- subscribed to. Note: the reply behaviour is deliberately NOT
+        -- asserted here. The router currently answers with PRUNE, but
+        -- gossipsub-v1.1.md requires ignoring a GRAFT for an unknown topic
+        -- entirely (the PRUNE reply is a spam amplification vector). The
+        -- previous version of this test asserted the PRUNE reply as correct;
+        -- the reply fix is tracked in #157.
+        mesh <- readTVarIO (gsMesh router)
+        Map.findWithDefault Set.empty "unknown-topic" mesh `shouldBe` Set.empty
 
       it "rejects graft during backoff (sends PRUNE with backoff)" $ do
         (router, logRef, timeRef) <- mkTestRouterWithTime localPid fixedTime
@@ -457,12 +459,42 @@ spec = do
         sent `shouldBe` []
 
     describe "handleIWant" $ do
-      it "is a stub in Phase 9a (does nothing)" $ do
+      -- gossipsub-v1.0.md: IWANT requests are answered from the mcache.
+      -- These replace the retired "stub does nothing" test, which passed
+      -- only because the cache happened to be empty (#175).
+      it "answers IWANT for our own published message from the mcache" $ do
+        (router, logRef) <- mkTestRouter localPid
+        addSubscribedPeer router (mkPeerId 1) "blocks"
+        kp <- newKeyPair
+        publish router "blocks" (BS.pack [1, 2, 3]) (Just kp)
+        published <- concatMap (rpcPublish . snd) <$> readIORef logRef
+        case published of
+          [msg] -> do
+            writeIORef logRef []
+            let requester = mkPeerId 2
+            handleIWant router requester [IWant [defaultMessageId msg]]
+            sent <- readIORef logRef
+            map fst sent `shouldBe` [requester]
+            concatMap (rpcPublish . snd) sent `shouldBe` [msg]
+          _ -> expectationFailure "expected exactly one published message"
+
+      it "answers IWANT for a message received from another peer" $ do
         (router, logRef) <- mkTestRouter localPid
         let sender = mkPeerId 1
-        handleIWant router sender [IWant [BS.pack [1]]]
+            requester = mkPeerId 2
+        addPeer router sender GossipSubPeer False fixedTime
+        kp <- newKeyPair
+        let msg = signedMessage kp "t" (BS.pack [5])
+        handleRPC router sender emptyRPC { rpcPublish = [msg] }
+        writeIORef logRef []
+        handleIWant router requester [IWant [defaultMessageId msg]]
         sent <- readIORef logRef
-        sent `shouldBe` []
+        concatMap (rpcPublish . snd) sent `shouldBe` [msg]
+
+      it "sends nothing for message ids not in the cache" $ do
+        (router, logRef) <- mkTestRouter localPid
+        handleIWant router (mkPeerId 1) [IWant [BS.pack [9, 9]]]
+        readIORef logRef `shouldReturn` []
 
     describe "publish" $ do
       it "flood publishes to all topic peers" $ do
@@ -652,6 +684,44 @@ spec = do
             msg = (signedMessage kp "t" (BS.pack [1])) { msgFrom = Just spoofed }
         handleRPC router sender emptyRPC { rpcPublish = [msg] }
         readIORef deliveredRef `shouldReturn` 0
+
+      it "rejects an unsigned message under StrictSign" $ do
+        -- pubsub/README.md StrictSign: "Enforce the fields to be present,
+        -- reject otherwise." The pre-#154 suite asserted the opposite:
+        -- that an unsigned message is delivered (#175).
+        (router, logRef) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            meshPeer = mkPeerId 2
+        addPeer router sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "t" (Set.fromList [sender, meshPeer])
+        deliveredRef <- newIORef (0 :: Int)
+        atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
+          modifyIORef' deliveredRef (+ 1)
+        let unsigned = PubSubMessage Nothing (BS.pack [1]) Nothing "t" Nothing Nothing
+        handleRPC router sender emptyRPC { rpcPublish = [unsigned] }
+        readIORef deliveredRef `shouldReturn` 0
+        readIORef logRef `shouldReturn` []
+        invalidCount router sender "t" `shouldReturn` 1
+
+      it "still delivers the genuine message after rejecting a forgery with the same id" $ do
+        -- pubsub/README.md:236-238 — a rejected message must not poison the
+        -- seen cache: validation runs before dedup, so the genuine message
+        -- (same from and seqno, hence the same message id) still goes through.
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        deliveredRef <- newIORef (0 :: Int)
+        atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
+          modifyIORef' deliveredRef (+ 1)
+        kp <- newKeyPair
+        let genuine = signedMessage kp "t" (BS.pack [1])
+            forged  = genuine { msgData = BS.pack [99] }
+        defaultMessageId forged `shouldBe` defaultMessageId genuine
+        handleRPC router sender emptyRPC { rpcPublish = [forged] }
+        readIORef deliveredRef `shouldReturn` 0
+        handleRPC router sender emptyRPC { rpcPublish = [genuine] }
+        readIORef deliveredRef `shouldReturn` 1
 
       it "charges the sender a P4 invalid delivery for a rejected message" $ do
         (router, _) <- mkTestRouter localPid
