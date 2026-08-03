@@ -34,7 +34,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Time (UTCTime, getCurrentTime)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
-import LibP2P.DHT.Distance (peerIdToKey)
+import LibP2P.DHT.Distance (keyToDHTKey, peerIdToKey)
 import LibP2P.DHT.Message
 import LibP2P.DHT.RoutingTable (RoutingTable, closestPeers, newRoutingTable)
 import LibP2P.DHT.Types
@@ -124,7 +124,9 @@ processRequest node msg remotePeerId =
 handleFindNode :: DHTNode -> DHTMessage -> IO DHTMessage
 handleFindNode node msg = do
   rt <- readTVarIO (dhtRoutingTable node)
-  let targetKey = DHTKey (msgKey msg)
+  -- The wire key is raw (a binary peer ID); the spec distance metric is
+  -- XOR over SHA-256 digests, so hash before comparing.
+  let targetKey = keyToDHTKey (msgKey msg)
       closest = closestPeers targetKey kValue rt
       peers = map entryToDHTPeer closest
   pure emptyDHTMessage
@@ -138,7 +140,8 @@ handleGetValue node msg = do
   rt <- readTVarIO (dhtRoutingTable node)
   records <- readTVarIO (dhtRecordStore node)
   let key = msgKey msg
-      targetKey = DHTKey key
+      -- Store lookup uses the raw key; distance uses its SHA-256.
+      targetKey = keyToDHTKey key
       closest = closestPeers targetKey kValue rt
       peers = map entryToDHTPeer closest
       rec = Map.lookup key records
@@ -177,7 +180,8 @@ handleGetProviders node msg = do
   rt <- readTVarIO (dhtRoutingTable node)
   providerMap <- readTVarIO (dhtProviderStore node)
   let key = msgKey msg
-      targetKey = DHTKey key
+      -- Store lookup uses the raw key; distance uses its SHA-256.
+      targetKey = keyToDHTKey key
       closest = closestPeers targetKey kValue rt
       closerPeers = map entryToDHTPeer closest
       providers = Map.findWithDefault [] key providerMap

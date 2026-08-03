@@ -3,7 +3,8 @@
 -- All distance computations operate on 256-bit SHA-256 keys.
 -- Distance is the XOR of two keys interpreted as a 256-bit unsigned integer.
 module LibP2P.DHT.Distance
-  ( peerIdToKey
+  ( keyToDHTKey
+  , peerIdToKey
   , xorDistance
   , commonPrefixLength
   , compareDistance
@@ -20,11 +21,20 @@ import Data.Word (Word8)
 import LibP2P.Crypto.PeerId (PeerId, peerIdBytes)
 import LibP2P.DHT.Types (BucketEntry (..), DHTKey (..))
 
+-- | Map a raw key (binary peer ID, record key, CID) into the DHT keyspace.
+--
+-- Per specs/kad-dht, the distance between two keys is
+-- @XOR(sha256(key1), sha256(key2))@ — every key must be hashed before any
+-- distance computation. Wire messages carry the raw key; only local
+-- comparisons use the digest.
+keyToDHTKey :: ByteString -> DHTKey
+keyToDHTKey bs =
+  let digest = hash bs :: Digest SHA256
+  in DHTKey (convert digest)
+
 -- | Convert a Peer ID to its DHT key by hashing with SHA-256.
 peerIdToKey :: PeerId -> DHTKey
-peerIdToKey pid =
-  let digest = hash (peerIdBytes pid) :: Digest SHA256
-  in DHTKey (convert digest)
+peerIdToKey = keyToDHTKey . peerIdBytes
 
 -- | Compute XOR distance between two DHT keys.
 xorDistance :: DHTKey -> DHTKey -> DHTKey
