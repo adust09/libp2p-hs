@@ -13,7 +13,7 @@ import Control.Concurrent.STM
   , tryReadTMVar
   , writeTQueue
   )
-import Control.Exception (throwIO)
+import Control.Exception (SomeException, catch, throwIO)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
@@ -21,9 +21,10 @@ import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (kpPublic)
 import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
+import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import LibP2P.Protocol.Identify
-import LibP2P.Protocol.Identify.Message (IdentifyInfo (..), decodeIdentify, encodeIdentify)
+import LibP2P.Protocol.Identify.Message (IdentifyInfo (..), decodeIdentify, encodeIdentify, maxIdentifySize)
 import LibP2P.Switch (newSwitch, setStreamHandler)
 import LibP2P.Switch.Types (Switch (..))
 import Data.Word (Word8)
@@ -73,6 +74,21 @@ mkClosableStreamPair = do
         }
   pure (streamA, streamB)
 
+-- | Read all raw bytes from a StreamIO until EOF (test helper).
+readAllBytes :: StreamIO -> IO (Either String BS.ByteString)
+readAllBytes stream = go []
+  where
+    go acc = do
+      result <- (Right <$> streamReadByte stream) `catch`
+                (\(_ :: SomeException) -> pure (Left ()))
+      case result of
+        Left () -> pure (Right (BS.pack (reverse acc)))
+        Right b -> go (b : acc)
+
+-- | Prepend the uvarint length prefix to an encoded message (test helper).
+frame :: BS.ByteString -> BS.ByteString
+frame payload = encodeUvarint (fromIntegral (BS.length payload)) <> payload
+
 spec :: Spec
 spec = do
   describe "Identify protocol" $ do
@@ -95,21 +111,26 @@ spec = do
       let expectedPubKey = encodePublicKey (kpPublic (swIdentityKey sw))
       idPublicKey info `shouldBe` Just expectedPubKey
 
-    it "handleIdentify sends decodable protobuf over stream" $ do
+    it "handleIdentify writes a varint-length-prefixed protobuf" $ do
       sw <- mkTestSwitch
       (streamA, streamB) <- mkClosableStreamPair
-      -- handleIdentify writes protobuf to streamA and closes it (EOF)
+      -- handleIdentify writes the framed protobuf to streamA and closes it (EOF)
       writer <- async $ handleIdentify sw streamA (PeerId "remote")
-      -- Read all bytes from streamB until EOF
-      bytesOrErr <- readUntilEOF streamB 65536
+      -- Read all raw bytes from streamB until EOF
+      bytesOrErr <- readAllBytes streamB
       wait writer
       case bytesOrErr of
-        Left err -> expectationFailure $ "readUntilEOF failed: " ++ err
-        Right bs -> case decodeIdentify bs of
-          Left parseErr -> expectationFailure $ "Decode failed: " ++ show parseErr
-          Right info -> do
-            idProtocolVersion info `shouldBe` Just "ipfs/0.1.0"
-            idAgentVersion info `shouldBe` Just "libp2p-hs/0.1.0"
+        Left err -> expectationFailure $ "reading stream failed: " ++ err
+        Right bs -> case decodeUvarint bs of
+          Left err -> expectationFailure $ "no varint length prefix: " ++ err
+          Right (len, payload) -> do
+            -- The varint prefix must describe exactly the protobuf payload
+            fromIntegral len `shouldBe` BS.length payload
+            case decodeIdentify payload of
+              Left parseErr -> expectationFailure $ "Decode failed: " ++ show parseErr
+              Right info -> do
+                idProtocolVersion info `shouldBe` Just "ipfs/0.1.0"
+                idAgentVersion info `shouldBe` Just "libp2p-hs/0.1.0"
 
     it "handleIdentify closes stream after writing (signals EOF)" $ do
       sw <- mkTestSwitch
@@ -143,7 +164,7 @@ spec = do
             }
       -- handleIdentify should write + close the stream
       writer <- async $ handleIdentify sw testStream (PeerId "remote")
-      bytesOrErr <- readUntilEOF readerStream 65536
+      bytesOrErr <- readAllBytes readerStream
       wait writer
       -- Stream close should have been called by handleIdentify
       closeCalled <- readIORef closeCalledRef
@@ -151,7 +172,7 @@ spec = do
       -- And the data should be readable
       case bytesOrErr of
         Right _ -> pure ()
-        Left err -> expectationFailure $ "readUntilEOF failed: " ++ err
+        Left err -> expectationFailure $ "reading stream failed: " ++ err
 
     it "handleIdentifyPush stores info in peer store" $ do
       sw <- mkTestSwitch
@@ -165,9 +186,9 @@ spec = do
             , idObservedAddr    = Nothing
             , idProtocols       = ["/test/proto"]
             }
-      -- Write encoded message then signal EOF
+      -- Write varint-length-prefixed message then signal EOF
       let encoded = encodeIdentify testInfo
-      streamWrite streamA encoded
+      streamWrite streamA (frame encoded)
       streamClose streamA
       -- handleIdentifyPush reads from streamB
       handleIdentifyPush sw streamB remotePeerId
@@ -178,6 +199,43 @@ spec = do
         Just storedInfo -> do
           idProtocolVersion storedInfo `shouldBe` Just "test/1.0"
           idAgentVersion storedInfo `shouldBe` Just "test-agent/0.1"
+
+    it "readFramedIdentify parses a varint-length-prefixed message" $ do
+      (streamA, streamB) <- mkClosableStreamPair
+      let testInfo = IdentifyInfo
+            { idProtocolVersion = Just "ipfs/0.1.0"
+            , idAgentVersion    = Just "framed-agent/1.0"
+            , idPublicKey       = Nothing
+            , idListenAddrs     = []
+            , idObservedAddr    = Nothing
+            , idProtocols       = ["/framed/1.0.0"]
+            }
+      streamWrite streamA (frame (encodeIdentify testInfo))
+      result <- readFramedIdentify streamB maxIdentifySize
+      result `shouldBe` Right testInfo
+
+    it "readFramedIdentify round-trips encodeFramedIdentify" $ do
+      (streamA, streamB) <- mkClosableStreamPair
+      let testInfo = IdentifyInfo
+            { idProtocolVersion = Just "ipfs/0.1.0"
+            , idAgentVersion    = Just "roundtrip/1.0"
+            , idPublicKey       = Just (BS.pack [1, 2, 3])
+            , idListenAddrs     = [BS.pack [4, 7, 0, 0, 0, 1]]
+            , idObservedAddr    = Nothing
+            , idProtocols       = ["/a/1.0.0", "/b/1.0.0"]
+            }
+      streamWrite streamA (encodeFramedIdentify testInfo)
+      result <- readFramedIdentify streamB maxIdentifySize
+      result `shouldBe` Right testInfo
+
+    it "readFramedIdentify rejects an oversized length prefix" $ do
+      (streamA, streamB) <- mkClosableStreamPair
+      -- Announce a length just above the limit, without sending a payload
+      streamWrite streamA (encodeUvarint (fromIntegral (maxIdentifySize + 1)))
+      result <- readFramedIdentify streamB maxIdentifySize
+      case result of
+        Left err -> err `shouldSatisfy` (not . null)
+        Right _  -> expectationFailure "expected oversized message to be rejected"
 
     it "registerIdentifyHandlers registers both protocol handlers" $ do
       sw <- mkTestSwitch
