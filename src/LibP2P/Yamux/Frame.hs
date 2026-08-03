@@ -12,6 +12,7 @@ module LibP2P.Yamux.Frame
   , defaultFlags
   , headerSize
   , initialWindowSize
+  , maxStreamWindowSize
   ) where
 
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
@@ -26,6 +27,12 @@ headerSize = 12
 -- | Default initial window size: 256 KiB (262144 bytes).
 initialWindowSize :: Word32
 initialWindowSize = 262144
+
+-- | Absolute upper bound for any receive window (16 MiB), matching
+-- go-yamux's MaxStreamWindowSize. No conforming peer may declare a
+-- data frame length beyond this, whatever the per-stream window is.
+maxStreamWindowSize :: Word32
+maxStreamWindowSize = 16777216
 
 -- | Yamux frame types.
 data FrameType

@@ -26,6 +26,7 @@ module LibP2P.Switch.Upgrade
 
 import Control.Concurrent.Async (async)
 import Control.Concurrent.STM (newTVarIO)
+import Control.Monad (replicateM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -33,6 +34,7 @@ import Data.Word (Word8)
 import LibP2P.Core.Binary (readWord16BE)
 import LibP2P.Crypto.Key (KeyPair (..))
 import LibP2P.Crypto.PeerId (fromPublicKey)
+import LibP2P.Yamux.Frame (maxStreamWindowSize)
 import LibP2P.Yamux.Session (closeSession, newSession, recvLoop, sendLoop)
 import qualified LibP2P.Yamux.Session as Yamux
 import LibP2P.Yamux.Stream (streamRead)
@@ -74,8 +76,25 @@ import qualified LibP2P.Crypto.Protobuf as Proto
 import qualified LibP2P.Noise.Handshake as HS
 
 -- | Read exactly n bytes from a StreamIO.
+--
+-- Defence in depth against remote memory exhaustion: the request size is
+-- bounded by maxStreamWindowSize (callers must validate lengths against
+-- flow control before reading), and bytes are packed in fixed-size chunks
+-- so memory use is proportional to the chunk size, not to n.
 readExact :: StreamIO -> Int -> IO ByteString
-readExact stream n = BS.pack <$> mapM (const (streamReadByte stream)) [1 .. n]
+readExact stream n
+  | n <= 0 = pure BS.empty
+  | n > fromIntegral maxStreamWindowSize =
+      fail ("readExact: requested size exceeds bound: " <> show n)
+  | otherwise = BS.concat <$> go n
+  where
+    chunkSize = 32768 :: Int
+    go 0 = pure []
+    go remaining = do
+      let m = min chunkSize remaining
+      chunk <- BS.pack <$> replicateM m (streamReadByte stream)
+      rest <- go (remaining - m)
+      pure (chunk : rest)
 
 -- | Read a 2-byte-BE-length-prefixed Noise frame from a StreamIO.
 readFramedMessage :: StreamIO -> IO ByteString
