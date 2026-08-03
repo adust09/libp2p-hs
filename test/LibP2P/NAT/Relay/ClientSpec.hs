@@ -5,7 +5,8 @@ import Test.Hspec
 import qualified Data.ByteString as BS
 import Control.Concurrent.Async (withAsync)
 import Control.Concurrent.STM (newTQueueIO, atomically, writeTQueue, readTQueue, TQueue)
-import Data.Word (Word8)
+import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Word (Word8, Word64)
 import LibP2P.NAT.Relay.Message
 import LibP2P.NAT.Relay.Client
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
@@ -64,6 +65,34 @@ spec = do
             case hopReservation resp of
               Just rsv -> rsvExpire rsv `shouldBe` Just 1700000000
               Nothing -> expectationFailure "Expected reservation"
+          Left err -> expectationFailure $ "makeReservation failed: " ++ err
+
+    it "should interpret received expire as an absolute Unix timestamp" $ do
+      (clientStream, serverStream) <- mkStreamPair
+      now <- getPOSIXTime
+      -- Relay sends an absolute expiration one hour from now, per spec.
+      let absoluteExpire = floor now + 3600 :: Word64
+          serverAction = do
+            _ <- readHopMessage serverStream maxRelayMessageSize
+            writeHopMessage serverStream HopMessage
+              { hopType = Just HopStatus
+              , hopPeer = Nothing
+              , hopReservation = Just Reservation
+                  { rsvExpire = Just absoluteExpire
+                  , rsvAddrs = []
+                  , rsvVoucher = Nothing
+                  }
+              , hopLimit = Nothing
+              , hopStatus = Just RelayOK
+              }
+      withAsync serverAction $ \_ -> do
+        result <- makeReservation clientStream
+        case result of
+          Right resp -> case hopReservation resp >>= rsvExpire of
+            -- The client must not rebase or offset the value: it is
+            -- already a UTC Unix time in seconds.
+            Just expire -> expire `shouldBe` absoluteExpire
+            Nothing -> expectationFailure "Expected reservation with expire"
           Left err -> expectationFailure $ "makeReservation failed: " ++ err
 
     it "returns error when relay refuses reservation" $ do
