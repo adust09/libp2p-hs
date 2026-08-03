@@ -34,6 +34,7 @@ import LibP2P.Protocol.GossipSub.Handler
   , gossipSubProtocolId
   , handleGossipSubStream
   , newGossipSubNode
+  , sendCurrentSubscriptions
   , startGossipSub
   , stopGossipSub
   )
@@ -215,6 +216,25 @@ spec = do
           rpcSubscriptions rpc1 `shouldBe` [SubOpts True "topic1"]
           rpcSubscriptions rpc2 `shouldBe` [SubOpts True "topic2"]
         _ -> expectationFailure "failed to read both RPCs"
+
+  describe "sendCurrentSubscriptions" $ do
+    -- Issue #155: a topic joined while no peers were known must still be
+    -- announced to peers that connect afterwards (the "hello packet",
+    -- pubsub/README.md). Before the fix, subscriptions were derived from
+    -- mesh-map keys and a peerless join left no trace.
+    it "announces a topic joined with no known peers to a later-connecting peer" $ do
+      (sw, _pid) <- mkTestSwitch
+      node <- newGossipSubNode sw testParams
+      -- Join while the router knows no peers at all
+      gossipJoin node "early-topic"
+      -- A peer connects afterwards; its hello packet must carry the topic
+      (nodeStream, remoteReadStream) <- mkMemoryStreamPair
+      sendCurrentSubscriptions node nodeStream
+      result <- timeout 2000000 $ readRPCMessage remoteReadStream maxRPCSize
+      case result of
+        Just (Right rpc) ->
+          rpcSubscriptions rpc `shouldBe` [SubOpts True "early-topic"]
+        _ -> expectationFailure "expected a subscription announcement RPC"
 
   describe "startGossipSub" $ do
     it "registers handler and starts heartbeat" $ do

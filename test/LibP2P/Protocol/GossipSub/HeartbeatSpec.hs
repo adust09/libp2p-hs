@@ -148,6 +148,23 @@ spec = do
                 Nothing -> False) sent
         length pruneMsgs `shouldBe` 9  -- 15 - 6 = 9
 
+      -- Issue #155: a topic joined with zero known peers must still be
+      -- maintained; when peers appear later, the heartbeat fills its mesh.
+      it "fills the mesh for a subscribed topic that had no peers at join time" $ do
+        (router, logRef, _) <- mkHeartbeatRouter localPid fixedTime
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "t")
+        -- Peers discovered only after the join
+        mapM_ (\pid -> addSubscribedPeer router pid "t" fixedTime) (map mkPeerId [1..4])
+        heartbeatOnce router
+        mesh <- readTVarIO (gsMesh router)
+        Set.size (Map.findWithDefault Set.empty "t" mesh) `shouldSatisfy` (>= 1)
+        sent <- readIORef logRef
+        let graftMsgs = filter (\(_, rpc) ->
+              case rpcControl rpc of
+                Just ctrl -> not (null (ctrlGraft ctrl))
+                Nothing -> False) sent
+        length graftMsgs `shouldSatisfy` (>= 1)
+
     describe "Fanout maintenance" $ do
       it "expires old fanout entries" $ do
         (router, _, timeRef) <- mkHeartbeatRouter localPid fixedTime
@@ -222,6 +239,30 @@ spec = do
                 Just ctrl -> not (null (ctrlIHave ctrl))
                 Nothing -> False) sent
         length ihaveMsgs `shouldBe` 0
+
+      -- gossipsub-v1.0.md heartbeat: gossip is emitted "for each topic in
+      -- mesh+fanout"; fanout-only topics were previously skipped (#155).
+      it "emits IHAVE for fanout topics" $ do
+        (router, logRef, _) <- mkHeartbeatRouter localPid fixedTime
+        let pids = map mkPeerId [1..3]
+        mapM_ (\pid -> addSubscribedPeer router pid "ftopic" fixedTime) pids
+        -- Fanout entry: we publish to "ftopic" without subscribing
+        atomically $ do
+          modifyTVar' (gsFanout router) $
+            Map.insert "ftopic" (Set.singleton (mkPeerId 1))
+          modifyTVar' (gsFanoutPub router) $
+            Map.insert "ftopic" fixedTime
+        let mid = BS.pack [7]
+            msg = PubSubMessage (Just (BS.pack [1])) (BS.pack [1]) (Just mid) "ftopic" Nothing Nothing
+        atomically $ modifyTVar' (gsMessageCache router) $
+          cachePut mid msg
+        heartbeatOnce router
+        sent <- readIORef logRef
+        let ihaveMsgs = filter (\(_, rpc) ->
+              case rpcControl rpc of
+                Just ctrl -> any (\(IHave t _) -> t == "ftopic") (ctrlIHave ctrl)
+                Nothing -> False) sent
+        length ihaveMsgs `shouldSatisfy` (>= 1)
 
       it "rotates message cache after gossip" $ do
         (router, _, _) <- mkHeartbeatRouter localPid fixedTime

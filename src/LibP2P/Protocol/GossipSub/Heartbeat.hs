@@ -54,7 +54,12 @@ meshMaintenance :: GossipSubRouter -> IO ()
 meshMaintenance router = do
   now <- gsGetTime router
   meshMap <- readTVarIO (gsMesh router)
-  forM_ (Map.toList meshMap) $ \(topic, meshPeers) -> do
+  subs <- readTVarIO (gsSubscriptions router)
+  -- Maintain every subscribed topic, not just topics with a mesh entry:
+  -- a topic joined with no peers must be filled once peers appear (#155).
+  let topics = Set.union subs (Map.keysSet meshMap)
+  forM_ (Set.toList topics) $ \topic -> do
+    let meshPeers = Map.findWithDefault Set.empty topic meshMap
     -- Step 1: Remove negative-score peers
     remaining <- pruneNegativeScore router topic meshPeers now
     -- Step 2: Fill if undersubscribed (< D_lo)
@@ -180,12 +185,19 @@ fanoutMaintenance router = do
 emitGossip :: GossipSubRouter -> IO ()
 emitGossip router = do
   meshMap <- readTVarIO (gsMesh router)
+  fanoutMap <- readTVarIO (gsFanout router)
+  subs <- readTVarIO (gsSubscriptions router)
   cache <- readTVarIO (gsMessageCache router)
   peersMap <- readTVarIO (gsPeers router)
   let params = gsParams router
+      -- gossipsub-v1.0.md heartbeat: gossip covers "each topic in
+      -- mesh+fanout", so topics we publish to without subscribing
+      -- also emit IHAVE (#155).
+      topics = Set.unions
+        [ subs, Map.keysSet meshMap, Map.keysSet fanoutMap ]
 
-  -- For each topic in mesh, send IHAVE to non-mesh peers
-  forM_ (Map.keys meshMap) $ \topic -> do
+  -- For each topic in mesh+fanout, send IHAVE to non-mesh peers
+  forM_ (Set.toList topics) $ \topic -> do
     let gossipIds = cacheGetGossipIds topic cache
     unless (null gossipIds) $ do
       let meshPeers = Map.findWithDefault Set.empty topic meshMap
