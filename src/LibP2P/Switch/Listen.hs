@@ -30,6 +30,7 @@ import LibP2P.MultistreamSelect.Negotiation
   , StreamIO (..)
   , negotiateResponder
   )
+import LibP2P.Protocol.Identify (pushIdentify)
 import LibP2P.Switch.ConnPool (addConn)
 import LibP2P.Switch.Connection (closeConnection)
 import LibP2P.Switch.ResourceManager
@@ -174,6 +175,9 @@ switchListen sw gater addrs = do
       atomically $ do
         existing <- readTVar (swListeners sw)
         writeTVar (swListeners sw) (existing ++ newListeners)
+      -- Listen addresses changed: push updated identify info to
+      -- connected peers in the background (specs/identify push).
+      _ <- async (pushIdentify sw)
       pure (map alAddress newListeners)
   where
     -- Find a transport for the address, bind, and spawn accept loop
