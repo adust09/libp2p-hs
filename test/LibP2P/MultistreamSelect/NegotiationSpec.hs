@@ -1,21 +1,36 @@
 module LibP2P.MultistreamSelect.NegotiationSpec (spec) where
 
-import Control.Concurrent.Async (concurrently, race, withAsync)
+import Control.Concurrent.Async (concurrently, withAsync)
+import Control.Monad (replicateM)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import LibP2P.MultistreamSelect.Negotiation
 import LibP2P.MultistreamSelect.Wire
 import System.Timeout (timeout)
 import Test.Hspec
 
+-- | Read exactly n raw bytes from a StreamIO (test-side helper for
+-- inspecting the wire without going through the message decoder).
+readRawBytes :: StreamIO -> Int -> IO ByteString
+readRawBytes s n = BS.pack <$> replicateM n (streamReadByte s)
+
+-- | The exact wire encoding of the "/multistream/1.0.0" header:
+-- varint(19), the 18 ASCII bytes of the protocol id, trailing newline.
+-- Transcribed from the multistream-select spec, not computed — a typo in
+-- the header constant must not be able to satisfy this test.
+multistreamHeaderBytes :: ByteString
+multistreamHeaderBytes = BS.pack
+  [ 0x13
+  , 0x2f, 0x6d, 0x75, 0x6c, 0x74, 0x69, 0x73, 0x74, 0x72, 0x65
+  , 0x61, 0x6d, 0x2f, 0x31, 0x2e, 0x30, 0x2e, 0x30
+  , 0x0a
+  ]
+
 spec :: Spec
 spec = do
   describe "Wire encoding" $ do
-    it "encodes /multistream/1.0.0 correctly" $ do
-      -- "/multistream/1.0.0" = 18 chars + '\n' = 19 bytes payload
-      let encoded = encodeMessage "/multistream/1.0.0"
-      BS.head encoded `shouldBe` 0x13 -- varint(19)
-      BS.last encoded `shouldBe` 0x0a
-      BS.length encoded `shouldBe` 20 -- 1 (varint) + 18 (text) + 1 (\n)
+    it "encodes /multistream/1.0.0 to the exact spec bytes" $
+      encodeMessage "/multistream/1.0.0" `shouldBe` multistreamHeaderBytes
 
     it "encodes /noise correctly" $ do
       let encoded = encodeMessage "/noise"
@@ -73,6 +88,30 @@ spec = do
       withAsync (negotiateResponder streamB ["/bar"]) $ \_ -> do
         initResult <- negotiateInitiator streamA ["/foo"]
         initResult `shouldBe` NoProtocol
+
+  describe "Negotiation - differing protocol tables" $ do
+    it "negotiates the only shared protocol after multiple na rounds" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      (initResult, respResult) <-
+        concurrently
+          (negotiateInitiator streamA ["/tls/1.0.0", "/mplex/6.7.0", "/noise"])
+          (negotiateResponder streamB ["/yamux/1.0.0", "/noise"])
+      initResult `shouldBe` Accepted "/noise"
+      respResult `shouldBe` Accepted "/noise"
+
+    it "responder answers an unsupported proposal with the exact na bytes" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      -- Hand-rolled initiator: instead of pairing the responder with our
+      -- own initiator (which by construction agrees on every byte), speak
+      -- the protocol manually and compare the responder's raw wire output
+      -- against the bytes the spec mandates.
+      withAsync (negotiateResponder streamB ["/bar"]) $ \_ -> do
+        streamWrite streamA (encodeMessage multistreamHeader)
+        headerEcho <- readRawBytes streamA 20
+        headerEcho `shouldBe` multistreamHeaderBytes
+        streamWrite streamA (encodeMessage "/foo")
+        naBytes <- readRawBytes streamA 4
+        naBytes `shouldBe` BS.pack [0x03, 0x6e, 0x61, 0x0a]
 
   describe "Negotiation - yamux" $ do
     it "negotiates muxer protocol" $ do

@@ -155,6 +155,7 @@ test-suite libp2p-hs-test
     LibP2P.Protocol.Identify.IdentifySpec
     LibP2P.Protocol.Ping.PingSpec
     LibP2P.Noise.HandshakeSpec
+    LibP2P.Noise.ForeignPeerSpec
     LibP2P.DHT.DistanceSpec
     LibP2P.DHT.RoutingTableSpec
     LibP2P.DHT.MessageSpec

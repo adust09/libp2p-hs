@@ -52,6 +52,20 @@ spec = do
           remaining `shouldBe` BS.empty
         Left err -> expectationFailure err
 
+    it "boundary table: every size up to 65535 round-trips, everything above is rejected" $ do
+      let accepted = [0, 1, 65534, maxNoiseMessageSize]
+          rejected = [maxNoiseMessageSize + 1, 70000]
+      mapM_
+        (\n -> case encodeFrame (BS.replicate n 0x42) >>= decodeFrame of
+            Right (decoded, remaining) -> do
+              BS.length decoded `shouldBe` n
+              remaining `shouldBe` BS.empty
+            Left err -> expectationFailure $ "size " <> show n <> ": " <> err)
+        accepted
+      mapM_
+        (\n -> encodeFrame (BS.replicate n 0x42) `shouldSatisfy` isLeft)
+        rejected
+
   describe "chunkPlaintext" $ do
     it "keeps a small plaintext as a single chunk" $
       chunkPlaintext (BS.replicate 100 0x01) `shouldBe` [BS.replicate 100 0x01]
@@ -100,6 +114,22 @@ spec = do
       let noiseStaticPK = BS.replicate 32 0xAA
       case signStaticKey (kpPrivate kp1) noiseStaticPK of
         Right sig -> verifyStaticKey (kpPublic kp2) noiseStaticPK sig `shouldBe` False
+        Left err -> expectationFailure err
+
+    it "identity_sig covers the literal domain-separation prefix bytes" $ do
+      -- The prefix is built here from a string literal on purpose: this
+      -- pins the constant in Handshake.hs to the bytes the Noise spec
+      -- mandates, independently of the constant itself. A typo in the
+      -- prefix would keep every self-paired test green while silently
+      -- breaking interop with go-libp2p/rust-libp2p.
+      Right kp <- generateKeyPair
+      let noiseStaticPK = BS.replicate 32 0xAA
+          literalMsg = "noise-libp2p-static-key:" <> noiseStaticPK
+      case signStaticKey (kpPrivate kp) noiseStaticPK of
+        Right sig -> verify (kpPublic kp) literalMsg sig `shouldBe` True
+        Left err -> expectationFailure err
+      case sign (kpPrivate kp) literalMsg of
+        Right sig -> verifyStaticKey (kpPublic kp) noiseStaticPK sig `shouldBe` True
         Left err -> expectationFailure err
 
   describe "NoisePayload protobuf" $ do
@@ -247,26 +277,11 @@ spec = do
           verifyStaticKey remotePubKey remoteNoisePub (npIdentitySig remoteNP)
             `shouldBe` True
 
-    it "performFullHandshake rejects replayed identity payload (MitM)" $ do
-      -- Eve intercepts and runs her own Noise session with Alice,
-      -- but replays Bob's identity payload. performFullHandshake should
-      -- now detect this because it verifies identity_sig binding.
-      Right aliceIdentity <- generateKeyPair
-      Right bobIdentity <- generateKeyPair
-
-      -- We need a scenario where the identity payload doesn't match the Noise key.
-      -- The simplest test: performFullHandshake with legitimate keys still works,
-      -- then we test that the convenience API matches Upgrade.hs behavior.
-      -- Since we can't easily inject a replayed payload into performFullHandshake
-      -- (it builds payloads internally), we verify the negative case via
-      -- performFullHandshakeWithSessions: it should successfully complete
-      -- with legitimate keys (signature verification passes).
-      result <- performFullHandshake aliceIdentity bobIdentity
-      case result of
-        Left err -> expectationFailure $ "legitimate handshake should succeed: " ++ err
-        Right (aliceSeesBob, bobSeesAlice) -> do
-          aliceSeesBob `shouldBe` fromPublicKey (kpPublic bobIdentity)
-          bobSeesAlice `shouldBe` fromPublicKey (kpPublic aliceIdentity)
+    -- NOTE: performFullHandshake builds both payloads internally, so a
+    -- replayed payload cannot be injected through it. The production-path
+    -- rejection of a replayed/forged identity payload is covered in
+    -- LibP2P.Noise.ForeignPeerSpec, which drives one endpoint by hand
+    -- against performStreamHandshake.
 
     it "post-handshake encrypted transport works" $ do
       Right aliceIdentity <- generateKeyPair
@@ -287,6 +302,34 @@ spec = do
           (ciphertext2, _bobSession'') <- either fail pure $ encryptMessage bobSession' reply
           (decrypted2, _aliceSession'') <- either fail pure $ decryptMessage aliceSession' ciphertext2
           decrypted2 `shouldBe` reply
+
+    it "a 65519-byte plaintext fills exactly one maximum-size Noise message" $ do
+      Right aliceIdentity <- generateKeyPair
+      Right bobIdentity <- generateKeyPair
+
+      result <- performFullHandshakeWithSessions aliceIdentity bobIdentity
+      case result of
+        Left err -> expectationFailure err
+        Right (aliceSession, _bobSession) -> do
+          -- 65519 bytes of plaintext + 16-byte AEAD tag = 65535-byte
+          -- ciphertext, the largest Noise message the 2-byte length
+          -- prefix can declare. This is the true chunking boundary.
+          let atLimit = BS.replicate maxNoisePlaintextSize 0x01
+          (ct, aliceSession') <- either fail pure $ encryptMessage aliceSession atLimit
+          BS.length ct `shouldBe` maxNoiseMessageSize
+          case encodeFrame ct of
+            Right framed -> BS.take 2 framed `shouldBe` BS.pack [0xFF, 0xFF]
+            Left err -> expectationFailure err
+          -- One byte more can never reach the wire as a single frame:
+          -- either the cipher refuses the oversized message, or the
+          -- 65536-byte ciphertext is rejected by encodeFrame. Callers
+          -- must chunk first (see chunkPlaintext / encryptAndWrite).
+          let overLimit = BS.replicate (maxNoisePlaintextSize + 1) 0x01
+          case encryptMessage aliceSession' overLimit of
+            Left _ -> pure ()
+            Right (ct2, _) -> do
+              BS.length ct2 `shouldBe` maxNoiseMessageSize + 1
+              encodeFrame ct2 `shouldSatisfy` isLeft
 
     it "post-handshake messages are order-dependent (nonce)" $ do
       Right aliceIdentity <- generateKeyPair
