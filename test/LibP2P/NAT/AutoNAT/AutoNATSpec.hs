@@ -327,6 +327,72 @@ spec = do
       dialed <- readIORef dialedRef
       dialed `shouldBe` []
 
+    it "passes the authenticated peer id to the dial-back, not a value from the message body" $ do
+      dialedPidsRef <- newIORef ([] :: [PeerId])
+      (clientStream, serverStream) <- mkStreamPair
+      let config = AutoNATConfig
+            { natThreshold = 3
+            , natDialBack = \pid _addrs -> do
+                modifyIORef' dialedPidsRef (pid :)
+                pure (Right ())
+            }
+          dialMsg = mkDialMsg remotePeerId [publicAddr]
+      writeAutoNATMessage clientStream dialMsg
+      handleAutoNAT config serverStream remotePeerId remoteObservedAddr
+      _ <- readAutoNATMessage clientStream maxAutoNATMessageSize
+      dialedPids <- readIORef dialedPidsRef
+      -- The dial-back target identity must be the peer authenticated on the
+      -- connection (which, after the mismatch check, is the only value that
+      -- can reach this point).
+      dialedPids `shouldBe` [remotePeerId]
+
+    it "includes the successfully dialled address in the OK response" $ do
+      (clientStream, serverStream) <- mkStreamPair
+      let config = AutoNATConfig
+            { natThreshold = 3
+            , natDialBack = \_pid _addrs -> pure (Right ())
+            }
+          -- privateAddr fails the observed-IP filter; publicAddr passes
+          dialMsg = mkDialMsg remotePeerId [privateAddr, publicAddr]
+      writeAutoNATMessage clientStream dialMsg
+      handleAutoNAT config serverStream remotePeerId remoteObservedAddr
+      result <- readAutoNATMessage clientStream maxAutoNATMessageSize
+      case result of
+        Right resp ->
+          case anMsgDialResponse resp of
+            Just dr -> do
+              anRespStatus dr `shouldBe` Just StatusOK
+              -- Spec (autonat): on success the response SHOULD carry the
+              -- address that was successfully dialled.
+              anRespAddr dr `shouldBe` Just (toBytes publicAddr)
+            Nothing -> expectationFailure "Expected DialResponse"
+        Left err -> expectationFailure $ "Read failed: " ++ err
+
+    it "rejects a relayed observed address with a trailing p2p-circuit component" $ do
+      dialedRef <- newIORef ([] :: [[Multiaddr]])
+      (clientStream, serverStream) <- mkStreamPair
+      let config = AutoNATConfig
+            { natThreshold = 3
+            , natDialBack = \_pid addrs -> do
+                modifyIORef' dialedRef (addrs :)
+                pure (Right ())
+            }
+          -- P2PCircuit in the last position (the existing relayed-address
+          -- test places it mid-list)
+          trailingRelayed = Multiaddr [IP4 0xCB007101, TCP 4001, P2P (BS.pack [1,2,3]), P2PCircuit]
+          dialMsg = mkDialMsg remotePeerId [publicAddr]
+      writeAutoNATMessage clientStream dialMsg
+      handleAutoNAT config serverStream remotePeerId trailingRelayed
+      result <- readAutoNATMessage clientStream maxAutoNATMessageSize
+      case result of
+        Right resp ->
+          case anMsgDialResponse resp of
+            Just dr -> anRespStatus dr `shouldBe` Just EDialRefused
+            Nothing -> expectationFailure "Expected DialResponse"
+        Left err -> expectationFailure $ "Read failed: " ++ err
+      dialed <- readIORef dialedRef
+      dialed `shouldBe` []
+
     it "caps the number of dial-back addresses per request" $ do
       dialedRef <- newIORef ([] :: [[Multiaddr]])
       (clientStream, serverStream) <- mkStreamPair

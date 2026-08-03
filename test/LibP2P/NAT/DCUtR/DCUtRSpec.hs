@@ -10,9 +10,10 @@ import Control.Concurrent.STM
   , newTVarIO, readTVarIO, readTVar, writeTVar, modifyTVar', registerDelay, retry
   )
 import Control.Monad (when)
-import Data.IORef (newIORef, readIORef, modifyIORef', atomicModifyIORef')
+import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import Data.Word (Word8)
+import LibP2P.Core.Varint (encodeUvarint)
 import LibP2P.NAT.DCUtR.Message
 import LibP2P.NAT.DCUtR
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
@@ -42,6 +43,11 @@ addrA = Multiaddr [IP4 0xCB007105, TCP 4001]  -- /ip4/203.0.113.5/tcp/4001
 
 addrB :: Multiaddr
 addrB = Multiaddr [IP4 0xCB007106, TCP 4002]  -- /ip4/203.0.113.6/tcp/4002
+
+-- | True for DCUtRFailed results.
+isFailed :: DCUtRResult -> Bool
+isFailed (DCUtRFailed _) = True
+isFailed DCUtRSuccess    = False
 
 spec :: Spec
 spec = do
@@ -95,15 +101,17 @@ spec = do
             DCUtRSuccess -> pure ()
             DCUtRFailed err -> expectationFailure $ "Handler failed: " ++ err
 
-    it "handles dial failure gracefully" $ do
+    it "returns DCUtRFailed on both sides when every dial fails" $ do
       (streamA, streamB) <- mkStreamPair
+      aDials <- newIORef (0 :: Int)
+      bDials <- newIORef (0 :: Int)
       let configA = DCUtRConfig
             { dcMaxAttempts = 1
-            , dcDialer = \_ -> pure (Left "dial failed")
+            , dcDialer = \_ -> modifyIORef' aDials (+ 1) >> pure (Left "dial failed")
             }
           configB = DCUtRConfig
             { dcMaxAttempts = 1
-            , dcDialer = \_ -> pure (Left "dial failed")
+            , dcDialer = \_ -> modifyIORef' bDials (+ 1) >> pure (Left "dial failed")
             }
           addrsA = [addrA]
           addrsB = [addrB]
@@ -111,13 +119,57 @@ spec = do
         withAsync (handleDCUtR configA streamA addrsA) $ \handlerAsync -> do
           resultB <- wait initiatorAsync
           resultA <- wait handlerAsync
-          -- Should report failure when dial fails
-          case resultB of
-            DCUtRFailed _ -> pure ()
-            DCUtRSuccess -> pure ()  -- may still report success from message exchange
-          case resultA of
-            DCUtRFailed _ -> pure ()
-            DCUtRSuccess -> pure ()
+          -- The message exchange succeeding must NOT be reported as a
+          -- successful hole punch: both sides dialled and both dials failed.
+          resultB `shouldSatisfy` isFailed
+          resultA `shouldSatisfy` isFailed
+          readIORef aDials >>= (`shouldBe` 1)
+          readIORef bDials >>= (`shouldBe` 1)
+
+    it "handler fails when SYNC arrives in place of the initial CONNECT" $ do
+      (peerStream, handlerStream) <- mkStreamPair
+      dials <- newIORef (0 :: Int)
+      let config = DCUtRConfig
+            { dcMaxAttempts = 3
+            , dcDialer = \_ -> modifyIORef' dials (+ 1) >> pure (Right ())
+            }
+      -- Spec: the exchange must begin with CONNECT
+      writeHolePunchMessage peerStream (HolePunchMessage { hpType = HPSync, hpObsAddrs = [] })
+      result <- handleDCUtR config handlerStream [addrA]
+      result `shouldSatisfy` isFailed
+      -- A protocol violation must abort without any hole punch attempt
+      readIORef dials >>= (`shouldBe` 0)
+
+    it "handler fails when a second CONNECT arrives in place of SYNC" $ do
+      (peerStream, handlerStream) <- mkStreamPair
+      dials <- newIORef (0 :: Int)
+      let config = DCUtRConfig
+            { dcMaxAttempts = 3
+            , dcDialer = \_ -> modifyIORef' dials (+ 1) >> pure (Right ())
+            }
+          badPeer = do
+            writeHolePunchMessage peerStream
+              (HolePunchMessage { hpType = HPConnect, hpObsAddrs = [toBytes addrB] })
+            _ <- readHolePunchMessage peerStream maxDCUtRMessageSize
+            writeHolePunchMessage peerStream
+              (HolePunchMessage { hpType = HPConnect, hpObsAddrs = [toBytes addrB] })
+      withAsync badPeer $ \_ -> do
+        result <- handleDCUtR config handlerStream [addrA]
+        result `shouldSatisfy` isFailed
+        readIORef dials >>= (`shouldBe` 0)
+
+    it "handler refuses a framed message larger than 4 KiB read from the stream" $ do
+      (peerStream, handlerStream) <- mkStreamPair
+      dials <- newIORef (0 :: Int)
+      let config = DCUtRConfig
+            { dcMaxAttempts = 3
+            , dcDialer = \_ -> modifyIORef' dials (+ 1) >> pure (Right ())
+            }
+      -- Length prefix claiming a 5000-byte message: past the 4 KiB cap
+      streamWrite peerStream (encodeUvarint 5000)
+      result <- handleDCUtR config handlerStream [addrA]
+      result `shouldSatisfy` isFailed
+      readIORef dials >>= (`shouldBe` 0)
 
   describe "DCUtR RTT measurement" $ do
     it "measures non-negative RTT" $ do
@@ -295,6 +347,48 @@ spec = do
           case mRTT of
             Just rtt -> rtt `shouldSatisfy` (>= 0.1)
             Nothing -> expectationFailure "RTT not measured"
+
+  describe "DCUtR hole punch timing" $ do
+    it "initiator waits approximately RTT/2 after SYNC before dialling" $ do
+      (peerStream, initiatorStream) <- mkStreamPair
+      syncSentAt <- newIORef Nothing
+      dialledAt <- newIORef Nothing
+      writeCount <- newIORef (0 :: Int)
+      -- Record when the initiator's second write (the SYNC) happens
+      let timedStream = initiatorStream
+            { streamWrite = \bs -> do
+                n <- atomicModifyIORef' writeCount (\c -> (c + 1, c + 1))
+                when (n == 2) (getCurrentTime >>= writeIORef syncSentAt . Just)
+                streamWrite initiatorStream bs
+            }
+          config = DCUtRConfig
+            { dcMaxAttempts = 1
+            , dcDialer = \_ -> do
+                getCurrentTime >>= writeIORef dialledAt . Just
+                pure (Right ())
+            }
+          -- Manual peer: delay the CONNECT answer by 200 ms so the measured
+          -- RTT is approximately 200 ms
+          slowPeer = do
+            _ <- readHolePunchMessage peerStream maxDCUtRMessageSize
+            threadDelay 200000
+            writeHolePunchMessage peerStream
+              (HolePunchMessage { hpType = HPConnect, hpObsAddrs = [toBytes addrA] })
+            _ <- readHolePunchMessage peerStream maxDCUtRMessageSize  -- SYNC
+            pure ()
+      withAsync slowPeer $ \_ -> do
+        result <- initiateDCUtR config timedStream [addrB]
+        result `shouldBe` DCUtRSuccess
+        mSync <- readIORef syncSentAt
+        mDial <- readIORef dialledAt
+        case (,) <$> mSync <*> mDial of
+          Just (tSync, tDial) -> do
+            -- Spec: the initiator waits RTT/2 (≈ 100 ms here) between SYNC
+            -- and dialling. Allow generous scheduler slack in both
+            -- directions, but a missing wait (≈ 0 ms) must fail.
+            diffUTCTime tDial tSync `shouldSatisfy` (>= 0.06)
+            diffUTCTime tDial tSync `shouldSatisfy` (<= 1)
+          Nothing -> expectationFailure "SYNC or dial time not recorded"
 
   describe "DCUtR constants" $ do
     it "max message size is 4096 bytes" $ do
