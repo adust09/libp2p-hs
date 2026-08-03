@@ -162,6 +162,12 @@ spec = do
             idListenAddrs info `shouldSatisfy` (not . null)
 
   describe "Multi-protocol" $ do
+    -- WARNING(#163): this test certifies behaviour the spec forbids.
+    -- specs/ping/ping.md: "The dialing peer MUST NOT keep more than one
+    -- outbound stream for the ping protocol per peer." It passes only
+    -- because sendPing opens a new stream per call. When #163 is fixed
+    -- (stream reuse + close), this test must be inverted — assert a
+    -- single outbound stream across both pings — not extended.
     it "multiple Ping requests on different streams over same connection" $ do
       withConnectedPair $ \_nodeA _nodeB conn -> do
         -- Send two Pings on separate streams over the same muxed connection

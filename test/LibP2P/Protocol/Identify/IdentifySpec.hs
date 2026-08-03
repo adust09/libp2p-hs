@@ -17,6 +17,7 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException, catch, throwIO)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.List (sort)
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (kpPublic)
@@ -127,12 +128,17 @@ spec = do
       idProtocolVersion info `shouldBe` Just "ipfs/0.1.0"
       idAgentVersion info `shouldBe` Just "libp2p-hs/0.1.0"
 
-    it "buildLocalIdentify includes registered protocols" $ do
+    it "buildLocalIdentify advertises exactly the registered protocol set" $ do
       sw <- mkTestSwitch
       info <- buildLocalIdentify sw Nothing
-      let protos = idProtocols info
-      protos `shouldSatisfy` (\ps -> "/test/1.0.0" `elem` ps)
-      protos `shouldSatisfy` (\ps -> "/test/2.0.0" `elem` ps)
+      -- Set equality, not membership: over-advertising protocols we do
+      -- not actually handle must fail this test too.
+      sort (idProtocols info) `shouldBe` ["/test/1.0.0", "/test/2.0.0"]
+
+    it "buildLocalIdentify omits observedAddr without a connection context" $ do
+      sw <- mkTestSwitch
+      info <- buildLocalIdentify sw Nothing
+      idObservedAddr info `shouldBe` Nothing
 
     it "buildLocalIdentify includes public key" $ do
       sw <- mkTestSwitch
@@ -277,6 +283,18 @@ spec = do
       streamWrite streamA (encodeFramedIdentify testInfo)
       result <- readFramedIdentify streamB maxIdentifySize
       result `shouldBe` Right testInfo
+
+    it "readFramedIdentify rejects a truncated frame" $ do
+      (streamA, streamB) <- mkClosableStreamPair
+      -- The length prefix promises 100 bytes but only 40 arrive before
+      -- EOF: the reader must return Left, never a partial Right.
+      streamWrite streamA (encodeUvarint 100 <> BS.replicate 40 0x08)
+      streamClose streamA
+      result <- readFramedIdentify streamB maxIdentifySize
+      case result of
+        Left err -> err `shouldSatisfy` (not . null)
+        Right info -> expectationFailure $
+          "expected truncated frame to be rejected, got: " ++ show info
 
     it "readFramedIdentify rejects an oversized length prefix" $ do
       (streamA, streamB) <- mkClosableStreamPair

@@ -58,14 +58,44 @@ spec = do
         Right result -> idProtocols result `shouldBe` ["/noise", "/yamux/1.0.0", "/ipfs/id/1.0.0"]
         Left err -> expectationFailure $ "Decode failed: " ++ show err
 
-    it "decode rejects oversized message" $ do
-      -- Create a message larger than maxIdentifySize
-      let bigPubKey = BS.replicate (maxIdentifySize + 100) 0x42
-          info = IdentifyInfo Nothing Nothing (Just bigPubKey) [] Nothing []
-          encoded = encodeIdentify info
-      -- The encoded message should be parseable (proto3-wire doesn't enforce size)
-      -- Size check is done at read time by readFramedIdentify, not at decode time
-      BS.length encoded `shouldSatisfy` (> maxIdentifySize)
+    it "encodes each field with the spec's field number and wire type" $ do
+      -- specs/identify/README.md protobuf: publicKey = 1, listenAddrs = 2,
+      -- protocols = 3, observedAddr = 4, protocolVersion = 5,
+      -- agentVersion = 6 — all length-delimited (wire type 2), so the
+      -- first tag byte of a single-field message is (field << 3) | 2.
+      let empty = IdentifyInfo Nothing Nothing Nothing [] Nothing []
+          firstByte info = BS.head (encodeIdentify info)
+      firstByte empty { idPublicKey = Just (BS.pack [1]) }   `shouldBe` 0x0a
+      firstByte empty { idListenAddrs = [BS.pack [1]] }      `shouldBe` 0x12
+      firstByte empty { idProtocols = ["/x/1.0.0"] }         `shouldBe` 0x1a
+      firstByte empty { idObservedAddr = Just (BS.pack [1]) } `shouldBe` 0x22
+      firstByte empty { idProtocolVersion = Just "v" }       `shouldBe` 0x2a
+      firstByte empty { idAgentVersion = Just "v" }          `shouldBe` 0x32
+
+    it "decodes a go-libp2p-shaped message (hand-written golden vector)" $ do
+      -- Hand-constructed per the spec protobuf, deliberately NOT produced
+      -- by encodeIdentify, so encoder and decoder cannot agree on a
+      -- convention that is internally consistent but externally wrong.
+      let golden = BS.concat
+            [ -- listenAddrs = 2 (bytes): /ip4/127.0.0.1/tcp/4001
+              BS.pack [0x12, 0x08, 0x04, 0x7f, 0x00, 0x00, 0x01, 0x06, 0x0f, 0xa1]
+              -- protocols = 3 (string): "/ipfs/id/1.0.0"
+            , BS.pack [0x1a, 0x0e], "/ipfs/id/1.0.0"
+              -- protocols = 3 (string): "/ipfs/ping/1.0.0"
+            , BS.pack [0x1a, 0x10], "/ipfs/ping/1.0.0"
+              -- protocolVersion = 5 (string): "ipfs/0.1.0"
+            , BS.pack [0x2a, 0x0a], "ipfs/0.1.0"
+              -- agentVersion = 6 (string): "go-libp2p/0.36.4"
+            , BS.pack [0x32, 0x10], "go-libp2p/0.36.4"
+            ]
+      case decodeIdentify golden of
+        Left err -> expectationFailure $ "Decode failed: " ++ show err
+        Right info -> do
+          idAgentVersion info `shouldBe` Just "go-libp2p/0.36.4"
+          idProtocolVersion info `shouldBe` Just "ipfs/0.1.0"
+          idListenAddrs info `shouldBe`
+            [BS.pack [0x04, 0x7f, 0x00, 0x00, 0x01, 0x06, 0x0f, 0xa1]]
+          idProtocols info `shouldBe` ["/ipfs/id/1.0.0", "/ipfs/ping/1.0.0"]
 
     it "decode skips unknown fields" $ do
       -- Encode known fields, then append unknown field bytes
