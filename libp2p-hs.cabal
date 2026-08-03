@@ -185,6 +185,8 @@ test-suite libp2p-hs-test
     LibP2P.Protocol.GossipSub.HeartbeatSpec
     LibP2P.Protocol.GossipSub.HandlerSpec
     LibP2P.IntegrationSpec
+    LibP2P.FaultInjectionSpec
+    LibP2P.WireConformanceSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
