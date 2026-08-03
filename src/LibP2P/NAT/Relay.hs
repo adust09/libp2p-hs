@@ -32,6 +32,7 @@ import Control.Concurrent.Async (race)
 import Control.Concurrent.STM
 import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
 import qualified Data.Map.Strict as Map
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32, Word64)
 import LibP2P.NAT.Relay.Message
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
@@ -60,7 +61,7 @@ defaultRelayConfig = RelayConfig
 -- | An active reservation for a peer.
 data ActiveReservation = ActiveReservation
   { arPeerId     :: !PeerId
-  , arExpiration :: !Word64   -- ^ Unix timestamp
+  , arExpiration :: !Word64   -- ^ Absolute expiration time (UTC Unix time, seconds)
   } deriving (Show, Eq)
 
 -- | Mutable relay server state.
@@ -85,8 +86,10 @@ handleReserve state stream peerId = do
   if Map.size reservations >= limit
     then sendHopStatus stream ResourceLimitExceeded
     else do
-      -- Create reservation
-      let expiration = rcReservationDuration (rsConfig state)
+      -- Create reservation. Per circuit-v2 spec, Reservation.expire is an
+      -- absolute UTC Unix time in seconds, not a duration.
+      now <- getPOSIXTime
+      let expiration = floor now + rcReservationDuration (rsConfig state)
           reservation = ActiveReservation
             { arPeerId = peerId
             , arExpiration = expiration

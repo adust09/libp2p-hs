@@ -6,7 +6,9 @@ import qualified Data.ByteString as BS
 import Control.Concurrent.Async (withAsync, race)
 import Control.Concurrent.STM
 import Control.Concurrent (threadDelay)
-import Data.Word (Word8)
+import qualified Data.Map.Strict as Map
+import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Word (Word8, Word64)
 import Data.IORef (newIORef, readIORef, modifyIORef')
 import LibP2P.NAT.Relay.Message
 import LibP2P.NAT.Relay
@@ -62,6 +64,38 @@ spec = do
             Just rsv -> rsvExpire rsv `shouldSatisfy` (/= Nothing)
             Nothing -> expectationFailure "Expected reservation in response"
         Left err -> expectationFailure $ "Read failed: " ++ err
+
+    it "should encode expire as an absolute Unix timestamp when reservation is accepted" $ do
+      relayState <- newRelayState defaultRelayConfig
+      (clientStream, serverStream) <- mkStreamPair
+      writeHopMessage clientStream HopMessage
+        { hopType = Just HopReserve
+        , hopPeer = Nothing
+        , hopReservation = Nothing
+        , hopLimit = Nothing
+        , hopStatus = Nothing
+        }
+      now <- getPOSIXTime
+      handleReserve relayState serverStream testPeerId
+      result <- readHopMessage clientStream maxRelayMessageSize
+      let nowSecs = floor now :: Word64
+          duration = rcReservationDuration defaultRelayConfig
+      case result of
+        Right resp -> case hopReservation resp >>= rsvExpire of
+          Just expire -> do
+            -- Spec (circuit-v2.md): expire is a UTC Unix time in seconds,
+            -- not a duration. It must lie in [now, now + duration + slack].
+            expire `shouldSatisfy` (>= nowSecs)
+            expire `shouldSatisfy` (<= nowSecs + duration + 5)
+          Nothing -> expectationFailure "Expected reservation with expire in response"
+        Left err -> expectationFailure $ "Read failed: " ++ err
+      -- Internal state must carry the same absolute expiration
+      reservations <- readTVarIO (rsReservations relayState)
+      case Map.lookup testPeerId reservations of
+        Just ar -> do
+          arExpiration ar `shouldSatisfy` (>= nowSecs)
+          arExpiration ar `shouldSatisfy` (<= nowSecs + duration + 5)
+        Nothing -> expectationFailure "Expected stored reservation for peer"
 
     it "rejects reservation when max reservations exceeded" $ do
       let config = defaultRelayConfig { rcMaxReservations = 0 }
