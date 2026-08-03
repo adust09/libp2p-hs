@@ -137,8 +137,8 @@ spec = do
       sw <- newSwitch pidB kpB
       -- Register a handler that signals when called via MVar
       handlerDone <- newEmptyMVar
-      setStreamHandler sw "/test/1.0.0" $ \_stream peerId ->
-        putMVar handlerDone peerId
+      setStreamHandler sw "/test/1.0.0" $ \conn _stream ->
+        putMVar handlerDone (connPeerId conn)
       -- Set up upgraded connections (dialer=outbound, listener=inbound)
       (streamA, streamB) <- mkMemoryStreamPair
       let rawConnA = mkMockRawConn streamA localAddr remoteAddr
@@ -158,6 +158,34 @@ spec = do
       case result of
         Nothing -> expectationFailure "timeout: stream not dispatched to handler"
         Just receivedPeerId -> receivedPeerId `shouldBe` pidA
+      muxClose (connSession connDialer)
+      muxClose (connSession connListener)
+
+    it "passes the Connection so the handler can see the remote address" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (pidB, kpB) <- mkTestIdentity
+      sw <- newSwitch pidB kpB
+      -- Register a handler that reports the connection's remote multiaddr
+      handlerDone <- newEmptyMVar
+      setStreamHandler sw "/test/1.0.0" $ \conn _stream ->
+        putMVar handlerDone (connRemoteAddr conn)
+      -- Set up upgraded connections (dialer=outbound, listener=inbound)
+      (streamA, streamB) <- mkMemoryStreamPair
+      let rawConnA = mkMockRawConn streamA localAddr remoteAddr
+          rawConnB = mkMockRawConn streamB remoteAddr localAddr
+      (connDialer, connListener) <- concurrently
+        (upgradeOutbound kpA rawConnA)
+        (upgradeInbound kpB rawConnB)
+      _loopThread <- async $ streamAcceptLoop sw connListener
+      result <- timeout 5000000 $ do
+        dialerStream <- muxOpenStream (connSession connDialer)
+        negResult <- negotiateInitiator dialerStream ["/test/1.0.0"]
+        case negResult of
+          Accepted _ -> takeMVar handlerDone
+          _          -> fail "protocol negotiation failed"
+      case result of
+        Nothing -> expectationFailure "timeout: stream not dispatched to handler"
+        Just seenAddr -> seenAddr `shouldBe` connRemoteAddr connListener
       muxClose (connSession connDialer)
       muxClose (connSession connListener)
 

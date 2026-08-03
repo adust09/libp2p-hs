@@ -41,7 +41,7 @@ import LibP2P.DHT.Types
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import LibP2P.Switch (setStreamHandler)
-import LibP2P.Switch.Types (Switch (..))
+import LibP2P.Switch.Types (Connection (..), Switch (..))
 
 -- | DHT protocol identifier for multistream-select.
 dhtProtocolId :: Text
@@ -98,7 +98,8 @@ newDHTNode sw mode = do
 -- | Register the DHT handler on the Switch (server mode only).
 registerDHTHandler :: DHTNode -> IO ()
 registerDHTHandler node =
-  setStreamHandler (dhtSwitch node) dhtProtocolId (\stream pid -> handleDHTRequest node stream pid)
+  setStreamHandler (dhtSwitch node) dhtProtocolId
+    (\conn stream -> handleDHTRequest node stream (connPeerId conn))
 
 -- | Handle an inbound DHT RPC request.
 handleDHTRequest :: DHTNode -> StreamIO -> PeerId -> IO ()

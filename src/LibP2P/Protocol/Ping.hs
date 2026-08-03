@@ -104,7 +104,8 @@ sendPing conn = do
 registerPingHandler :: Switch -> IO ()
 registerPingHandler sw = atomically $ do
   protos <- readTVar (swProtocols sw)
-  writeTVar (swProtocols sw) (Map.insert pingProtocolId handlePing protos)
+  let handler conn stream = handlePing stream (connPeerId conn)
+  writeTVar (swProtocols sw) (Map.insert pingProtocolId handler protos)
 
 -- | Read exactly n bytes from a StreamIO.
 readExact :: StreamIO -> Int -> IO ByteString

@@ -190,7 +190,7 @@ startGossipSub :: GossipSubNode -> IO ()
 startGossipSub node = do
   -- Register inbound stream handler on Switch
   setStreamHandler (gsnSwitch node) gossipSubProtocolId
-    (handleGossipSubStream node)
+    (\conn stream -> handleGossipSubStream node stream (connPeerId conn))
   -- Register connection notifier to auto-open GossipSub streams to new peers
   atomically $ modifyTVar' (swNotifiers (gsnSwitch node))
     (onNewConnection node :)
