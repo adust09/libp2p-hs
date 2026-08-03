@@ -1,5 +1,6 @@
 module LibP2P.Core.VarintSpec (spec) where
 
+import Control.Exception (evaluate)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word64)
@@ -28,9 +29,14 @@ spec = do
     it "encodes 421 as 0xa5 0x03 (p2p protocol code)" $
       encodeUvarint 421 `shouldBe` BS.pack [0xa5, 0x03]
 
-    it "encodes maxBound (2^64-1)" $
-      -- 2^64-1 requires 10 bytes in LEB128
-      BS.length (encodeUvarint maxBound) `shouldBe` 10
+    -- multiformats unsigned-varint spec: max 9 bytes / 63 bits.
+    -- 2^63-1 is the largest encodable value and takes exactly 9 bytes.
+    it "encodes 2^63-1 (spec maximum) as 9 bytes" $
+      encodeUvarint (2 ^ (63 :: Int) - 1)
+        `shouldBe` BS.pack (replicate 8 0xff ++ [0x7f])
+
+    it "rejects values >= 2^63 (would need a 10-byte encoding)" $
+      evaluate (encodeUvarint maxBound) `shouldThrow` anyErrorCall
 
   describe "decodeUvarint" $ do
     it "decodes 0x00 as 0" $
@@ -58,14 +64,35 @@ spec = do
     it "fails on unterminated varint (all continuation bits)" $
       decodeUvarint (BS.pack [0x80, 0x80]) `shouldSatisfy` isLeft
 
-    it "fails on overlong varint (>10 bytes)" $
-      let overlong = BS.pack (replicate 11 0x80)
-       in decodeUvarint overlong `shouldSatisfy` isLeft
+    -- multiformats unsigned-varint spec: "Implementations MUST restrict
+    -- the size of the varint to a max of 9 bytes (63 bits)."
+    it "fails on 10-byte varint (spec max is 9 bytes / 63 bits)" $
+      let tenBytes = BS.pack (replicate 9 0x80 ++ [0x01])
+       in decodeUvarint tenBytes `shouldSatisfy` isLeft
+
+    it "accepts a 9-byte varint at the 63-bit maximum" $
+      decodeUvarint (BS.pack (replicate 8 0xff ++ [0x7f]))
+        `shouldBe` Right (2 ^ (63 :: Int) - 1, BS.empty)
+
+    -- multiformats unsigned-varint spec: "Leading zeros must be trimmed
+    -- when encoding and must be rejected when decoding." The only number
+    -- that can end in a 0x00 byte is 0.
+    it "rejects non-minimal encoding 0x81 0x00 (padded 1)" $
+      decodeUvarint (BS.pack [0x81, 0x00]) `shouldSatisfy` isLeft
+
+    it "rejects non-minimal encoding 0x80 0x00 (padded 0)" $
+      decodeUvarint (BS.pack [0x80, 0x00]) `shouldSatisfy` isLeft
+
+    it "rejects non-minimal encoding 0xff 0xff 0x00" $
+      decodeUvarint (BS.pack [0xff, 0xff, 0x00]) `shouldSatisfy` isLeft
 
   describe "round-trip property" $ do
-    it "decode(encode(x)) == x for all Word64" $
-      property $ \(w :: Word64) ->
-        decodeUvarint (encodeUvarint w) === Right (w, BS.empty)
+    -- Restricted to 63-bit values: the unsigned-varint spec caps varints
+    -- at 9 bytes (63 bits), so values >= 2^63 are not encodable.
+    it "decode(encode(x)) == x for all 63-bit values" $
+      property $
+        forAll (choose (0, 2 ^ (63 :: Int) - 1)) $ \(w :: Word64) ->
+          decodeUvarint (encodeUvarint w) === Right (w, BS.empty)
 
 -- | Helper to check if an Either is Left.
 isLeft :: Either a b -> Bool

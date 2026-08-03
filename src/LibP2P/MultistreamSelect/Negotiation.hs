@@ -15,12 +15,20 @@ import Control.Concurrent.STM
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Text (Text)
-import Data.Word (Word8)
-import LibP2P.Core.Varint (decodeUvarint)
+import Data.Word (Word64, Word8)
+import LibP2P.Core.Varint (decodeUvarint, maxVarintBytes)
 import LibP2P.MultistreamSelect.Wire
 
 -- | A protocol identifier (e.g. "/noise", "/yamux/1.0.0").
 type ProtocolId = Text
+
+-- | Maximum accepted multistream-select message length in bytes.
+-- Negotiation runs on raw, unauthenticated connections before any
+-- handshake, so the declared length must be capped before allocating
+-- or reading the payload. go-multistream rejects messages over 1024
+-- bytes ("incoming message was too large"); protocol ids are far shorter.
+maxMessageLength :: Word64
+maxMessageLength = 1024
 
 -- | Result of a negotiation attempt.
 data NegotiationResult
@@ -54,28 +62,41 @@ readExact stream n = BS.pack <$> mapM (const (streamReadByte stream)) [1 .. n]
 
 -- | Read a complete multistream-select message from a stream.
 -- Reads varint length byte-by-byte, then reads the full payload.
+-- The declared length is validated against 'maxMessageLength' before
+-- any payload byte is read.
 readMessage :: StreamIO -> IO (Either String Text)
 readMessage stream = do
-  varintBytes <- readVarint stream
-  case decodeUvarint varintBytes of
+  varintResult <- readVarint stream
+  case varintResult of
     Left err -> pure (Left err)
-    Right (len, _) -> do
-      let payloadLen = fromIntegral len :: Int
-      payload <- readExact stream payloadLen
-      case decodeMessage (varintBytes <> payload) of
+    Right varintBytes ->
+      case decodeUvarint varintBytes of
         Left err -> pure (Left err)
-        Right (msg, _) -> pure (Right msg)
+        Right (len, _)
+          | len > maxMessageLength ->
+              pure (Left "readMessage: incoming message too large (max 1024 bytes)")
+          | otherwise -> do
+              payload <- readExact stream (fromIntegral len)
+              case decodeMessage (varintBytes <> payload) of
+                Left err -> pure (Left err)
+                Right (msg, _) -> pure (Right msg)
 
 -- | Read a varint one byte at a time from the stream.
-readVarint :: StreamIO -> IO ByteString
-readVarint stream = go BS.empty
+-- The read loop is bounded at 'maxVarintBytes' (9 bytes per the
+-- unsigned-varint spec) so a peer streaming continuation bytes (0x80)
+-- cannot keep us reading and accumulating forever.
+readVarint :: StreamIO -> IO (Either String ByteString)
+readVarint stream = go 0 []
   where
-    go acc = do
-      b <- streamReadByte stream
-      let acc' = acc <> BS.singleton b
-      if b < 0x80
-        then pure acc'
-        else go acc'
+    go :: Int -> [Word8] -> IO (Either String ByteString)
+    go n acc
+      | n >= maxVarintBytes =
+          pure (Left "readVarint: varint too long (exceeds 9 bytes)")
+      | otherwise = do
+          b <- streamReadByte stream
+          if b < 0x80
+            then pure (Right (BS.pack (reverse (b : acc))))
+            else go (n + 1) (b : acc)
 
 -- | Write a multistream-select message to a stream.
 writeMessage :: StreamIO -> Text -> IO ()
