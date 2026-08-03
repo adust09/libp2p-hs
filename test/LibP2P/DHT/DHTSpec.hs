@@ -208,7 +208,10 @@ spec = do
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
-        Right resp -> length (msgCloserPeers resp) `shouldSatisfy` (>= 0)
+        -- Issue #173: the old assertion here was `length >= 0`, a
+        -- tautology. The only entry in the table is pid2, and an unknown
+        -- target must still yield it as the closest peer.
+        Right resp -> map dhtPeerId (msgCloserPeers resp) `shouldBe` [peerIdBytes pid2]
         Left err -> expectationFailure $ "Failed: " ++ err
 
     -- Per specs/kad-dht: "the distance between two keys is
