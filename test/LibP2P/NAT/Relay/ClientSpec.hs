@@ -3,11 +3,12 @@ module LibP2P.NAT.Relay.ClientSpec (spec) where
 import Test.Hspec
 
 import qualified Data.ByteString as BS
-import Control.Concurrent.Async (withAsync)
+import Control.Concurrent.Async (withAsync, wait)
 import Control.Concurrent.STM (newTQueueIO, atomically, writeTQueue, readTQueue, TQueue)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word8, Word64)
 import LibP2P.NAT.Relay.Message
+import LibP2P.NAT.Relay
 import LibP2P.NAT.Relay.Client
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import LibP2P.Crypto.PeerId (PeerId (..))
@@ -181,37 +182,59 @@ spec = do
         Right msg -> stopStatus msg `shouldBe` Just RelayOK
         Left err -> expectationFailure $ "readStopMessage failed: " ++ err
 
-  describe "Relay client end-to-end mock flow" $ do
-    it "reserve → connect → stop → bridge" $ do
-      -- This test simulates the complete relay flow with mock streams
-      -- 1. Client reserves on relay
-      -- 2. Another peer connects through relay
-      -- 3. Target handles stop
-      -- We just verify the message exchange works end-to-end
-      (clientToRelay, relayFromClient) <- mkStreamPair
-      -- Step 1: Client sends RESERVE
-      writeHopMessage clientToRelay HopMessage
-        { hopType = Just HopReserve
-        , hopPeer = Nothing, hopReservation = Nothing
-        , hopLimit = Nothing, hopStatus = Nothing
-        }
-      req <- readHopMessage relayFromClient maxRelayMessageSize
-      case req of
-        Right msg -> hopType msg `shouldBe` Just HopReserve
-        Left err -> expectationFailure $ "Failed to read RESERVE: " ++ err
-      -- Relay responds OK
-      writeHopMessage relayFromClient HopMessage
-        { hopType = Just HopStatus
-        , hopPeer = Nothing
-        , hopReservation = Just Reservation
-            { rsvExpire = Just 1700000000
-            , rsvAddrs = [BS.pack [4, 127, 0, 0, 1, 6, 0x10, 0x01]]
-            , rsvVoucher = Nothing
-            }
-        , hopLimit = Nothing
-        , hopStatus = Just RelayOK
-        }
-      resp <- readHopMessage clientToRelay maxRelayMessageSize
-      case resp of
-        Right msg -> hopStatus msg `shouldBe` Just RelayOK
-        Left err -> expectationFailure $ "Failed to read RESERVE response: " ++ err
+  describe "Relay client end-to-end flow against the relay server" $ do
+    it "reserve → connect → stop → bridge using the real server and client code" $ do
+      -- Full single-process circuit:
+      --   A (reserver) reserves on the relay via makeReservation/handleReserve
+      --   B (source) connects to A via connectViaRelay/handleConnect
+      --   A accepts the stop CONNECT via handleStop
+      --   Application data flows both ways through the bridged circuit
+      relayState <- newRelayState defaultRelayConfig
+      let reserver = testPeerId    -- A: the peer holding the reservation
+          source = targetPeerId    -- B: the peer connecting through the relay
+      -- Step 1: A reserves on the relay
+      (aHop, relayAHop) <- mkStreamPair
+      let relayReserveSide = do
+            req <- readHopMessage relayAHop maxRelayMessageSize
+            case req of
+              Right msg | hopType msg == Just HopReserve ->
+                handleReserve relayState relayAHop reserver
+              _ -> expectationFailure "relay expected a RESERVE request"
+      withAsync relayReserveSide $ \reserveAsync -> do
+        rsvResult <- makeReservation aHop
+        wait reserveAsync
+        case rsvResult of
+          Right resp -> do
+            hopStatus resp `shouldBe` Just RelayOK
+            (hopReservation resp >>= rsvExpire) `shouldSatisfy` (/= Nothing)
+          Left err -> expectationFailure $ "makeReservation failed: " ++ err
+      -- Step 2: B connects to A through the relay; A accepts via handleStop
+      (bHop, relayBHop) <- mkStreamPair
+      (relayStop, targetStop) <- mkStreamPair
+      let relayConnectSide = do
+            req <- readHopMessage relayBHop maxRelayMessageSize
+            case req of
+              Right msg | hopType msg == Just HopConnect ->
+                handleConnect relayState relayBHop source msg
+                  (\pid -> pure (if pid == reserver then Just relayStop else Nothing))
+              _ -> expectationFailure "relay expected a CONNECT request"
+      withAsync relayConnectSide $ \_connectAsync ->
+        withAsync (handleStop targetStop) $ \stopAsync -> do
+          connResult <- connectViaRelay bHop reserver
+          case connResult of
+            Right resp -> hopStatus resp `shouldBe` Just RelayOK
+            Left err -> expectationFailure $ "connectViaRelay failed: " ++ err
+          stopResult <- wait stopAsync
+          case stopResult of
+            Right (srcPid, mLimit) -> do
+              -- The stop CONNECT must identify the connecting peer
+              srcPid `shouldBe` source
+              mLimit `shouldSatisfy` (/= Nothing)
+            Left err -> expectationFailure $ "handleStop failed: " ++ err
+          -- Step 3: application data flows through the bridged circuit
+          streamWrite bHop (BS.pack [1, 2, 3])
+          fwd <- mapM (\_ -> streamReadByte targetStop) [1..3 :: Int]
+          fwd `shouldBe` [1, 2, 3]
+          streamWrite targetStop (BS.pack [9, 8])
+          back <- mapM (\_ -> streamReadByte bHop) [1..2 :: Int]
+          back `shouldBe` [9, 8]

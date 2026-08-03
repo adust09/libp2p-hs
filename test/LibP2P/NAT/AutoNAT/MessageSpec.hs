@@ -4,6 +4,7 @@ import Test.Hspec
 
 import qualified Data.ByteString as BS
 import Control.Concurrent.STM (newTQueueIO, atomically, writeTQueue, readTQueue, TQueue)
+import Data.List (isInfixOf)
 import Data.Word (Word8)
 import LibP2P.NAT.AutoNAT.Message
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
@@ -193,7 +194,7 @@ spec = do
           fakePayload = BS.replicate 10 0x00
           oversized = fakeLen <> fakePayload
       case decodeAutoNATFramed 1000 oversized of
-        Left err -> err `shouldSatisfy` \e -> "too large" `elem` words e || True
+        Left err -> err `shouldSatisfy` ("too large" `isInfixOf`)
         Right _ -> expectationFailure "Should have rejected oversized message"
 
     it "writeAutoNATMessage + readAutoNATMessage over StreamIO pair" $ do
