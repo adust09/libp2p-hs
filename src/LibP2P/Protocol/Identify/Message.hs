@@ -8,8 +8,9 @@
 --   Field 5: protocolVersion (string, optional)
 --   Field 6: agentVersion    (string, optional)
 --
--- Uses proto3-wire for protobuf encoding/decoding. No length prefix;
--- the message boundary is determined by stream closure.
+-- Uses proto3-wire for protobuf encoding/decoding. On the wire the
+-- message is varint-length-delimited; the framing lives in
+-- "LibP2P.Protocol.Identify" (encodeFramedIdentify / readFramedIdentify).
 module LibP2P.Protocol.Identify.Message
   ( IdentifyInfo (..)
   , encodeIdentify

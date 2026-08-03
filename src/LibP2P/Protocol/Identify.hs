@@ -4,8 +4,10 @@
 --
 -- After a connection is established, both sides exchange IdentifyInfo
 -- messages to learn about each other's capabilities, listen addresses,
--- and agent version. The message has no length prefix — the boundary
--- is determined by stream closure.
+-- and agent version. Like all libp2p protobuf streams, the message is
+-- varint-length-delimited on the wire: uvarint(len) ++ protobuf. This
+-- matches the delimited reader/writer used by go-libp2p (pbio),
+-- rust-libp2p, and js-libp2p.
 --
 -- Also implements Identify Push (/ipfs/id/push/1.0.0) for proactive
 -- updates when local state changes.
@@ -21,14 +23,16 @@ module LibP2P.Protocol.Identify
   , buildLocalIdentify
     -- * Registration
   , registerIdentifyHandlers
-    -- * Helpers
-  , readUntilEOF
+    -- * Wire framing
+  , encodeFramedIdentify
+  , readFramedIdentify
   ) where
 
 import Control.Concurrent.STM (atomically, readTVar, writeTVar)
 import Control.Exception (SomeException, catch)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Crypto.Key (kpPublic)
@@ -63,46 +67,39 @@ identifyPushProtocolId = "/ipfs/id/push/1.0.0"
 
 -- | Handle an inbound Identify request (responder side).
 --
--- Sends our local IdentifyInfo as protobuf to the stream, then closes.
--- The remote side reads until EOF.
+-- Sends our local IdentifyInfo as a varint-length-prefixed protobuf,
+-- then closes the stream (per specs/identify: respond and close).
 handleIdentify :: Switch -> StreamIO -> PeerId -> IO ()
 handleIdentify sw stream _remotePeerId = do
   info <- buildLocalIdentify sw Nothing
-  let encoded = encodeIdentify info
-  streamWrite stream encoded
-  streamClose stream  -- Signal EOF so the remote side's readUntilEOF terminates
+  streamWrite stream (encodeFramedIdentify info)
+  streamClose stream
 
 -- | Request Identify from a remote peer (initiator side).
 --
--- Opens a new stream, negotiates /ipfs/id/1.0.0, reads until EOF,
--- then decodes the protobuf message.
+-- Opens a new stream, negotiates /ipfs/id/1.0.0, then reads one
+-- varint-length-prefixed protobuf message.
 requestIdentify :: Connection -> IO (Either String IdentifyInfo)
 requestIdentify conn = do
   stream <- muxOpenStream (connSession conn)
   result <- negotiateInitiator stream [identifyProtocolId]
   case result of
-    Accepted _ -> do
-      bytesOrErr <- readUntilEOF stream maxIdentifySize
-      case bytesOrErr of
-        Left err -> pure (Left err)
-        Right bs -> case decodeIdentify bs of
-          Left parseErr -> pure (Left (show parseErr))
-          Right info -> pure (Right info)
+    Accepted _ -> readFramedIdentify stream maxIdentifySize
     NoProtocol -> pure (Left "remote does not support identify")
 
 -- | Handle an inbound Identify Push (responder side).
 --
--- Reads the pushed IdentifyInfo from the remote peer.
+-- Reads the pushed varint-length-prefixed IdentifyInfo from the remote
+-- peer. The length prefix is the message boundary — identify push has
+-- no stream-close boundary to fall back on.
 handleIdentifyPush :: Switch -> StreamIO -> PeerId -> IO ()
 handleIdentifyPush sw stream remotePeerId = do
-  bytesOrErr <- readUntilEOF stream maxIdentifySize
-  case bytesOrErr of
+  infoOrErr <- readFramedIdentify stream maxIdentifySize
+  case infoOrErr of
     Left _ -> pure ()
-    Right bs -> case decodeIdentify bs of
-      Left _ -> pure ()
-      Right info -> atomically $ do
-        store <- readTVar (swPeerStore sw)
-        writeTVar (swPeerStore sw) (Map.insert remotePeerId info store)
+    Right info -> atomically $ do
+      store <- readTVar (swPeerStore sw)
+      writeTVar (swPeerStore sw) (Map.insert remotePeerId info store)
 
 -- | Build our local IdentifyInfo from Switch state.
 buildLocalIdentify :: Switch -> Maybe Connection -> IO IdentifyInfo
@@ -133,18 +130,52 @@ registerIdentifyHandlers sw = do
         protos'' = Map.insert identifyPushProtocolId (handleIdentifyPush sw) protos'
     writeTVar (swProtocols sw) protos''
 
--- | Read bytes from a StreamIO until EOF, up to a maximum size.
+-- | Encode an IdentifyInfo with its uvarint length prefix, as written
+-- on the wire: uvarint(len) ++ protobuf.
+encodeFramedIdentify :: IdentifyInfo -> BS.ByteString
+encodeFramedIdentify info =
+  let payload = encodeIdentify info
+  in encodeUvarint (fromIntegral (BS.length payload)) <> payload
+
+-- | Read one varint-length-prefixed Identify message from a stream.
 --
--- Identify uses stream closure as message boundary (no length prefix).
--- Accumulates bytes until streamReadByte throws (EOF/stream closed).
-readUntilEOF :: StreamIO -> Int -> IO (Either String BS.ByteString)
-readUntilEOF stream maxSize = go []  0
+-- Reads the uvarint length prefix, then exactly that many payload
+-- bytes, and decodes the protobuf. Rejects messages larger than
+-- maxSize before reading the payload.
+readFramedIdentify :: StreamIO -> Int -> IO (Either String IdentifyInfo)
+readFramedIdentify stream maxSize = readFramed `catch` onError
   where
-    go acc size
-      | size >= maxSize = pure (Left "message exceeds maximum size")
+    onError :: SomeException -> IO (Either String IdentifyInfo)
+    onError e = pure (Left ("identify stream read failed: " ++ show e))
+
+    readFramed = do
+      varintBytes <- readVarintBytes stream
+      case decodeUvarint varintBytes of
+        Left err -> pure (Left ("identify length prefix decode error: " ++ err))
+        Right (len, _) -> do
+          let msgLen = fromIntegral len :: Int
+          if msgLen > maxSize
+            then pure (Left ("identify message too large: "
+                             ++ show msgLen ++ " > " ++ show maxSize))
+            else do
+              payload <- readExact stream msgLen
+              case decodeIdentify payload of
+                Left parseErr ->
+                  pure (Left ("identify protobuf decode error: " ++ show parseErr))
+                Right info -> pure (Right info)
+
+-- | Read the bytes of one unsigned varint from a stream (up to 10 bytes).
+readVarintBytes :: StreamIO -> IO BS.ByteString
+readVarintBytes stream = go [] (0 :: Int)
+  where
+    go acc n
+      | n >= 10 = pure (BS.pack (reverse acc))  -- max varint length
       | otherwise = do
-          result <- (Right <$> streamReadByte stream) `catch`
-                    (\(_ :: SomeException) -> pure (Left ()))
-          case result of
-            Left () -> pure (Right (BS.pack (reverse acc)))
-            Right b -> go (b : acc) (size + 1)
+          b <- streamReadByte stream
+          if b < 0x80
+            then pure (BS.pack (reverse (b : acc)))
+            else go (b : acc) (n + 1)
+
+-- | Read exactly n bytes from a stream.
+readExact :: StreamIO -> Int -> IO BS.ByteString
+readExact stream n = BS.pack <$> mapM (const (streamReadByte stream)) [1 .. n]

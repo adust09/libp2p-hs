@@ -64,7 +64,7 @@ spec = do
           info = IdentifyInfo Nothing Nothing (Just bigPubKey) [] Nothing []
           encoded = encodeIdentify info
       -- The encoded message should be parseable (proto3-wire doesn't enforce size)
-      -- Size check is done at read time by readUntilEOF, not at decode time
+      -- Size check is done at read time by readFramedIdentify, not at decode time
       BS.length encoded `shouldSatisfy` (> maxIdentifySize)
 
     it "decode skips unknown fields" $ do
