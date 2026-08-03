@@ -28,8 +28,10 @@ module LibP2P.NAT.Relay
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Control.Concurrent.Async (race)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (race_)
 import Control.Concurrent.STM
+import Control.Exception (finally)
 import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
 import qualified Data.Map.Strict as Map
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -66,16 +68,17 @@ data ActiveReservation = ActiveReservation
 
 -- | Mutable relay server state.
 data RelayState = RelayState
-  { rsConfig       :: !RelayConfig
-  , rsReservations :: !(TVar (Map.Map PeerId ActiveReservation))
-  , rsCircuitCount :: !(TVar Int)
+  { rsConfig        :: !RelayConfig
+  , rsReservations  :: !(TVar (Map.Map PeerId ActiveReservation))
+  , rsCircuitCounts :: !(TVar (Map.Map PeerId Int))
+    -- ^ Active relayed circuits per peer (both initiator and target sides)
   }
 
 -- | Create new relay state from configuration.
 newRelayState :: RelayConfig -> IO RelayState
 newRelayState config = RelayState config
   <$> newTVarIO Map.empty
-  <*> newTVarIO 0
+  <*> newTVarIO Map.empty
 
 -- | Handle a RESERVE request from a peer.
 handleReserve :: RelayState -> StreamIO -> PeerId -> IO ()
@@ -115,16 +118,59 @@ handleReserve state stream peerId = do
 -- | Handle a CONNECT request from a peer.
 -- The openStopStream callback is used to open a stop stream to the target.
 handleConnect :: RelayState -> StreamIO -> PeerId -> HopMessage -> (PeerId -> IO (Maybe StreamIO)) -> IO ()
-handleConnect state stream _sourcePeerId msg openStopStream = do
+handleConnect state stream sourcePeerId msg openStopStream = do
   case hopPeer msg of
     Nothing -> sendHopStatus stream MalformedMessage
     Just peer -> do
       let targetId = PeerId (rpId peer)
-      -- Check target has a reservation
-      reservations <- readTVarIO (rsReservations state)
-      case Map.lookup targetId reservations of
-        Nothing -> sendHopStatus stream NoReservation
-        Just _rsv -> do
+      now <- getPOSIXTime
+      let nowSecs = floor now :: Word64
+      -- Check target has an unexpired reservation; drop it if it has expired.
+      hasReservation <- atomically $ do
+        reservations <- readTVar (rsReservations state)
+        case Map.lookup targetId reservations of
+          Nothing -> pure False
+          Just rsv
+            | arExpiration rsv <= nowSecs -> do
+                modifyTVar' (rsReservations state) (Map.delete targetId)
+                pure False
+            | otherwise -> pure True
+      if not hasReservation
+        then sendHopStatus stream NoReservation
+        else do
+          -- Acquire a circuit slot for both peers, enforcing the advertised
+          -- per-peer circuit limit atomically with the check.
+          acquired <- atomically $ acquireCircuitSlots state sourcePeerId targetId
+          if not acquired
+            then sendHopStatus stream ResourceLimitExceeded
+            else establishCircuit state stream sourcePeerId targetId openStopStream
+                   `finally` atomically (releaseCircuitSlots state sourcePeerId targetId)
+
+-- | Reserve one circuit slot for each of the two peers if neither is at the
+-- configured per-peer limit. Returns False without modifying state otherwise.
+acquireCircuitSlots :: RelayState -> PeerId -> PeerId -> STM Bool
+acquireCircuitSlots state sourceId targetId = do
+  counts <- readTVar (rsCircuitCounts state)
+  let limit = rcMaxCircuits (rsConfig state)
+      countOf pid = Map.findWithDefault 0 pid counts
+  if countOf sourceId >= limit || countOf targetId >= limit
+    then pure False
+    else do
+      let bump = Map.insertWith (+) sourceId 1 . Map.insertWith (+) targetId 1
+      writeTVar (rsCircuitCounts state) (bump counts)
+      pure True
+
+-- | Release the circuit slots acquired by 'acquireCircuitSlots'.
+releaseCircuitSlots :: RelayState -> PeerId -> PeerId -> STM ()
+releaseCircuitSlots state sourceId targetId =
+  modifyTVar' (rsCircuitCounts state) (dropOne sourceId . dropOne targetId)
+  where
+    dropOne = Map.update (\n -> if n <= 1 then Nothing else Just (n - 1))
+
+-- | Open a stop stream to the target, exchange CONNECT/STATUS, and bridge the
+-- two streams until EOF or a limit is exceeded.
+establishCircuit :: RelayState -> StreamIO -> PeerId -> PeerId -> (PeerId -> IO (Maybe StreamIO)) -> IO ()
+establishCircuit state stream sourcePeerId targetId openStopStream = do
           -- Try to open stop stream to target
           mStopStream <- openStopStream targetId
           case mStopStream of
@@ -134,7 +180,7 @@ handleConnect state stream _sourcePeerId msg openStopStream = do
               let stopMsg = StopMessage
                     { stopType = Just StopConnect
                     , stopPeer = Just RelayPeer
-                        { rpId = let PeerId bs = _sourcePeerId in bs
+                        { rpId = let PeerId bs = sourcePeerId in bs
                         , rpAddrs = []
                         }
                     , stopLimit = Just RelayLimit
@@ -179,22 +225,31 @@ sendHopStatus stream status = writeHopMessage stream HopMessage
   }
 
 -- | Bridge two streams bidirectionally with optional data/duration limits.
--- Terminates when either direction closes or limits are exceeded.
+-- Terminates when either direction closes or limits are exceeded, then closes
+-- both streams so neither end is left with a half-open circuit.
 bridgeStreams :: Maybe RelayLimit -> StreamIO -> StreamIO -> IO ()
 bridgeStreams mLimit streamA streamB = do
-  let dataLimit = case mLimit of
-        Just lim -> case rlData lim of
-          Just n  -> fromIntegral n :: Int
-          Nothing -> maxBound
+  let dataLimit = case mLimit >>= rlData of
+        Just n  -> fromIntegral n :: Int
         Nothing -> maxBound
+      -- Duration limit in microseconds for threadDelay
+      mDurationMicros = case mLimit >>= rlDuration of
+        Just secs | secs > 0 -> Just (fromIntegral secs * 1000000 :: Int)
+        _                    -> Nothing
   -- Track bytes transferred in each direction
   countAtoB <- newIORef (0 :: Int)
   countBtoA <- newIORef (0 :: Int)
   -- Forward A→B and B→A concurrently; terminate when either finishes
-  _ <- race
-    (forwardWithLimit streamA streamB countAtoB dataLimit)
-    (forwardWithLimit streamB streamA countBtoA dataLimit)
-  pure ()
+  let forwarding = race_
+        (forwardWithLimit streamA streamB countAtoB dataLimit)
+        (forwardWithLimit streamB streamA countBtoA dataLimit)
+  -- Enforce the advertised duration limit: close the circuit when it elapses
+  (case mDurationMicros of
+     Nothing     -> forwarding
+     Just micros -> race_ (threadDelay micros) forwarding)
+    `finally` do
+      streamClose streamA
+      streamClose streamB
 
 -- | Forward bytes from source to destination with a byte limit.
 forwardWithLimit :: StreamIO -> StreamIO -> IORef Int -> Int -> IO ()
