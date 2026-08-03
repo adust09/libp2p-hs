@@ -126,7 +126,7 @@ dispatchStream sw conn stream = do
       -- Look up the handler for the negotiated protocol
       mHandler <- lookupHandler proto
       case mHandler of
-        Just handler -> handler stream (connPeerId conn)
+        Just handler -> handler conn stream
         Nothing -> pure ()  -- Should not happen: proto was in supported list
     NoProtocol -> pure ()  -- No common protocol, stream will be closed
   where

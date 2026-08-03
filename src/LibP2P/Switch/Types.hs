@@ -63,8 +63,11 @@ data Connection = Connection
 
 -- | A protocol stream handler.
 --
--- Receives the stream I/O and the remote peer's identity.
-type StreamHandler = StreamIO -> PeerId -> IO ()
+-- Receives the connection the stream runs over and the stream I/O.
+-- The connection exposes the remote peer identity ('connPeerId') and
+-- addresses ('connRemoteAddr', 'connLocalAddr'), which protocols like
+-- Identify (observedAddr) and the NAT stack need.
+type StreamHandler = Connection -> StreamIO -> IO ()
 
 -- | Events emitted by the Switch for observability.
 data SwitchEvent

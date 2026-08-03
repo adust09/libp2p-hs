@@ -33,7 +33,6 @@ import Control.Exception (SomeException, catch)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
-import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Crypto.Key (kpPublic)
 import LibP2P.Multiaddr.Codec (encodeProtocols)
@@ -69,9 +68,10 @@ identifyPushProtocolId = "/ipfs/id/push/1.0.0"
 --
 -- Sends our local IdentifyInfo as a varint-length-prefixed protobuf,
 -- then closes the stream (per specs/identify: respond and close).
-handleIdentify :: Switch -> StreamIO -> PeerId -> IO ()
-handleIdentify sw stream _remotePeerId = do
-  info <- buildLocalIdentify sw Nothing
+-- The connection provides the remote address used for observedAddr.
+handleIdentify :: Switch -> Connection -> StreamIO -> IO ()
+handleIdentify sw conn stream = do
+  info <- buildLocalIdentify sw (Just conn)
   streamWrite stream (encodeFramedIdentify info)
   streamClose stream
 
@@ -92,14 +92,14 @@ requestIdentify conn = do
 -- Reads the pushed varint-length-prefixed IdentifyInfo from the remote
 -- peer. The length prefix is the message boundary — identify push has
 -- no stream-close boundary to fall back on.
-handleIdentifyPush :: Switch -> StreamIO -> PeerId -> IO ()
-handleIdentifyPush sw stream remotePeerId = do
+handleIdentifyPush :: Switch -> Connection -> StreamIO -> IO ()
+handleIdentifyPush sw conn stream = do
   infoOrErr <- readFramedIdentify stream maxIdentifySize
   case infoOrErr of
     Left _ -> pure ()
     Right info -> atomically $ do
       store <- readTVar (swPeerStore sw)
-      writeTVar (swPeerStore sw) (Map.insert remotePeerId info store)
+      writeTVar (swPeerStore sw) (Map.insert (connPeerId conn) info store)
 
 -- | Build our local IdentifyInfo from Switch state.
 buildLocalIdentify :: Switch -> Maybe Connection -> IO IdentifyInfo
