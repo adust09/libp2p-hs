@@ -52,6 +52,10 @@ spec = do
       received <- readFramedMessage streamB
       received `shouldBe` BS.empty
 
+    it "writeFramedMessage rejects a message larger than 65535 bytes" $ do
+      (streamA, _streamB) <- mkMemoryStreamPair
+      writeFramedMessage streamA (BS.replicate 65536 0x42) `shouldThrow` anyIOException
+
   describe "performStreamHandshake" $ do
     it "initiator and responder complete handshake and return correct PeerIds" $ do
       (pidA, kpA) <- mkTestIdentity
@@ -92,6 +96,37 @@ spec = do
       streamWrite encB "world"
       received2 <- readExact encA 5
       received2 `shouldBe` "world"
+
+    it "round-trips a payload larger than 65535 bytes without corruption" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      ((sessA, _), (sessB, _)) <-
+        concurrently
+          (performStreamHandshake kpA Outbound rawA)
+          (performStreamHandshake kpB Inbound rawB)
+      sendRefA <- newIORef sessA
+      recvRefA <- newIORef sessA
+      bufRefA  <- newIORef BS.empty
+      sendRefB <- newIORef sessB
+      recvRefB <- newIORef sessB
+      bufRefB  <- newIORef BS.empty
+      let encA = noiseSessionToStreamIO sendRefA recvRefA bufRefA rawA
+          encB = noiseSessionToStreamIO sendRefB recvRefB bufRefB rawB
+          -- Larger than the 65535-byte Noise message cap: must be chunked
+          -- into multiple frames, never truncated.
+          bigPayload = BS.pack (take 70000 (cycle [0 .. 255]))
+      streamWrite encA bigPayload
+      received <- readExact encB 70000
+      received `shouldBe` bigPayload
+      -- The connection must remain usable after the large write
+      streamWrite encA "still alive"
+      received2 <- readExact encB 11
+      received2 `shouldBe` "still alive"
+      -- And the reverse direction too
+      streamWrite encB bigPayload
+      received3 <- readExact encA 70000
+      received3 `shouldBe` bigPayload
 
   describe "Full upgrade pipeline" $ do
     it "upgradeOutbound + upgradeInbound exchange data on muxed stream" $ do

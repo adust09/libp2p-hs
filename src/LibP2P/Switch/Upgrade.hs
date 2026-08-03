@@ -44,7 +44,7 @@ import LibP2P.MultistreamSelect.Negotiation
   , negotiateInitiator
   , negotiateResponder
   )
-import LibP2P.Noise.Framing (encodeFrame)
+import LibP2P.Noise.Framing (chunkPlaintext, encodeFrame)
 import LibP2P.Noise.Handshake
   ( HandshakeResult (..)
   , buildHandshakePayload
@@ -87,8 +87,11 @@ readFramedMessage stream = do
     else readExact stream len
 
 -- | Write a 2-byte-BE-length-prefixed Noise frame to a StreamIO.
+-- Fails (instead of truncating the length prefix) if the message exceeds
+-- the 65535-byte Noise message cap.
 writeFramedMessage :: StreamIO -> ByteString -> IO ()
-writeFramedMessage stream msg = streamWrite stream (encodeFrame msg)
+writeFramedMessage stream msg =
+  either fail (streamWrite stream) (encodeFrame msg)
 
 -- | Perform a Noise XX handshake over a StreamIO using framed messages.
 -- Returns (NoiseSession, HandshakeResult) with the remote PeerId.
@@ -198,15 +201,21 @@ noiseSessionToStreamIO sendRef recvRef bufRef rawIO = StreamIO
   , streamClose = pure ()  -- Encryption layer does not own the connection
   }
 
--- | Encrypt plaintext and write as a framed Noise message.
+-- | Encrypt plaintext and write as framed Noise messages.
+-- A Noise message is capped at 65535 bytes, so plaintext is split into
+-- chunks of at most 65519 bytes (65535 minus the 16-byte AEAD tag) and
+-- each chunk is encrypted and framed as its own Noise transport message.
 encryptAndWrite :: IORef NoiseSession -> StreamIO -> ByteString -> IO ()
-encryptAndWrite sendRef rawIO plaintext = do
-  sess <- readIORef sendRef
-  case encryptMessage sess plaintext of
-    Left err -> fail $ "encryptAndWrite: " <> err
-    Right (ct, sess') -> do
-      writeIORef sendRef sess'
-      writeFramedMessage rawIO ct
+encryptAndWrite sendRef rawIO plaintext =
+  mapM_ encryptChunk (chunkPlaintext plaintext)
+  where
+    encryptChunk chunk = do
+      sess <- readIORef sendRef
+      case encryptMessage sess chunk of
+        Left err -> fail $ "encryptAndWrite: " <> err
+        Right (ct, sess') -> do
+          writeIORef sendRef sess'
+          writeFramedMessage rawIO ct
 
 -- | Read and decrypt a byte from the Noise channel.
 -- If the buffer has bytes, return the first. Otherwise, read a full Noise
