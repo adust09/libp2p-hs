@@ -4,9 +4,16 @@
 -- - Minimal varint encoding
 -- - Fields in field number order (Type=1, Data=2)
 -- - All fields present, no extras
+--
+-- Both messages share the same wire layout (per the peer-ids spec):
+--
+-- > message PublicKey  { required KeyType Type = 1; required bytes Data = 2; }
+-- > message PrivateKey { required KeyType Type = 1; required bytes Data = 2; }
 module LibP2P.Crypto.Protobuf
   ( encodePublicKey
   , decodePublicKey
+  , encodePrivateKey
+  , decodePrivateKey
   ) where
 
 import Data.ByteString (ByteString)
@@ -14,7 +21,7 @@ import qualified Data.ByteString as BS
 import Data.Word (Word64, Word8)
 import Numeric (showHex)
 import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
-import LibP2P.Crypto.Key (KeyType (..), PublicKey (..))
+import LibP2P.Crypto.Key (KeyType (..), PrivateKey (..), PublicKey (..))
 
 -- | Protobuf KeyType enum values (per libp2p peer-ids spec: RSA=0, Ed25519=1,
 -- Secp256k1=2, ECDSA=3).
@@ -32,12 +39,33 @@ keyTypeFromProto 3 = Right ECDSA
 keyTypeFromProto n = Left $ "unknown KeyType: " <> show n
 
 -- | Deterministic protobuf encoding of a PublicKey message.
+encodePublicKey :: PublicKey -> ByteString
+encodePublicKey (PublicKey kt rawKey) = encodeKeyMessage kt rawKey
+
+-- | Decode a protobuf-encoded PublicKey message.
+decodePublicKey :: ByteString -> Either String PublicKey
+decodePublicKey bs = uncurry PublicKey <$> decodeKeyMessage "decodePublicKey" bs
+
+-- | Deterministic protobuf encoding of a PrivateKey message. Note that
+-- PrivateKey messages are never sent over the wire; this is the on-disk
+-- format shared by libp2p implementations.
+encodePrivateKey :: PrivateKey -> ByteString
+encodePrivateKey (PrivateKey kt rawKey) = encodeKeyMessage kt rawKey
+
+-- | Decode a protobuf-encoded PrivateKey message, e.g. a key file written
+-- by another implementation. The Data field is returned as-is; use
+-- 'LibP2P.Crypto.Key.keyPairFromPrivateKey' to validate it and derive the
+-- public key.
+decodePrivateKey :: ByteString -> Either String PrivateKey
+decodePrivateKey bs = uncurry PrivateKey <$> decodeKeyMessage "decodePrivateKey" bs
+
+-- | Shared deterministic encoding of the key messages.
 --
 -- Layout:
 --   Field 1 (Type): tag=0x08 (field 1, wire type 0=varint), value=keytype
 --   Field 2 (Data): tag=0x12 (field 2, wire type 2=length-delimited), length, bytes
-encodePublicKey :: PublicKey -> ByteString
-encodePublicKey (PublicKey kt rawKey) =
+encodeKeyMessage :: KeyType -> ByteString -> ByteString
+encodeKeyMessage kt rawKey =
   -- Field 1: tag 0x08 + varint value
   BS.singleton 0x08 <> encodeUvarint (keyTypeToProto kt)
     -- Field 2: tag 0x12 + varint length + raw bytes
@@ -45,9 +73,9 @@ encodePublicKey (PublicKey kt rawKey) =
     <> encodeUvarint (fromIntegral (BS.length rawKey))
     <> rawKey
 
--- | Decode a protobuf-encoded PublicKey message.
-decodePublicKey :: ByteString -> Either String PublicKey
-decodePublicKey bs = do
+-- | Shared decoding of the key messages; @ctx@ names the caller in errors.
+decodeKeyMessage :: String -> ByteString -> Either String (KeyType, ByteString)
+decodeKeyMessage ctx bs = do
   -- Field 1: expect tag 0x08
   (tag1, rest1) <- takeExpectedByte 0x08 bs "expected tag 0x08 for field 1"
   _ <- pure tag1
@@ -58,14 +86,14 @@ decodePublicKey bs = do
   (dataLen, rest4) <- decodeUvarint rest3
   let len = fromIntegral dataLen :: Int
   if BS.length rest4 < len
-    then Left "decodePublicKey: not enough bytes for key data"
+    then Left $ ctx <> ": not enough bytes for key data"
     else
       let keyData = BS.take len rest4
-       in Right (PublicKey kt keyData)
+       in Right (kt, keyData)
   where
     takeExpectedByte :: Word8 -> ByteString -> String -> Either String (Word8, ByteString)
     takeExpectedByte expected input msg
-      | BS.null input = Left $ "decodePublicKey: " <> msg <> " (empty input)"
+      | BS.null input = Left $ ctx <> ": " <> msg <> " (empty input)"
       | BS.head input /= expected =
-          Left $ "decodePublicKey: " <> msg <> " (got 0x" <> showHex (BS.head input) ")"
+          Left $ ctx <> ": " <> msg <> " (got 0x" <> showHex (BS.head input) ")"
       | otherwise = Right (expected, BS.tail input)

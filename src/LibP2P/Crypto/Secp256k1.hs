@@ -11,6 +11,7 @@ module LibP2P.Crypto.Secp256k1
   ( generate
   , signIO
   , verify
+  , derivePublicKey
   ) where
 
 import Crypto.Hash.Algorithms (SHA256 (..))
@@ -72,6 +73,12 @@ signIO privRaw msg
       let priv = ECDSA.PrivateKey curve (os2ip privRaw)
       sig <- ECDSA.sign priv SHA256 msg
       pure (Right (encodeSignature sig))
+
+-- | Derive the 33-byte compressed public key from a 32-byte private scalar.
+derivePublicKey :: ByteString -> Either String ByteString
+derivePublicKey privRaw
+  | BS.length privRaw /= 32 = Left "Secp256k1.derivePublicKey: private key must be 32 bytes"
+  | otherwise = Right (encodePoint (generateQ curve (os2ip privRaw)))
 
 -- | Verify a DER signature against a 33-byte compressed public key (ECDSA/SHA-256).
 verify :: ByteString -> ByteString -> ByteString -> Bool
