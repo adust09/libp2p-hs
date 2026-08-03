@@ -136,6 +136,7 @@ test-suite libp2p-hs-test
     LibP2P.Crypto.RSASpec
     LibP2P.Crypto.Secp256k1Spec
     LibP2P.Crypto.ECDSASpec
+    LibP2P.Crypto.KeyImportSpec
     LibP2P.MultistreamSelect.NegotiationSpec
     LibP2P.Yamux.FrameSpec
     LibP2P.Yamux.StreamSpec

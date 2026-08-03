@@ -11,9 +11,11 @@ module LibP2P.Crypto.RSA
   ( generate
   , sign
   , verify
+  , derivePublicKey
   ) where
 
 import Crypto.Hash.Algorithms (SHA256 (..))
+import Crypto.Number.Basic (numBytes)
 import qualified Crypto.PubKey.RSA as RSA
 import qualified Crypto.PubKey.RSA.PKCS15 as PKCS15
 import Data.ASN1.BinaryEncoding (DER (..))
@@ -26,7 +28,8 @@ import Data.X509 (PubKey (PubKeyRSA))
 publicExponent :: Integer
 publicExponent = 0x10001
 
--- | Default modulus size in bytes (2048-bit).
+-- | Modulus size in bytes for locally generated keys (2048-bit).
+-- Imported keys may use any modulus size; see 'decodePrivateKey'.
 keySizeBytes :: Int
 keySizeBytes = 256
 
@@ -51,6 +54,10 @@ verify pubDer msg sig =
   case decodePublicKey pubDer of
     Left _ -> False
     Right pub -> PKCS15.verify (Just SHA256) pub msg sig
+
+-- | Derive the SPKI-DER public key from a PKCS#1-DER private key.
+derivePublicKey :: ByteString -> Either String ByteString
+derivePublicKey privDer = encodePublicKey . RSA.private_pub <$> decodePrivateKey privDer
 
 -- | Encode an RSA public key as DER SubjectPublicKeyInfo.
 encodePublicKey :: RSA.PublicKey -> ByteString
@@ -105,7 +112,9 @@ decodePrivateKey bs =
         Right
           RSA.PrivateKey
             { RSA.private_pub =
-                RSA.PublicKey {RSA.public_size = keySizeBytes, RSA.public_n = n, RSA.public_e = e}
+                -- The modulus size must be derived from n itself: keys from
+                -- other implementations are not necessarily 2048-bit.
+                RSA.PublicKey {RSA.public_size = numBytes n, RSA.public_n = n, RSA.public_e = e}
             , RSA.private_d = d
             , RSA.private_p = p
             , RSA.private_q = q

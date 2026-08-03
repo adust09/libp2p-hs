@@ -20,6 +20,9 @@ generateKeyPair = do
   pure (keyPairFromSeed seed)
 
 -- | Create an Ed25519 key pair from a 32-byte seed.
+--
+-- The private key bytes are stored in the 64-byte wire form required by the
+-- peer-ids spec: @seed || public key@.
 keyPairFromSeed :: ByteString -> Either String KeyPair
 keyPairFromSeed seed
   | BS.length seed /= 32 = Left "keyPairFromSeed: seed must be 32 bytes"
@@ -31,5 +34,5 @@ keyPairFromSeed seed
            in Right $
                 KeyPair
                   { kpPublic = PublicKey Ed25519 (convert pk)
-                  , kpPrivate = PrivateKey Ed25519 (convert sk)
+                  , kpPrivate = PrivateKey Ed25519 (convert sk <> convert pk)
                   }
