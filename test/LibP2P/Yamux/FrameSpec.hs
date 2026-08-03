@@ -55,11 +55,17 @@ spec = do
       BS.index encoded 2 `shouldBe` 0x00
       BS.index encoded 3 `shouldBe` 0x08
 
-    it "encodes GoAway normal" $ do
-      let hdr = YamuxHeader 0 FrameGoAway defaultFlags 0 0
-      let encoded = encodeHeader hdr
-      BS.index encoded 1 `shouldBe` 0x03
-      BS.index encoded 8 `shouldBe` 0x00 -- error code 0
+    it "encodes all three GoAway codes in the low byte of the Length field" $ do
+      -- The error code lives in the 32-bit Length field; codes 0x00,
+      -- 0x01 and 0x02 differ only at byte 11 (the least significant)
+      mapM_
+        ( \code -> do
+            let encoded = encodeHeader (YamuxHeader 0 FrameGoAway defaultFlags 0 code)
+            BS.index encoded 1 `shouldBe` 0x03
+            BS.take 3 (BS.drop 8 encoded) `shouldBe` BS.pack [0x00, 0x00, 0x00]
+            BS.index encoded 11 `shouldBe` fromIntegral code
+        )
+        ([0x00, 0x01, 0x02] :: [Word32])
 
   describe "decodeHeader" $ do
     it "decodes Data SYN stream=1 len=5" $ do
@@ -108,15 +114,6 @@ spec = do
       property $ \(sid :: Word32) (len :: Word32) ->
         let hdr = YamuxHeader 0 FrameData defaultFlags sid len
          in decodeHeader (encodeHeader hdr) === Right hdr
-
-  describe "Stream ID conventions" $ do
-    it "client uses odd IDs (1,3,5,...)" $ do
-      let clientIds = [1, 3, 5, 7, 9] :: [Word32]
-      all odd clientIds `shouldBe` True
-
-    it "server uses even IDs (2,4,6,...)" $ do
-      let serverIds = [2, 4, 6, 8, 10] :: [Word32]
-      all even serverIds `shouldBe` True
 
   describe "Constants" $ do
     it "initial window size is 256 KiB" $

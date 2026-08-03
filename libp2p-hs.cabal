@@ -141,8 +141,10 @@ test-suite libp2p-hs-test
     LibP2P.Crypto.KeyImportSpec
     LibP2P.MultistreamSelect.NegotiationSpec
     LibP2P.Yamux.FrameSpec
+    LibP2P.Yamux.HostilePeer
     LibP2P.Yamux.StreamSpec
     LibP2P.Yamux.SessionSpec
+    LibP2P.Yamux.StateMachineSpec
     LibP2P.Transport.TCPSpec
     LibP2P.Switch.ConnPoolSpec
     LibP2P.Switch.ConnectionLifecycleSpec
