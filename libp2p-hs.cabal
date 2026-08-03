@@ -190,3 +190,4 @@ test-suite libp2p-hs-test
     QuickCheck >= 2.14 && < 2.16
   build-tool-depends:
     hspec-discover:hspec-discover
+  ghc-options: -threaded
