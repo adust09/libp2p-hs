@@ -5,19 +5,42 @@
 module LibP2P.IntegrationSpec (spec) where
 
 import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (forConcurrently)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
+  , modifyTVar'
   , readTVar
+  , retry
   , writeTVar
   )
 import Control.Exception (SomeException, bracket, try)
+import Control.Monad (replicateM)
+import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import Data.Time.Clock (getCurrentTime)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair, publicKey)
-import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import LibP2P.Multiaddr (Multiaddr (..))
+import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes)
+import LibP2P.DHT
+  ( DHTMode (..)
+  , DHTNode (..)
+  , decodePeerAddrs
+  , newDHTNode
+  , registerDHTHandler
+  )
+import LibP2P.DHT.Distance (peerIdToKey)
+-- Qualified: DHTMessage's msgKey clashes with PubSubMessage's msgKey.
+import qualified LibP2P.DHT.Message as DHTMsg
+import LibP2P.DHT.RoutingTable (insertPeer)
+import LibP2P.DHT.Types (BucketEntry (..), ConnectionType (..))
+import LibP2P.Multiaddr (Multiaddr (..), toBytes)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
+import LibP2P.MultistreamSelect.Negotiation
+  ( NegotiationResult (..)
+  , StreamIO (..)
+  , negotiateInitiator
+  )
 import LibP2P.Protocol.GossipSub.Handler
   ( gossipJoin
   , gossipPublish
@@ -49,8 +72,13 @@ import LibP2P.Switch.Listen
   , defaultConnectionGater
   , switchListen
   )
-import LibP2P.Switch (addTransport, newSwitch, switchClose)
-import LibP2P.Switch.Types (Connection (..), DialError (..), Switch (..))
+import LibP2P.Switch (addTransport, newSwitch, setStreamHandler, switchClose)
+import LibP2P.Switch.Types
+  ( Connection (..)
+  , DialError (..)
+  , MuxerSession (..)
+  , Switch (..)
+  )
 import LibP2P.Transport.TCP (newTCPTransport)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -65,6 +93,10 @@ mkTestIdentity = do
 -- | Loopback address with port 0 (OS assigns ephemeral port).
 loopbackAddr :: Multiaddr
 loopbackAddr = Multiaddr [IP4 0x7f000001, TCP 0]
+
+-- | Read exactly n bytes from a stream.
+readN :: StreamIO -> Int -> IO BS.ByteString
+readN stream n = BS.pack <$> replicateM n (streamReadByte stream)
 
 -- | Create a test node: Switch + TCP transport + Identify + Ping.
 -- Returns the Switch, PeerId, and KeyPair.
@@ -81,40 +113,51 @@ withTestNode action = bracket setup teardown (\(sw, pid, _kp) -> action sw pid)
       pure (sw, pid, kp)
     teardown (sw, _pid, _kp) = switchClose sw
 
+-- | Create a listening test node: Switch + TCP + Identify + Ping,
+-- bound to a loopback address. The Switch is closed on exit, even
+-- when the action throws.
+withListeningNode :: ((Switch, PeerId, Multiaddr) -> IO a) -> IO a
+withListeningNode action = bracket setup teardown action
+  where
+    setup = do
+      (pid, kp) <- mkTestIdentity
+      sw <- newSwitch pid kp
+      tcp <- newTCPTransport
+      addTransport sw tcp
+      registerIdentifyHandlers sw
+      registerPingHandler sw
+      addrs <- switchListen sw defaultConnectionGater [loopbackAddr]
+      pure (sw, pid, head addrs)
+    teardown (sw, _pid, _addr) = switchClose sw
+
+-- | Block until the given peer shows up in the switch's connection pool.
+-- Replaces the previous fixed 300ms sleep: the pool is STM state, so the
+-- test can wait on the exact condition instead of a wall-clock guess.
+waitForPeerInPool :: Switch -> PeerId -> IO ()
+waitForPeerInPool sw pid = do
+  seen <- timeout 5000000 $ atomically $ do
+    mConn <- lookupConn (swConnPool sw) pid
+    maybe retry (const (pure ())) mConn
+  case seen of
+    Just () -> pure ()
+    Nothing -> fail "waitForPeerInPool: peer never appeared in the pool"
+
 -- | Create two connected test nodes: node B listens, node A dials.
 -- Returns both Switches, PeerIds, and the connection from A to B.
+-- Both Switches are torn down via bracket even when the action fails,
+-- so a failing assertion cannot leak listeners into later tests.
 withConnectedPair :: ((Switch, PeerId) -> (Switch, PeerId) -> Connection -> IO a) -> IO a
-withConnectedPair action = do
-  -- Node B (listener)
-  (pidB, kpB) <- mkTestIdentity
-  swB <- newSwitch pidB kpB
-  tcpB <- newTCPTransport
-  addTransport swB tcpB
-  registerIdentifyHandlers swB
-  registerPingHandler swB
-  addrs <- switchListen swB defaultConnectionGater [loopbackAddr]
-  let listenAddr = head addrs
-  -- Node A (dialer)
-  (pidA, kpA) <- mkTestIdentity
-  swA <- newSwitch pidA kpA
-  tcpA <- newTCPTransport
-  addTransport swA tcpA
-  registerIdentifyHandlers swA
-  registerPingHandler swA
-  -- Dial from A to B
-  dialResult <- dial swA pidB [listenAddr]
-  case dialResult of
-    Left err -> do
-      switchClose swB
-      switchClose swA
-      fail $ "withConnectedPair: dial failed: " ++ show err
-    Right conn -> do
-      -- Allow listener to complete pool insertion
-      threadDelay 300000
-      result <- action (swA, pidA) (swB, pidB) conn
-      switchClose swA
-      switchClose swB
-      pure result
+withConnectedPair action =
+  withListeningNode $ \(swB, pidB, listenAddr) ->
+    withTestNode $ \swA pidA -> do
+      dialResult <- dial swA pidB [listenAddr]
+      case dialResult of
+        Left err -> fail $ "withConnectedPair: dial failed: " ++ show err
+        Right conn -> do
+          -- The dialer returns before the listener finishes pool insertion;
+          -- wait on the pool itself rather than sleeping.
+          waitForPeerInPool swB pidA
+          action (swA, pidA) (swB, pidB) conn
 
 spec :: Spec
 spec = do
@@ -128,6 +171,17 @@ spec = do
         case poolConn of
           Nothing -> expectationFailure "listener should see dialer in pool"
           Just c  -> connPeerId c `shouldBe` pidA
+
+    it "upgraded connection records /noise security and /yamux/1.0.0 muxing on both sides" $ do
+      withConnectedPair $ \(_swA, pidA) (swB, _pidB) conn -> do
+        connSecurity conn `shouldBe` "/noise"
+        connMuxer conn `shouldBe` "/yamux/1.0.0"
+        poolConn <- atomically $ lookupConn (swConnPool swB) pidA
+        case poolConn of
+          Nothing -> expectationFailure "listener should see dialer in pool"
+          Just c -> do
+            connSecurity c `shouldBe` "/noise"
+            connMuxer c `shouldBe` "/yamux/1.0.0"
 
   describe "Ping over real TCP" $ do
     it "sendPing returns valid RTT (>0, <1s for loopback)" $ do
@@ -161,6 +215,18 @@ spec = do
             -- B is listening, so idListenAddrs should be non-empty
             idListenAddrs info `shouldSatisfy` (not . null)
 
+    it "observedAddr echoes the dialer's own address as seen by the listener" $ do
+      -- Regression for #167: the responder must fill observedAddr with the
+      -- initiator's source address. On loopback that address is exactly the
+      -- dialer's local socket address (ephemeral port included).
+      withConnectedPair $ \_nodeA _nodeB conn -> do
+        result <- timeout 5000000 $ requestIdentify conn
+        case result of
+          Nothing -> expectationFailure "identify timed out"
+          Just (Left err) -> expectationFailure $ "identify failed: " ++ err
+          Just (Right info) ->
+            idObservedAddr info `shouldBe` Just (toBytes (connLocalAddr conn))
+
   describe "Multi-protocol" $ do
     -- WARNING(#163): this test certifies behaviour the spec forbids.
     -- specs/ping/ping.md: "The dialing peer MUST NOT keep more than one
@@ -179,6 +245,111 @@ spec = do
         case pingResult2 of
           Left err -> expectationFailure $ "ping 2 failed: " ++ show err
           Right (PingResult rtt2) -> rtt2 `shouldSatisfy` (> 0)
+
+    it "unknown protocol gets na over real TCP and the connection stays usable" $ do
+      withConnectedPair $ \_nodeA _nodeB conn -> do
+        stream <- muxOpenStream (connSession conn)
+        result <- timeout 5000000 $
+          negotiateInitiator stream ["/test/does-not-exist/1.0.0"]
+        result `shouldBe` Just NoProtocol
+        -- The failed negotiation must not poison the muxed connection.
+        pingAfter <- timeout 5000000 $ sendPing conn
+        case pingAfter of
+          Just (Right (PingResult rtt)) -> rtt `shouldSatisfy` (> 0)
+          Just (Left err) ->
+            expectationFailure $ "ping after failed negotiation: " ++ show err
+          Nothing ->
+            expectationFailure "connection unusable after failed negotiation"
+
+  describe "DHT over real TCP" $ do
+    it "FIND_NODE returns the responder's routing table entries with addresses" $ do
+      -- Regression for #168/#194: the outbound RPC path must reach a real
+      -- peer over the Switch, and Peer records must carry multiaddrs.
+      withConnectedPair $ \(swA, _pidA) (swB, pidB) _conn -> do
+        dhtB <- newDHTNode swB DHTServer
+        registerDHTHandler dhtB
+        dhtA <- newDHTNode swA DHTClient
+        -- Seed B's routing table with a fabricated third peer.
+        (pidC, _kpC) <- mkTestIdentity
+        now <- getCurrentTime
+        let addrC = Multiaddr [IP4 0x7f000001, TCP 4001]
+            entryC = BucketEntry pidC (peerIdToKey pidC) [addrC] now NotConnected
+        atomically $ modifyTVar' (dhtRoutingTable dhtB) (fst . insertPeer entryC)
+        let request = DHTMsg.emptyDHTMessage
+              { DHTMsg.msgType = DHTMsg.FindNode
+              , DHTMsg.msgKey = peerIdBytes pidC
+              }
+        result <- timeout 10000000 $ dhtSendRequest dhtA pidB request
+        case result of
+          Nothing -> expectationFailure "FIND_NODE timed out"
+          Just (Left err) -> expectationFailure $ "FIND_NODE failed: " ++ err
+          Just (Right resp) -> do
+            DHTMsg.msgType resp `shouldBe` DHTMsg.FindNode
+            map DHTMsg.dhtPeerId (DHTMsg.msgCloserPeers resp)
+              `shouldContain` [peerIdBytes pidC]
+            concatMap DHTMsg.dhtPeerAddrs (DHTMsg.msgCloserPeers resp)
+              `shouldContain` [toBytes addrC]
+
+    it "three nodes: dialer learns a third peer via FIND_NODE, dials it, and pings it" $ do
+      -- A full discovery walk over three real nodes: A asks B for C,
+      -- decodes C's address from the wire response, dials C, and pings.
+      withListeningNode $ \(_swC, pidC, addrC) ->
+        withConnectedPair $ \(swA, _pidA) (swB, pidB) _conn -> do
+          dhtB <- newDHTNode swB DHTServer
+          registerDHTHandler dhtB
+          dhtA <- newDHTNode swA DHTClient
+          now <- getCurrentTime
+          let entryC = BucketEntry pidC (peerIdToKey pidC) [addrC] now NotConnected
+          atomically $ modifyTVar' (dhtRoutingTable dhtB) (fst . insertPeer entryC)
+          let request = DHTMsg.emptyDHTMessage
+                { DHTMsg.msgType = DHTMsg.FindNode
+                , DHTMsg.msgKey = peerIdBytes pidC
+                }
+          result <- timeout 10000000 $ dhtSendRequest dhtA pidB request
+          case result of
+            Nothing -> expectationFailure "FIND_NODE timed out"
+            Just (Left err) -> expectationFailure $ "FIND_NODE failed: " ++ err
+            Just (Right resp) -> do
+              let records = filter
+                    ((== peerIdBytes pidC) . DHTMsg.dhtPeerId)
+                    (DHTMsg.msgCloserPeers resp)
+                  learnedAddrs =
+                    decodePeerAddrs (concatMap DHTMsg.dhtPeerAddrs records)
+              learnedAddrs `shouldBe` [addrC]
+              dialResult <- timeout 10000000 $ dial swA pidC learnedAddrs
+              case dialResult of
+                Just (Right connC) -> do
+                  pingResult <- timeout 5000000 $ sendPing connC
+                  case pingResult of
+                    Just (Right (PingResult rtt)) -> rtt `shouldSatisfy` (> 0)
+                    other -> expectationFailure $
+                      "ping to discovered peer failed: " ++ show other
+                Just (Left err) -> expectationFailure $
+                  "dial to discovered peer failed: " ++ show err
+                Nothing ->
+                  expectationFailure "dial to discovered peer timed out"
+
+  describe "Concurrent streams over real TCP" $ do
+    it "4 concurrent streams echo distinct payloads larger than one noise frame" $ do
+      -- 66000 bytes exceeds the 65535-byte noise frame limit, so a single
+      -- stream write must be chunked across noise frames (#183) and
+      -- reassembled intact — on four streams at once.
+      withConnectedPair $ \_nodeA (swB, _pidB) conn -> do
+        let echoProto = "/libp2p-hs/test-echo/1.0.0"
+            payloadSize = 66000
+        setStreamHandler swB echoProto $ \_c stream -> do
+          payload <- readN stream payloadSize
+          streamWrite stream payload
+        result <- timeout 60000000 $
+          forConcurrently [0 .. 3 :: Int] $ \i -> do
+            stream <- muxOpenStream (connSession conn)
+            negotiated <- negotiateInitiator stream [echoProto]
+            negotiated `shouldBe` Accepted echoProto
+            let payload = BS.replicate payloadSize (fromIntegral (0x41 + i))
+            streamWrite stream payload
+            echoed <- readN stream payloadSize
+            pure (echoed == payload)
+        result `shouldBe` Just [True, True, True, True]
 
   describe "GossipSub over real TCP" $ do
     it "two nodes join topic, publish -> receive" $ do
