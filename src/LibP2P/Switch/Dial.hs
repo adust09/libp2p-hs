@@ -34,9 +34,11 @@ import Control.Concurrent.STM
   , putTMVar
   , readTMVar
   , readTVar
+  , tryPutTMVar
+  , writeTChan
   , writeTVar
   )
-import Control.Exception (SomeException)
+import Control.Exception (SomeException, finally, onException)
 import Control.Monad (forM, when)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
@@ -44,6 +46,7 @@ import Data.Time.Clock (NominalDiffTime, addUTCTime, getCurrentTime)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.Switch.ConnPool (addConn, lookupConn)
+import LibP2P.Switch.Connection (closeConnection)
 import LibP2P.Switch.Listen (streamAcceptLoop)
 import LibP2P.Switch.ResourceManager (Direction (..), releaseConnection, reserveConnection)
 import LibP2P.Switch.Types
@@ -52,6 +55,7 @@ import LibP2P.Switch.Types
   , DialError (..)
   , MuxerSession (..)
   , Switch (..)
+  , SwitchEvent (..)
   )
 import LibP2P.Switch.Upgrade (upgradeOutbound)
 import LibP2P.Transport (Transport (..))
@@ -149,8 +153,21 @@ dial sw remotePeerId addrs = do
                   -- Another thread is already dialing; wait for its result
                   atomically $ readTMVar tmvar
                 StartNew tmvar ->
-                  -- We own this dial; execute and broadcast result
+                  -- We own this dial; execute and broadcast result.
+                  -- If the dial throws, fill the TMVar and drop the
+                  -- pending entry so waiters and future dials never
+                  -- wedge on a stale pending dial.
                   dialNewAndBroadcast sw remotePeerId addrs tmvar
+                    `onException` abortPendingDial sw remotePeerId tmvar
+
+-- | Clean up a pending dial whose worker threw an exception.
+-- Fills the TMVar (if still empty) so joined waiters are released,
+-- and removes the pending map entry so future dials can proceed.
+abortPendingDial :: Switch -> PeerId -> TMVar (Either DialError Connection) -> IO ()
+abortPendingDial sw pid tmvar = atomically $ do
+  _ <- tryPutTMVar tmvar (Left (DialAllFailed ["dial aborted by exception"]))
+  pending <- readTVar (swPendingDials sw)
+  writeTVar (swPendingDials sw) (Map.delete pid pending)
 
 -- | Atomically check for an existing pending dial or create one.
 checkPendingDial :: Switch -> PeerId -> STM PendingCheck
@@ -197,9 +214,14 @@ dialNewAndBroadcast sw remotePeerId addrs tmvar = do
       case verified of
         Right conn -> do
           clearBackoff (swDialBackoffs sw) remotePeerId
-          atomically $ addConn (swConnPool sw) conn
-          -- Start accepting inbound streams on the dialer side
-          _ <- async $ streamAcceptLoop sw conn
+          atomically $ do
+            addConn (swConnPool sw) conn
+            writeTChan (swEvents sw)
+              (Connected (connPeerId conn) Outbound (connRemoteAddr conn))
+          -- Start accepting inbound streams on the dialer side; tear the
+          -- connection down when the session dies (pool removal,
+          -- resource release, muxer + transport close).
+          _ <- async $ streamAcceptLoop sw conn `finally` closeConnection sw conn
           -- Notify connection listeners (e.g. GossipSub auto-stream open)
           notifiers <- atomically $ readTVar (swNotifiers sw)
           mapM_ (\f -> async $ f conn) notifiers

@@ -24,9 +24,10 @@ module LibP2P.Switch.Upgrade
   , writeFramedMessage
   ) where
 
-import Control.Concurrent.Async (async)
-import Control.Concurrent.STM (newTVarIO)
-import Control.Monad (replicateM)
+import Control.Concurrent.Async (async, cancel, race, waitCatch)
+import Control.Concurrent.STM (atomically, isEmptyTQueue, newTVarIO, retry)
+import Control.Exception (SomeException, catch)
+import Control.Monad (replicateM, unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -39,7 +40,7 @@ import LibP2P.Yamux.Session (closeSession, newSession, recvLoop, sendLoop)
 import qualified LibP2P.Yamux.Session as Yamux
 import LibP2P.Yamux.Stream (streamRead)
 import qualified LibP2P.Yamux.Stream as YS
-import LibP2P.Yamux.Types (SessionRole (..), YamuxSession, YamuxStream)
+import LibP2P.Yamux.Types (SessionRole (..), YamuxSession (ysessSendCh), YamuxStream)
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
@@ -72,6 +73,7 @@ import LibP2P.Switch.Types
   , MuxerSession (..)
   )
 import LibP2P.Transport (RawConnection (..))
+import System.Timeout (timeout)
 import qualified LibP2P.Crypto.Protobuf as Proto
 import qualified LibP2P.Noise.Handshake as HS
 
@@ -260,15 +262,24 @@ decryptAndReadByte recvRef bufRef rawIO = do
       writeIORef bufRef (BS.tail buf)
       pure (BS.head buf)
 
+-- | Bounded window given to the send loop to flush the GoAway frame
+-- before the transport is closed underneath it.
+goAwayFlushTimeoutUs :: Int
+goAwayFlushTimeoutUs = 200000
+
 -- | Wrap a YamuxSession as a MuxerSession.
 -- Starts sendLoop and recvLoop as background threads.
 -- The MuxerSession provides open/accept stream operations that
 -- produce StreamIO-compatible streams.
-yamuxToMuxerSession :: YamuxSession -> IO MuxerSession
-yamuxToMuxerSession yamuxSess = do
+--
+-- The supplied close action closes the underlying transport; muxClose
+-- runs it after sending GoAway and stopping the session loops, so
+-- closing a connection actually releases the socket.
+yamuxToMuxerSession :: YamuxSession -> IO () -> IO MuxerSession
+yamuxToMuxerSession yamuxSess closeTransport = do
   -- Start background loops
-  _ <- async (sendLoop yamuxSess)
-  _ <- async (recvLoop yamuxSess)
+  sendLoopA <- async (sendLoop yamuxSess)
+  recvLoopA <- async (recvLoop yamuxSess)
   pure MuxerSession
     { muxOpenStream = do
         result <- Yamux.openStream yamuxSess
@@ -276,11 +287,25 @@ yamuxToMuxerSession yamuxSess = do
           Right stream -> yamuxStreamToStreamIO stream
           Left err -> fail $ "muxOpenStream: " <> show err
     , muxAcceptStream = do
-        result <- Yamux.acceptStream yamuxSess
+        -- Fail the accept as soon as the receive loop dies (remote
+        -- GoAway followed by EOF, transport error, or local close), so
+        -- the Switch's stream accept loop exits and tears down the
+        -- connection instead of blocking forever.
+        result <- race (waitCatch recvLoopA) (Yamux.acceptStream yamuxSess)
         case result of
-          Right stream -> yamuxStreamToStreamIO stream
-          Left err -> fail $ "muxAcceptStream: " <> show err
-    , muxClose = closeSession yamuxSess
+          Left _ -> fail "muxAcceptStream: session terminated"
+          Right (Right stream) -> yamuxStreamToStreamIO stream
+          Right (Left err) -> fail $ "muxAcceptStream: " <> show err
+    , muxClose = do
+        -- Queue GoAway, give the send loop a bounded window to flush
+        -- it, then stop the loops and close the underlying transport.
+        closeSession yamuxSess
+        _ <- timeout goAwayFlushTimeoutUs $ atomically $ do
+          empty <- isEmptyTQueue (ysessSendCh yamuxSess)
+          unless empty retry
+        cancel sendLoopA
+        cancel recvLoopA
+        closeTransport `catch` \(_ :: SomeException) -> pure ()
     }
 
 -- | Convert a YamuxStream to StreamIO with a read buffer.
@@ -348,7 +373,7 @@ upgradeOutbound identityKP rawConn = do
   let yamuxWrite = streamWrite encryptedIO
       yamuxRead  = \n -> readExact encryptedIO n
   yamuxSess <- newSession RoleClient yamuxWrite yamuxRead
-  muxer <- yamuxToMuxerSession yamuxSess
+  muxer <- yamuxToMuxerSession yamuxSess (rcClose rawConn)
 
   -- Build Connection
   stateVar <- newTVarIO ConnOpen
@@ -395,7 +420,7 @@ upgradeInbound identityKP rawConn = do
   let yamuxWrite = streamWrite encryptedIO
       yamuxRead  = \n -> readExact encryptedIO n
   yamuxSess <- newSession RoleServer yamuxWrite yamuxRead
-  muxer <- yamuxToMuxerSession yamuxSess
+  muxer <- yamuxToMuxerSession yamuxSess (rcClose rawConn)
 
   -- Build Connection
   stateVar <- newTVarIO ConnOpen
