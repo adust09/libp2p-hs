@@ -22,6 +22,7 @@ import LibP2P.Crypto.Key (KeyPair)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId)
+import LibP2P.Switch.Connection (closeAllConnections)
 import LibP2P.Switch.ResourceManager (DefaultLimits (..), defaultPeerLimits, defaultSystemLimits, newResourceManager)
 import LibP2P.Switch.Types (ActiveListener (..), StreamHandler, Switch (..))
 import LibP2P.Transport (Listener (..), Transport (..))
@@ -93,7 +94,8 @@ lookupStreamHandler sw proto = atomically $ do
   pure $ Map.lookup proto protos
 
 -- | Shut down the switch.
--- Cancels all accept loop threads, closes all listeners, then sets the closed flag.
+-- Cancels all accept loop threads, closes all listeners, tears down all
+-- pooled connections, then sets the closed flag.
 switchClose :: Switch -> IO ()
 switchClose sw = do
   -- Read and clear listeners atomically
@@ -104,6 +106,9 @@ switchClose sw = do
     pure ls
   -- Cancel accept loops and close listeners outside STM
   mapM_ closeListener listeners
+  -- Tear down every pooled connection (pool removal, resource release,
+  -- muxer close, transport close)
+  closeAllConnections sw
   where
     closeListener al = do
       cancel (alAcceptLoop al) `catch` (\(_ :: SomeException) -> pure ())

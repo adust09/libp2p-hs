@@ -30,6 +30,8 @@ module LibP2P.Switch.ResourceManager
   , releaseConnection
   , reserveStream
   , releaseStream
+  , reservePeerStream
+  , releasePeerStream
     -- * Bracket patterns
   , withConnection
   , withStream
@@ -190,6 +192,20 @@ reserveStream scope dir = reserveStreamInScope scope dir
 -- | Release a stream in the given scope (walks up to parent).
 releaseStream :: ResourceScope -> Direction -> STM ()
 releaseStream scope dir = releaseStreamInScope scope dir
+
+-- | Reserve a stream against a peer's scope (peer scope → system scope).
+reservePeerStream :: ResourceManager -> PeerId -> Direction -> STM (Either ResourceError ())
+reservePeerStream rm pid dir = do
+  peerScope <- getOrCreatePeerScope rm pid
+  reserveStream peerScope dir
+
+-- | Release a stream against a peer's scope (peer scope → system scope).
+releasePeerStream :: ResourceManager -> PeerId -> Direction -> STM ()
+releasePeerStream rm pid dir = do
+  peers <- readTVar (rmPeerScopes rm)
+  case Map.lookup pid peers of
+    Nothing -> pure ()
+    Just peerScope -> releaseStream peerScope dir
 
 -- | Bracket: reserve connection, run action, release on exit (even on exception).
 withConnection :: ResourceManager -> PeerId -> Direction -> IO a -> IO a

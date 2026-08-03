@@ -53,6 +53,7 @@ library
     LibP2P.Transport.TCP
     LibP2P.Switch.Types
     LibP2P.Switch.ConnPool
+    LibP2P.Switch.Connection
     LibP2P.Switch
     LibP2P.Switch.Dial
     LibP2P.Switch.Listen
@@ -143,6 +144,7 @@ test-suite libp2p-hs-test
     LibP2P.Yamux.SessionSpec
     LibP2P.Transport.TCPSpec
     LibP2P.Switch.ConnPoolSpec
+    LibP2P.Switch.ConnectionLifecycleSpec
     LibP2P.Switch.SwitchSpec
     LibP2P.Switch.DialSpec
     LibP2P.Switch.ListenSpec

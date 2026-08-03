@@ -45,7 +45,10 @@ module LibP2P
   , switchListenAddrs
   , switchClose
   , dial
+  , closeConnection
+  , newStream
   , DialError (..)
+  , ResourceError (..)
   , setStreamHandler
   , removeStreamHandler
   , StreamIO (..)
@@ -101,9 +104,10 @@ import LibP2P.Protocol.GossipSub.Handler
 import LibP2P.Protocol.GossipSub.Types (GossipSubParams (..), defaultGossipSubParams)
 import LibP2P.Protocol.Identify (registerIdentifyHandlers, requestIdentify)
 import LibP2P.Protocol.Ping (PingError (..), PingResult (..), registerPingHandler, sendPing)
+import LibP2P.Switch.Connection (closeConnection, newStream)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (ConnectionGater (..), defaultConnectionGater, switchListen, switchListenAddrs)
 import LibP2P.Switch (addTransport, newSwitch, removeStreamHandler, setStreamHandler, switchClose)
-import LibP2P.Switch.Types (Connection (..), DialError (..), StreamHandler, Switch)
+import LibP2P.Switch.Types (Connection (..), DialError (..), ResourceError (..), StreamHandler, Switch)
 import LibP2P.Transport.TCP (newTCPTransport)
 import LibP2P.Transport (Transport (..))

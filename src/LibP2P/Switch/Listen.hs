@@ -19,24 +19,31 @@ module LibP2P.Switch.Listen
   ) where
 
 import Control.Concurrent.Async (async)
-import Control.Concurrent.STM (atomically, readTVar, writeTVar)
-import Control.Exception (SomeException, catch)
+import Control.Concurrent.STM (atomically, readTVar, writeTChan, writeTVar)
+import Control.Exception (SomeException, catch, finally)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
-  , StreamIO
+  , StreamIO (..)
   , negotiateResponder
   )
 import LibP2P.Switch.ConnPool (addConn)
-import LibP2P.Switch.ResourceManager (Direction (..), reserveConnection)
+import LibP2P.Switch.Connection (closeConnection)
+import LibP2P.Switch.ResourceManager
+  ( Direction (..)
+  , releasePeerStream
+  , reserveConnection
+  , reservePeerStream
+  )
 import LibP2P.Switch.Types
   ( ActiveListener (..)
   , Connection (..)
   , MuxerSession (..)
   , Switch (..)
+  , SwitchEvent (..)
   )
 import LibP2P.Switch.Upgrade (upgradeInbound)
 import LibP2P.Transport (Listener (..), RawConnection (..), Transport (..))
@@ -80,13 +87,17 @@ handleInbound sw gater rawConn = do
           case resCheck of
             Left _ -> muxClose (connSession conn)
             Right () -> do
-              -- Add to connection pool
-              atomically $ addConn (swConnPool sw) conn
+              -- Add to connection pool and publish Connected event
+              atomically $ do
+                addConn (swConnPool sw) conn
+                writeTChan (swEvents sw)
+                  (Connected (connPeerId conn) Inbound (connRemoteAddr conn))
               -- Notify connection listeners (e.g. GossipSub auto-stream open)
               notifiers <- atomically $ readTVar (swNotifiers sw)
               mapM_ (\f -> async $ f conn) notifiers
-              -- Block on stream accept loop until connection closes
-              streamAcceptLoop sw conn
+              -- Block on stream accept loop until the session dies, then
+              -- tear down: pool removal, resource release, muxer close.
+              streamAcceptLoop sw conn `finally` closeConnection sw conn
 
 -- | Accept inbound streams and dispatch to registered protocol handlers.
 --
@@ -116,20 +127,31 @@ streamAcceptLoop sw conn = loop
 -- the remote peer wants, then looks up and invokes the registered handler.
 dispatchStream :: Switch -> Connection -> StreamIO -> IO ()
 dispatchStream sw conn stream = do
-  -- Get the list of supported protocols from the Switch
-  supportedProtos <- atomically $
-    Map.keys <$> readProtos
-  -- Run multistream-select responder
-  result <- negotiateResponder stream supportedProtos
-  case result of
-    Accepted proto -> do
-      -- Look up the handler for the negotiated protocol
-      mHandler <- lookupHandler proto
-      case mHandler of
-        Just handler -> handler stream (connPeerId conn)
-        Nothing -> pure ()  -- Should not happen: proto was in supported list
-    NoProtocol -> pure ()  -- No common protocol, stream will be closed
+  -- Reserve an inbound stream slot against the peer's resource scope
+  reserved <- atomically $
+    reservePeerStream (swResourceMgr sw) (connPeerId conn) Inbound
+  case reserved of
+    Left _ ->
+      -- Over the stream limit: refuse the stream without negotiating
+      streamClose stream `catch` \(_ :: SomeException) -> pure ()
+    Right () -> negotiateAndDispatch `finally` release
   where
+    release = atomically $
+      releasePeerStream (swResourceMgr sw) (connPeerId conn) Inbound
+    negotiateAndDispatch = do
+      -- Get the list of supported protocols from the Switch
+      supportedProtos <- atomically $
+        Map.keys <$> readProtos
+      -- Run multistream-select responder
+      result <- negotiateResponder stream supportedProtos
+      case result of
+        Accepted proto -> do
+          -- Look up the handler for the negotiated protocol
+          mHandler <- lookupHandler proto
+          case mHandler of
+            Just handler -> handler stream (connPeerId conn)
+            Nothing -> pure ()  -- Should not happen: proto was in supported list
+        NoProtocol -> pure ()  -- No common protocol, stream will be closed
     readProtos = readTVar (swProtocols sw)
     lookupHandler proto = atomically $
       Map.lookup proto <$> readTVar (swProtocols sw)
