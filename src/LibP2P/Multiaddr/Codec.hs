@@ -48,7 +48,6 @@ encodeProtocols = BS.concat . map encodeOne
     encodeAddress P2PCircuit = BS.empty
     encodeAddress WebTransport = BS.empty
     encodeAddress NoiseProto = BS.empty
-    encodeAddress YamuxProto = BS.empty
 
     encodeVarText :: Text -> ByteString
     encodeVarText t =
@@ -114,13 +113,12 @@ decodeProtocols bs
     buildVarProtocol _ _ = Nothing
 
     buildNoAddrProtocol :: Word64 -> Maybe Protocol
-    buildNoAddrProtocol 460 = Just QuicV1
+    buildNoAddrProtocol 461 = Just QuicV1
     buildNoAddrProtocol 477 = Just WS
     buildNoAddrProtocol 478 = Just WSS
     buildNoAddrProtocol 290 = Just P2PCircuit
     buildNoAddrProtocol 465 = Just WebTransport
     buildNoAddrProtocol 454 = Just NoiseProto
-    buildNoAddrProtocol 467 = Just YamuxProto
     buildNoAddrProtocol _ = Nothing
 
 -- | Convert a list of protocols to human-readable text form.
@@ -178,9 +176,12 @@ textToProtocols input
       "udp" -> withAddr rest $ \addr remaining -> do
         port <- parsePort addr
         Right (UDP port, remaining)
-      "p2p" -> withAddr rest $ \addr remaining -> do
-        mh <- parsePeerIdAddr addr
-        Right (P2P mh, remaining)
+      -- "ipfs" is the legacy name for "p2p"; both map to code 421 and are
+      -- equivalent in binary form. Rendering always emits "p2p".
+      _ | name == "p2p" || name == "ipfs" ->
+        withAddr rest $ \addr remaining -> do
+          mh <- parsePeerIdAddr addr
+          Right (P2P mh, remaining)
       "dns" -> withAddr rest $ \addr remaining ->
         Right (DNS addr, remaining)
       "dns4" -> withAddr rest $ \addr remaining ->
@@ -207,9 +208,6 @@ textToProtocols input
       "noise" -> do
         more <- parseParts rest
         Right (NoiseProto : more)
-      "yamux" -> do
-        more <- parseParts rest
-        Right (YamuxProto : more)
       other -> Left $ "textToProtocols: unknown protocol " <> T.unpack other
 
     withAddr :: [Text] -> (Text -> [Text] -> Either String (Protocol, [Text])) -> Either String [Protocol]
