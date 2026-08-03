@@ -1,7 +1,7 @@
 -- | Protocol definitions for multiaddr.
 --
 -- Each protocol has a numeric code and an address format.
--- See: https://github.com/multiformats/multicodec/blob/master/table.csv
+-- See: https://github.com/multiformats/multiaddr/blob/master/protocols.csv
 module LibP2P.Multiaddr.Protocol
   ( Protocol (..)
   , protocolCode
@@ -32,7 +32,6 @@ data Protocol
   | P2PCircuit         -- ^ Circuit relay marker (no address)
   | WebTransport       -- ^ WebTransport (no address)
   | NoiseProto         -- ^ Noise protocol marker (no address)
-  | YamuxProto         -- ^ Yamux protocol marker (no address)
   deriving (Show, Eq)
 
 -- | Address size specification for a protocol.
@@ -49,7 +48,7 @@ protocolCode (IP6 _) = 41
 protocolCode (TCP _) = 6
 protocolCode (UDP _) = 273
 protocolCode (P2P _) = 421
-protocolCode QuicV1 = 460
+protocolCode QuicV1 = 461
 protocolCode WS = 477
 protocolCode WSS = 478
 protocolCode (DNS _) = 53
@@ -59,7 +58,6 @@ protocolCode (DNSAddr _) = 56
 protocolCode P2PCircuit = 290
 protocolCode WebTransport = 465
 protocolCode NoiseProto = 454
-protocolCode YamuxProto = 467
 
 -- | Get the human-readable name for a protocol.
 protocolName :: Protocol -> Text
@@ -78,7 +76,6 @@ protocolName (DNSAddr _) = "dnsaddr"
 protocolName P2PCircuit = "p2p-circuit"
 protocolName WebTransport = "webtransport"
 protocolName NoiseProto = "noise"
-protocolName YamuxProto = "yamux"
 
 -- | Get the address size specification for a protocol code.
 protocolAddressSize :: Word64 -> Maybe AddressSize
@@ -87,7 +84,7 @@ protocolAddressSize 41 = Just (Fixed 16)      -- ip6
 protocolAddressSize 6 = Just (Fixed 2)        -- tcp
 protocolAddressSize 273 = Just (Fixed 2)      -- udp
 protocolAddressSize 421 = Just VarIntPrefixed -- p2p
-protocolAddressSize 460 = Just NoAddress      -- quic-v1
+protocolAddressSize 461 = Just NoAddress      -- quic-v1
 protocolAddressSize 477 = Just NoAddress      -- ws
 protocolAddressSize 478 = Just NoAddress      -- wss
 protocolAddressSize 53 = Just VarIntPrefixed  -- dns
@@ -97,7 +94,6 @@ protocolAddressSize 56 = Just VarIntPrefixed  -- dnsaddr
 protocolAddressSize 290 = Just NoAddress      -- p2p-circuit
 protocolAddressSize 465 = Just NoAddress      -- webtransport
 protocolAddressSize 454 = Just NoAddress      -- noise
-protocolAddressSize 467 = Just NoAddress      -- yamux
 protocolAddressSize _ = Nothing
 
 -- | Map protocol code to name (for text parsing).
@@ -107,7 +103,7 @@ codeToProtocolName 41 = Just "ip6"
 codeToProtocolName 6 = Just "tcp"
 codeToProtocolName 273 = Just "udp"
 codeToProtocolName 421 = Just "p2p"
-codeToProtocolName 460 = Just "quic-v1"
+codeToProtocolName 461 = Just "quic-v1"
 codeToProtocolName 477 = Just "ws"
 codeToProtocolName 478 = Just "wss"
 codeToProtocolName 53 = Just "dns"
@@ -117,5 +113,4 @@ codeToProtocolName 56 = Just "dnsaddr"
 codeToProtocolName 290 = Just "p2p-circuit"
 codeToProtocolName 465 = Just "webtransport"
 codeToProtocolName 454 = Just "noise"
-codeToProtocolName 467 = Just "yamux"
 codeToProtocolName _ = Nothing

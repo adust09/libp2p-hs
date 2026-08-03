@@ -1,7 +1,9 @@
 module LibP2P.Multiaddr.MultiaddrSpec (spec) where
 
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base58 as B58
 import Data.Text (Text)
+import qualified Data.Text.Encoding as TE
 import LibP2P.Core.Varint (encodeUvarint)
 import LibP2P.Crypto.PeerId (PeerId (..))
 import LibP2P.Multiaddr.Codec
@@ -19,9 +21,12 @@ spec = do
 
     it "encodes /ip4/198.51.100.0/udp/9090/quic-v1 to correct bytes" $ do
       let ps = [IP4 0xc6336400, UDP 9090, QuicV1]
-      -- 04 c6336400 9102 2382 cc03
+      -- 04 c6336400 9102 2382 cd03 (quic-v1 = 461 = varint cd 03)
       encodeProtocols ps
-        `shouldBe` BS.pack [0x04, 0xc6, 0x33, 0x64, 0x00, 0x91, 0x02, 0x23, 0x82, 0xcc, 0x03]
+        `shouldBe` BS.pack [0x04, 0xc6, 0x33, 0x64, 0x00, 0x91, 0x02, 0x23, 0x82, 0xcd, 0x03]
+
+    it "encodes quic-v1 as protocol code 461, not legacy quic 460" $
+      encodeProtocols [QuicV1] `shouldBe` encodeUvarint 461
 
     it "encodes zero-address protocols (ws, wss, p2p-circuit)" $ do
       let ps = [QuicV1, WS, P2PCircuit]
@@ -35,8 +40,14 @@ spec = do
       decodeProtocols bytes `shouldBe` Right [IP4 0x7f000001, TCP 4001]
 
     it "decodes /ip4/198.51.100.0/udp/9090/quic-v1 from bytes" $ do
-      let bytes = BS.pack [0x04, 0xc6, 0x33, 0x64, 0x00, 0x91, 0x02, 0x23, 0x82, 0xcc, 0x03]
+      let bytes = BS.pack [0x04, 0xc6, 0x33, 0x64, 0x00, 0x91, 0x02, 0x23, 0x82, 0xcd, 0x03]
       decodeProtocols bytes `shouldBe` Right [IP4 0xc6336400, UDP 9090, QuicV1]
+
+    it "does not decode legacy quic code 460 as quic-v1" $
+      decodeProtocols (encodeUvarint 460) `shouldNotBe` Right [QuicV1]
+
+    it "rejects unassigned code 467 (formerly used for yamux)" $
+      decodeProtocols (encodeUvarint 467) `shouldSatisfy` isLeft
 
     it "fails on empty input" $
       decodeProtocols BS.empty `shouldBe` Right []
@@ -85,6 +96,22 @@ spec = do
     it "parses /dns4/example.com/tcp/443/wss" $ do
       textToProtocols "/dns4/example.com/tcp/443/wss"
         `shouldBe` Right [DNS4 "example.com", TCP 443, WSS]
+
+    it "parses /ipfs/<peer-id> as the legacy alias of /p2p/<peer-id>" $ do
+      let mh = BS.pack $ [0x12, 0x20] <> replicate 32 0xAB
+      let b58 = TE.decodeUtf8 (B58.encode mh)
+      textToProtocols ("/ipfs/" <> b58) `shouldBe` Right [P2P mh]
+      textToProtocols ("/ipfs/" <> b58) `shouldBe` textToProtocols ("/p2p/" <> b58)
+
+    it "renders /ipfs input back as /p2p" $ do
+      let mh = BS.pack $ [0x12, 0x20] <> replicate 32 0xAB
+      let b58 = TE.decodeUtf8 (B58.encode mh)
+      case textToProtocols ("/ipfs/" <> b58) of
+        Right ps -> protocolsToText ps `shouldBe` ("/p2p/" <> b58)
+        Left err -> expectationFailure err
+
+    it "fails on /yamux (not a registered multiaddr protocol)" $
+      textToProtocols "/yamux" `shouldSatisfy` isLeft
 
     it "fails on invalid protocol name" $
       textToProtocols "/invalid/foo" `shouldSatisfy` isLeft
