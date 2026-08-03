@@ -27,7 +27,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Time (UTCTime, getCurrentTime)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
-import LibP2P.DHT (DHTNode (..), ProviderEntry (..), Validator (..))
+import LibP2P.DHT (DHTNode (..), ProviderEntry (..), Validator (..), decodePeerAddrs)
 import LibP2P.DHT.Distance (keyToDHTKey, peerIdToKey, sortByDistance)
 import LibP2P.DHT.Message
 import LibP2P.DHT.RoutingTable (closestPeers, insertPeer, allPeers)
@@ -391,11 +391,13 @@ bootstrap node seeds = do
 -- Helpers
 
 -- | Convert a DHTPeer to a BucketEntry (with current time).
+-- Per specs/kad-dht, multiaddrs carried by Peer records are decoded and
+-- kept so the learned peers can be dialled in follow-up queries.
 dhtPeerToEntry :: a -> DHTPeer -> BucketEntry
 dhtPeerToEntry _ peer = BucketEntry
   { entryPeerId   = PeerId (dhtPeerId peer)
   , entryKey      = peerIdToKey (PeerId (dhtPeerId peer))
-  , entryAddrs    = []  -- would need multiaddr decoding
+  , entryAddrs    = decodePeerAddrs (dhtPeerAddrs peer)
   , entryLastSeen = epochTime
   , entryConnType = dhtPeerConnType peer
   }
@@ -404,7 +406,7 @@ dhtPeerToEntry _ peer = BucketEntry
 dhtPeerToProvider :: DHTPeer -> ProviderEntry
 dhtPeerToProvider peer = ProviderEntry
   { peProvider  = PeerId (dhtPeerId peer)
-  , peAddrs     = []
+  , peAddrs     = decodePeerAddrs (dhtPeerAddrs peer)
   , peTimestamp = epochTime
   }
 
