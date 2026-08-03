@@ -87,7 +87,10 @@ handleReserve state stream peerId = do
   reservations <- readTVarIO (rsReservations state)
   let limit = rcMaxReservations (rsConfig state)
   if Map.size reservations >= limit
-    then sendHopStatus stream ResourceLimitExceeded
+    -- Per circuit-v2 spec, a reservation rejected because the relay is at
+    -- capacity is RESERVATION_REFUSED (200); RESOURCE_LIMIT_EXCEEDED (201)
+    -- is reserved for relayed-connection limits on CONNECT.
+    then sendHopStatus stream ReservationRefused
     else do
       -- Create reservation. Per circuit-v2 spec, Reservation.expire is an
       -- absolute UTC Unix time in seconds, not a duration.

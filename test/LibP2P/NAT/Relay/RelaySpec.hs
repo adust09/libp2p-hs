@@ -99,7 +99,7 @@ spec = do
           arExpiration ar `shouldSatisfy` (<= nowSecs + duration + 5)
         Nothing -> expectationFailure "Expected stored reservation for peer"
 
-    it "rejects reservation when max reservations exceeded" $ do
+    it "should refuse reservation with RESERVATION_REFUSED when max reservations exceeded" $ do
       let config = defaultRelayConfig { rcMaxReservations = 0 }
       relayState <- newRelayState config
       (clientStream, serverStream) <- mkStreamPair
@@ -114,13 +114,11 @@ spec = do
       result <- readHopMessage clientStream maxRelayMessageSize
       case result of
         Right resp -> do
-          -- The request must be refused: not OK and no reservation granted.
-          -- NOTE: circuit-v2.md assigns RESERVATION_REFUSED (200) to a
-          -- reservation rejected for capacity; the current implementation
-          -- returns RESOURCE_LIMIT_EXCEEDED (201). The exact status code is
-          -- tracked in #180, so this test only asserts refusal.
-          hopStatus resp `shouldNotBe` Just RelayOK
-          hopStatus resp `shouldNotBe` Nothing
+          -- circuit-v2.md assigns RESERVATION_REFUSED (200) to a reservation
+          -- rejected for capacity ("e.g. because there are too many
+          -- reservations"); RESOURCE_LIMIT_EXCEEDED (201) is reserved for
+          -- relayed-connection limits.
+          hopStatus resp `shouldBe` Just ReservationRefused
           hopReservation resp `shouldBe` Nothing
         Left err -> expectationFailure $ "Read failed: " ++ err
       -- No reservation may be stored for the refused peer
