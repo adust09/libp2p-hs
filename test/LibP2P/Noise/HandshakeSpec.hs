@@ -15,7 +15,19 @@ spec = do
   describe "Framing" $ do
     it "encodes with 2-byte BE length prefix" $ do
       let msg = BS.pack [0x01, 0x02, 0x03]
-      encodeFrame msg `shouldBe` BS.pack [0x00, 0x03, 0x01, 0x02, 0x03]
+      encodeFrame msg `shouldBe` Right (BS.pack [0x00, 0x03, 0x01, 0x02, 0x03])
+
+    it "accepts a message of exactly maxNoiseMessageSize bytes" $ do
+      let msg = BS.replicate maxNoiseMessageSize 0x42
+      case encodeFrame msg of
+        Right framed -> do
+          BS.length framed `shouldBe` maxNoiseMessageSize + 2
+          BS.take 2 framed `shouldBe` BS.pack [0xFF, 0xFF]
+        Left err -> expectationFailure err
+
+    it "rejects a message larger than maxNoiseMessageSize bytes" $ do
+      let msg = BS.replicate (maxNoiseMessageSize + 1) 0x42
+      encodeFrame msg `shouldSatisfy` isLeft
 
     it "decodes framed message" $ do
       let framed = BS.pack [0x00, 0x03, 0x01, 0x02, 0x03]
@@ -34,11 +46,36 @@ spec = do
 
     it "round-trip" $ do
       let msg = BS.replicate 100 0x42
-      case decodeFrame (encodeFrame msg) of
+      case encodeFrame msg >>= decodeFrame of
         Right (decoded, remaining) -> do
           decoded `shouldBe` msg
           remaining `shouldBe` BS.empty
         Left err -> expectationFailure err
+
+  describe "chunkPlaintext" $ do
+    it "keeps a small plaintext as a single chunk" $
+      chunkPlaintext (BS.replicate 100 0x01) `shouldBe` [BS.replicate 100 0x01]
+
+    it "keeps a plaintext of exactly maxNoisePlaintextSize as a single chunk" $ do
+      let msg = BS.replicate maxNoisePlaintextSize 0x01
+      chunkPlaintext msg `shouldBe` [msg]
+
+    it "splits a plaintext one byte over the limit into two chunks" $ do
+      let msg = BS.replicate (maxNoisePlaintextSize + 1) 0x01
+      map BS.length (chunkPlaintext msg) `shouldBe` [maxNoisePlaintextSize, 1]
+
+    it "splits a 70000-byte plaintext into spec-sized chunks that reassemble" $ do
+      let msg = BS.pack (take 70000 (cycle [0 .. 255]))
+          chunks = chunkPlaintext msg
+      map BS.length chunks `shouldBe` [maxNoisePlaintextSize, 70000 - maxNoisePlaintextSize]
+      BS.concat chunks `shouldBe` msg
+
+    it "yields a single empty chunk for empty input" $
+      chunkPlaintext BS.empty `shouldBe` [BS.empty]
+
+    it "every chunk plus the 16-byte AEAD tag fits in a Noise message" $ do
+      let msg = BS.replicate 200000 0x01
+      chunkPlaintext msg `shouldSatisfy` all (\c -> BS.length c + 16 <= maxNoiseMessageSize)
 
   describe "Static key signing" $ do
     it "signStaticKey produces verifiable signature" $ do
