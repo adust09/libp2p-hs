@@ -7,6 +7,7 @@ module LibP2P.DHT.DHTSpec
 
 import Test.Hspec
 
+import Control.Concurrent.Async (async, wait)
 import Control.Concurrent.STM
 import Crypto.Hash (Digest, SHA256, hash)
 import Data.ByteArray (convert)
@@ -21,9 +22,18 @@ import LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
 import LibP2P.DHT.Message
 import LibP2P.DHT.RoutingTable (insertPeer)
 import LibP2P.DHT.Types
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import LibP2P.Switch.Types (Switch (..))
+import LibP2P.Multiaddr (Multiaddr, fromText, toBytes)
+import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), negotiateResponder)
+import LibP2P.Switch.ConnPool (addConn)
+import LibP2P.Switch.Types
+  ( ConnState (..)
+  , Connection (..)
+  , Direction (..)
+  , MuxerSession (..)
+  , Switch (..)
+  )
 import LibP2P.Switch.ResourceManager (ResourceManager, newResourceManager, DefaultLimits (..), noLimits)
+import System.Timeout (timeout)
 
 -- | Helper: create a PeerId from raw bytes.
 mkPeerId :: BS.ByteString -> PeerId
@@ -87,22 +97,70 @@ dummyKeyPair = KeyPair
   (PublicKey Ed25519 (BS.replicate 32 0))
   (PrivateKey Ed25519 (BS.replicate 64 0))
 
--- | Create a stream pair for testing.
+-- | A test multiaddr for address propagation assertions.
+testAddr :: Multiaddr
+testAddr = either error id (fromText "/ip4/127.0.0.1/tcp/4001")
+
+-- | Create a stream pair for testing, with close/EOF support.
+-- Closing one end makes reads on the other end fail once the in-flight
+-- bytes are drained, mimicking a real muxer stream reaching EOF.
 mkStreamPair :: IO (StreamIO, StreamIO)
 mkStreamPair = do
-  q1 <- newTQueueIO :: IO (TQueue Word8)
-  q2 <- newTQueueIO :: IO (TQueue Word8)
-  let streamA = StreamIO
-        { streamWrite = \bs -> mapM_ (\b -> atomically (writeTQueue q1 b)) (BS.unpack bs)
-        , streamReadByte = atomically (readTQueue q2)
-        , streamClose = pure ()
+  q1 <- newTQueueIO :: IO (TQueue Word8)  -- A -> B
+  q2 <- newTQueueIO :: IO (TQueue Word8)  -- B -> A
+  closedAtoB <- newTVarIO False
+  closedBtoA <- newTVarIO False
+  let writeAll q bs = mapM_ (\b -> atomically (writeTQueue q b)) (BS.unpack bs)
+      readOrEOF q closedVar = atomically $ do
+        mb <- tryReadTQueue q
+        case mb of
+          Just b -> pure b
+          Nothing -> do
+            closed <- readTVar closedVar
+            if closed then throwSTM (userError "stream closed") else retry
+      streamA = StreamIO
+        { streamWrite = writeAll q1
+        , streamReadByte = readOrEOF q2 closedBtoA
+        , streamClose = atomically (writeTVar closedAtoB True)
         }
       streamB = StreamIO
-        { streamWrite = \bs -> mapM_ (\b -> atomically (writeTQueue q2 b)) (BS.unpack bs)
-        , streamReadByte = atomically (readTQueue q1)
-        , streamClose = pure ()
+        { streamWrite = writeAll q2
+        , streamReadByte = readOrEOF q1 closedAtoB
+        , streamClose = atomically (writeTVar closedBtoA True)
         }
   pure (streamA, streamB)
+
+-- | A mock Connection that hands out the given stream on the first
+-- muxOpenStream call and counts opens; later opens fail so tests can
+-- assert that the sender reuses one stream per peer.
+mkMockConnection :: PeerId -> StreamIO -> TVar Int -> IO Connection
+mkMockConnection pid stream openCountVar = do
+  stateVar <- newTVarIO ConnOpen
+  handedOut <- newTVarIO False
+  let openOnce = do
+        first <- atomically $ do
+          done <- readTVar handedOut
+          if done
+            then pure False
+            else do
+              writeTVar handedOut True
+              modifyTVar' openCountVar (+ 1)
+              pure True
+        if first then pure stream else fail "mock: stream already opened"
+  pure Connection
+    { connPeerId     = pid
+    , connDirection  = Outbound
+    , connLocalAddr  = testAddr
+    , connRemoteAddr = testAddr
+    , connSecurity   = "/noise"
+    , connMuxer      = "/yamux/1.0.0"
+    , connSession    = MuxerSession
+        { muxOpenStream   = openOnce
+        , muxAcceptStream = fail "mock: no inbound streams"
+        , muxClose        = pure ()
+        }
+    , connState      = stateVar
+    }
 
 spec :: Spec
 spec = do
@@ -121,6 +179,7 @@ spec = do
             , msgKey = BS.pack [42, 42, 42]
             }
       writeFramedMessage clientStream request
+      streamClose clientStream
       handleDHTRequest node serverStream remotePid
 
       result <- readFramedMessage clientStream maxDHTMessageSize
@@ -144,6 +203,7 @@ spec = do
             , msgKey = BS.pack [0xFF, 0xFF]
             }
       writeFramedMessage clientStream request
+      streamClose clientStream
       handleDHTRequest node serverStream remotePid
 
       result <- readFramedMessage clientStream maxDHTMessageSize
@@ -172,6 +232,7 @@ spec = do
       (clientStream, serverStream) <- mkStreamPair
       let request = emptyDHTMessage { msgType = FindNode, msgKey = wireKey }
       writeFramedMessage clientStream request
+      streamClose clientStream
       handleDHTRequest node serverStream remotePid
 
       result <- readFramedMessage clientStream maxDHTMessageSize
@@ -194,6 +255,7 @@ spec = do
       (clientStream, serverStream) <- mkStreamPair
       let request = emptyDHTMessage { msgType = GetValue, msgKey = wireKey }
       writeFramedMessage clientStream request
+      streamClose clientStream
       handleDHTRequest node serverStream remotePid
 
       result <- readFramedMessage clientStream maxDHTMessageSize
@@ -216,6 +278,7 @@ spec = do
       (clientStream, serverStream) <- mkStreamPair
       let request = emptyDHTMessage { msgType = GetProviders, msgKey = wireKey }
       writeFramedMessage clientStream request
+      streamClose clientStream
       handleDHTRequest node serverStream remotePid
 
       result <- readFramedMessage clientStream maxDHTMessageSize
@@ -232,6 +295,7 @@ spec = do
       (clientStream, serverStream) <- mkStreamPair
       let request = emptyDHTMessage { msgType = GetValue, msgKey = key }
       writeFramedMessage clientStream request
+      streamClose clientStream
       handleDHTRequest node serverStream remotePid
 
       result <- readFramedMessage clientStream maxDHTMessageSize
@@ -244,6 +308,7 @@ spec = do
       (clientStream, serverStream) <- mkStreamPair
       let request = emptyDHTMessage { msgType = GetValue, msgKey = BS.pack [1, 2, 3] }
       writeFramedMessage clientStream request
+      streamClose clientStream
       handleDHTRequest node serverStream remotePid
 
       result <- readFramedMessage clientStream maxDHTMessageSize
@@ -265,6 +330,7 @@ spec = do
             , msgRecord = Just rec
             }
       writeFramedMessage clientStream request
+      streamClose clientStream
       handleDHTRequest node serverStream remotePid
       _ <- readFramedMessage clientStream maxDHTMessageSize
 
@@ -283,6 +349,7 @@ spec = do
             , msgProviderPeers = [fakePeer]
             }
       writeFramedMessage clientStream request
+      streamClose clientStream
       handleDHTRequest node serverStream remotePid
 
       result <- readFramedMessage clientStream maxDHTMessageSize
@@ -307,6 +374,7 @@ spec = do
             , msgProviderPeers = [validPeer]
             }
       writeFramedMessage clientStream request
+      streamClose clientStream
       handleDHTRequest node serverStream remotePid
 
       result <- readFramedMessage clientStream maxDHTMessageSize
@@ -332,6 +400,7 @@ spec = do
             , msgProviderPeers = [validPeer]
             }
       writeFramedMessage clientStream1 addReq
+      streamClose clientStream1
       handleDHTRequest node serverStream1 remotePid
       _ <- readFramedMessage clientStream1 maxDHTMessageSize
 
@@ -342,6 +411,7 @@ spec = do
             , msgKey = key
             }
       writeFramedMessage clientStream2 getReq
+      streamClose clientStream2
       handleDHTRequest node serverStream2 remotePid
 
       result <- readFramedMessage clientStream2 maxDHTMessageSize
@@ -352,11 +422,149 @@ spec = do
           dhtPeerId (head (msgProviderPeers resp)) `shouldBe` peerIdBytes remotePid
         Left err -> expectationFailure $ "Failed: " ++ err
 
+    -- Issue #147: specs/kad-dht requires handling additional RPC request
+    -- messages on the same inbound stream — go-libp2p keeps one long-lived
+    -- stream per peer and pipelines requests over it.
+    it "serves multiple consecutive requests on a single stream" $ do
+      node <- mkTestNode localPid
+      let key = BS.pack [0xCA, 0xFE]
+          rec = DHTRecord key (BS.pack [0xDE, 0xAD]) "2024-01-01T00:00:00Z"
+      storeRecord node rec
+
+      (clientStream, serverStream) <- mkStreamPair
+      handler <- async (handleDHTRequest node serverStream remotePid)
+
+      writeFramedMessage clientStream
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [1] })
+      r1 <- timeout 2000000 (readFramedMessage clientStream maxDHTMessageSize)
+      case r1 of
+        Just (Right resp) -> msgType resp `shouldBe` FindNode
+        _ -> expectationFailure "no response to first request"
+
+      writeFramedMessage clientStream
+        (emptyDHTMessage { msgType = GetValue, msgKey = key })
+      r2 <- timeout 2000000 (readFramedMessage clientStream maxDHTMessageSize)
+      case r2 of
+        Just (Right resp) -> msgRecord resp `shouldBe` Just rec
+        _ -> expectationFailure
+               "handler did not serve a second request on the same stream"
+
+      streamClose clientStream
+      wait handler
+
+    -- Issue #147: Peer records must carry the peer's known multiaddrs so
+    -- the requester can dial them (go-libp2p filters address-less peers).
+    it "FIND_NODE returns closerPeers with their known multiaddrs" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let pid2 = mkPeerId (BS.pack [2])
+          entry = BucketEntry pid2 (peerIdToKey pid2) [testAddr] now Connected
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        fst (insertPeer entry rt)
+
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [42] }
+      writeFramedMessage clientStream request
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid
+
+      result <- readFramedMessage clientStream maxDHTMessageSize
+      case result of
+        Right resp -> map dhtPeerAddrs (msgCloserPeers resp)
+                        `shouldBe` [[toBytes testAddr]]
+        Left err -> expectationFailure $ "Failed: " ++ err
+
+    it "GET_PROVIDERS returns provider peers with their multiaddrs" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let key = BS.pack [0xAB]
+      addProvider node key (ProviderEntry (mkPeerId (BS.pack [7])) [testAddr] now)
+
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage { msgType = GetProviders, msgKey = key }
+      writeFramedMessage clientStream request
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid
+
+      result <- readFramedMessage clientStream maxDHTMessageSize
+      case result of
+        Right resp -> map dhtPeerAddrs (msgProviderPeers resp)
+                        `shouldBe` [[toBytes testAddr]]
+        Left err -> expectationFailure $ "Failed: " ++ err
+
+    it "ADD_PROVIDER decodes provider multiaddrs into the provider store" $ do
+      node <- mkTestNode localPid
+      let key = BS.pack [0xAA, 0xCC]
+          validPeer = DHTPeer (peerIdBytes remotePid) [toBytes testAddr] Connected
+
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage
+            { msgType = AddProvider
+            , msgKey = key
+            , msgProviderPeers = [validPeer]
+            }
+      writeFramedMessage clientStream request
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid
+
+      stored <- getProviders node key
+      map peAddrs stored `shouldBe` [[testAddr]]
+
     it "registerDHTHandler registers protocol on Switch" $ do
       node <- mkTestNode localPid
       registerDHTHandler node
       protos <- readTVarIO (swProtocols (dhtSwitch node))
       Map.member dhtProtocolId protos `shouldBe` True
+
+  -- Issue #168: newDHTNode must wire an outbound sender that opens a
+  -- /ipfs/kad/1.0.0 stream via the Switch. Previously the default sender
+  -- was a permanent failure and only a test mock ever assigned the field.
+  describe "dhtSendRequest (production wiring)" $ do
+    it "opens a stream via the Switch, negotiates the protocol, and exchanges framed messages, reusing the stream" $ do
+      clientNode <- mkTestNode localPid
+      serverNode <- mkTestNode remotePid
+      (clientEnd, serverEnd) <- mkStreamPair
+      openCountVar <- newTVarIO (0 :: Int)
+      conn <- mkMockConnection remotePid clientEnd openCountVar
+      atomically $ addConn (swConnPool (dhtSwitch clientNode)) conn
+
+      -- Remote side: multistream-select responder, then the DHT handler.
+      server <- async $ do
+        _ <- negotiateResponder serverEnd [dhtProtocolId]
+        handleDHTRequest serverNode serverEnd localPid
+
+      let req1 = emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [42] }
+      r1 <- timeout 2000000 (dhtSendRequest clientNode remotePid req1)
+      case r1 of
+        Just (Right resp) -> msgType resp `shouldBe` FindNode
+        Just (Left err) -> expectationFailure $ "send failed: " ++ err
+        Nothing -> expectationFailure "send timed out"
+
+      -- A second request must reuse the cached stream: the mock connection
+      -- only allows a single muxOpenStream call.
+      let key = BS.pack [0xCA]
+          rec = DHTRecord key (BS.pack [1]) "2024-01-01T00:00:00Z"
+      storeRecord serverNode rec
+      let req2 = emptyDHTMessage { msgType = GetValue, msgKey = key }
+      r2 <- timeout 2000000 (dhtSendRequest clientNode remotePid req2)
+      case r2 of
+        Just (Right resp) -> msgRecord resp `shouldBe` Just rec
+        Just (Left err) -> expectationFailure $ "second send failed: " ++ err
+        Nothing -> expectationFailure "second send timed out"
+
+      opens <- readTVarIO openCountVar
+      opens `shouldBe` 1
+
+      streamClose clientEnd
+      wait server
+
+    it "fails with Left when there is no connection to the peer" $ do
+      node <- mkTestNode localPid
+      let request = emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [1] }
+      result <- dhtSendRequest node (mkPeerId (BS.pack [9])) request
+      case result of
+        Left _ -> pure ()
+        Right _ -> expectationFailure "expected failure without a connection"
 
   describe "Store operations" $ do
     it "storeRecord + lookupRecord round-trip" $ do
