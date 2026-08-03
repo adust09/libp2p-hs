@@ -1,8 +1,10 @@
 module LibP2P.Yamux.SessionSpec (spec) where
 
-import Control.Concurrent.Async (async, concurrently, concurrently_, withAsync)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (async, concurrently, concurrently_, wait, withAsync)
 import Control.Concurrent.STM
 import qualified Data.ByteString as BS
+import System.Timeout (timeout)
 import LibP2P.Yamux.Frame
 import LibP2P.Yamux.Session
 import LibP2P.Yamux.Stream (streamClose, streamRead, streamReset, streamWrite)
@@ -338,6 +340,165 @@ spec = do
               results <- mapM (\s -> streamRead s >>= \(Right d) -> pure d) streams
               mapM_ (\d -> BS.length d `shouldBe` 100) results
           )
+
+  describe "FIN handling in pre-established states (issue #142)" $ do
+    it "should signal EOF when Data-frame FIN arrives while stream is in SYNReceived" $ do
+      ((writeA, _readA), (writeB, readB)) <- mkMemoryTransportPair
+      server <- newSession RoleServer writeB readB
+      let synHdr =
+            YamuxHeader
+              { yhVersion = 0
+              , yhType = FrameData
+              , yhFlags = defaultFlags {flagSYN = True}
+              , yhStreamId = 1
+              , yhLength = 0
+              }
+          dataHdr =
+            YamuxHeader
+              { yhVersion = 0
+              , yhType = FrameData
+              , yhFlags = defaultFlags
+              , yhStreamId = 1
+              , yhLength = 5
+              }
+          finHdr =
+            YamuxHeader
+              { yhVersion = 0
+              , yhType = FrameData
+              , yhFlags = defaultFlags {flagFIN = True}
+              , yhStreamId = 1
+              , yhLength = 0
+              }
+      writeA (encodeHeader synHdr)
+      writeA (encodeHeader dataHdr)
+      writeA "hello"
+      writeA (encodeHeader finHdr)
+      withAsync (sendLoop server) $ \_ ->
+        withAsync (recvLoop server) $ \_ -> do
+          -- Let recvLoop process all frames before accepting, so the FIN
+          -- is handled while the stream is still in StreamSYNReceived
+          threadDelay 100000
+          result <- timeout 1000000 $ do
+            Right stream <- acceptStream server
+            Right received <- streamRead stream
+            received `shouldBe` "hello"
+            eof <- streamRead stream
+            eof `shouldBe` Left YamuxStreamClosed
+          result `shouldBe` Just ()
+
+    it "should signal EOF when WindowUpdate FIN arrives while stream is in SYNReceived (go-libp2p open pattern)" $ do
+      ((writeA, _readA), (writeB, readB)) <- mkMemoryTransportPair
+      server <- newSession RoleServer writeB readB
+      let synHdr =
+            YamuxHeader
+              { yhVersion = 0
+              , yhType = FrameWindowUpdate
+              , yhFlags = defaultFlags {flagSYN = True}
+              , yhStreamId = 1
+              , yhLength = 0
+              }
+          dataHdr =
+            YamuxHeader
+              { yhVersion = 0
+              , yhType = FrameData
+              , yhFlags = defaultFlags
+              , yhStreamId = 1
+              , yhLength = 5
+              }
+          finHdr =
+            YamuxHeader
+              { yhVersion = 0
+              , yhType = FrameWindowUpdate
+              , yhFlags = defaultFlags {flagFIN = True}
+              , yhStreamId = 1
+              , yhLength = 0
+              }
+      writeA (encodeHeader synHdr)
+      writeA (encodeHeader dataHdr)
+      writeA "hello"
+      writeA (encodeHeader finHdr)
+      withAsync (sendLoop server) $ \_ ->
+        withAsync (recvLoop server) $ \_ -> do
+          threadDelay 100000
+          result <- timeout 1000000 $ do
+            Right stream <- acceptStream server
+            Right received <- streamRead stream
+            received `shouldBe` "hello"
+            eof <- streamRead stream
+            eof `shouldBe` Left YamuxStreamClosed
+          result `shouldBe` Just ()
+
+    it "should transition SYNSent to RemoteClose when WindowUpdate FIN arrives" $ do
+      ((writeA, readA), (writeB, _readB)) <- mkMemoryTransportPair
+      client <- newSession RoleClient writeA readA
+      withAsync (sendLoop client) $ \_ ->
+        withAsync (recvLoop client) $ \_ -> do
+          Right stream <- openStream client
+          -- Remote half-closes with WindowUpdate+FIN before ACKing the SYN
+          let finHdr =
+                YamuxHeader
+                  { yhVersion = 0
+                  , yhType = FrameWindowUpdate
+                  , yhFlags = defaultFlags {flagFIN = True}
+                  , yhStreamId = 1
+                  , yhLength = 0
+                  }
+          writeB (encodeHeader finHdr)
+          result <- timeout 1000000 $ atomically $ do
+            st <- readTVar (ysState stream)
+            check (st == StreamRemoteClose)
+          result `shouldBe` Just ()
+
+  describe "Flow control: declared length validated before payload read (issue #143)" $ do
+    it "should reject a data frame declaring more than the recv window without reading its payload" $ do
+      ((writeA, _readA), (writeB, readB)) <- mkMemoryTransportPair
+      server <- newSession RoleServer writeB readB
+      let synHdr =
+            YamuxHeader
+              { yhVersion = 0
+              , yhType = FrameWindowUpdate
+              , yhFlags = defaultFlags {flagSYN = True}
+              , yhStreamId = 1
+              , yhLength = 0
+              }
+          -- Declares 1 MiB (> 256 KiB initial window); no payload bytes follow.
+          -- The violation must be detected on the header alone.
+          bigHdr =
+            YamuxHeader
+              { yhVersion = 0
+              , yhType = FrameData
+              , yhFlags = defaultFlags
+              , yhStreamId = 1
+              , yhLength = 1048576
+              }
+      writeA (encodeHeader synHdr)
+      writeA (encodeHeader bigHdr)
+      withAsync (sendLoop server) $ \_ ->
+        withAsync (recvLoop server) $ \recvA -> do
+          result <- timeout 1000000 $ do
+            atomically $ readTVar (ysessShutdown server) >>= check
+            -- The violation must also terminate the receive loop
+            wait recvA
+          result `shouldBe` Just ()
+
+    it "should reject a length of 0xFFFFFFFF on an unknown stream and stop the session" $ do
+      ((writeA, _readA), (writeB, readB)) <- mkMemoryTransportPair
+      server <- newSession RoleServer writeB readB
+      let hugeHdr =
+            YamuxHeader
+              { yhVersion = 0
+              , yhType = FrameData
+              , yhFlags = defaultFlags
+              , yhStreamId = 1
+              , yhLength = 0xFFFFFFFF
+              }
+      writeA (encodeHeader hugeHdr)
+      withAsync (sendLoop server) $ \_ ->
+        withAsync (recvLoop server) $ \recvA -> do
+          result <- timeout 1000000 $ do
+            atomically $ readTVar (ysessShutdown server) >>= check
+            wait recvA
+          result `shouldBe` Just ()
 
 -- | Read exactly n bytes from a stream by accumulating chunks.
 readAll :: YamuxStream -> Int -> IO BS.ByteString

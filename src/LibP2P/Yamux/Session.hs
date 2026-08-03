@@ -108,8 +108,13 @@ acceptStream sess = do
           , yhLength = 0
           }
   atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
-  -- Transition to Established
-  atomically $ writeTVar (ysState stream) StreamEstablished
+  -- Transition to Established only from SYNReceived. The remote may have
+  -- already half-closed (FIN) before we accepted; that state must survive.
+  atomically $ do
+    st <- readTVar (ysState stream)
+    case st of
+      StreamSYNReceived -> writeTVar (ysState stream) StreamEstablished
+      _ -> pure ()
   pure (Right stream)
 
 -- | Send a Ping and wait for the ACK response.
@@ -172,133 +177,174 @@ recvLoop sess = go
           if yhVersion hdr /= 0
             then pure () -- Protocol error
             else do
-              dispatchFrame sess hdr
-              go
+              continue <- dispatchFrame sess hdr
+              when continue go
 
 -- | Dispatch a decoded frame to the appropriate handler.
-dispatchFrame :: YamuxSession -> YamuxHeader -> IO ()
+-- Returns False when a fatal protocol error occurred and the receive
+-- loop must terminate (go-yamux treats these as session-fatal).
+dispatchFrame :: YamuxSession -> YamuxHeader -> IO Bool
 dispatchFrame sess hdr = case yhType hdr of
   FrameData -> handleDataFrame sess hdr
   FrameWindowUpdate -> handleWindowUpdate sess hdr
-  FramePing -> handlePing sess hdr
-  FrameGoAway -> handleGoAway sess hdr
+  FramePing -> handlePing sess hdr >> pure True
+  FrameGoAway -> handleGoAway sess hdr >> pure True
 
--- | Handle a Data frame: read payload, manage stream state, deliver data.
-handleDataFrame :: YamuxSession -> YamuxHeader -> IO ()
+-- | Handle a Data frame: validate declared length, read payload, manage
+-- stream state, deliver data. Returns False on fatal protocol error.
+handleDataFrame :: YamuxSession -> YamuxHeader -> IO Bool
 handleDataFrame sess hdr = do
-  -- Read payload
-  payload <-
-    if yhLength hdr > 0
-      then ysessRead sess (fromIntegral (yhLength hdr))
-      else pure BS.empty
   let sid = yhStreamId hdr
       flags = yhFlags hdr
-  -- Handle SYN flag: create new inbound stream (with parity + duplicate validation)
-  when (flagSYN flags) $ do
-    valid <- atomically $ validateInboundSYN sess sid
-    if not valid
-      then sendGoAway sess GoAwayProtocol
-      else do
-        stream <- newStream sess sid StreamSYNReceived
-        atomically $ do
-          modifyTVar' (ysessStreams sess) (Map.insert sid stream)
-          writeTQueue (ysessAcceptCh sess) stream
-  -- Handle ACK flag: transition SYNSent -> Established
-  when (flagACK flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
-    case mStream of
-      Just stream -> atomically $ do
-        st <- readTVar (ysState stream)
-        case st of
-          StreamSYNSent -> writeTVar (ysState stream) StreamEstablished
-          _ -> pure ()
-      Nothing -> pure ()
-  -- Deliver payload to stream buffer (with flow-control check)
-  when (BS.length payload > 0) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
-    case mStream of
-      Just stream -> do
-        let payloadLen = fromIntegral (BS.length payload)
-        overWindow <- atomically $ do
-          w <- readTVar (ysRecvWindow stream)
-          if w < payloadLen
-            then pure True
-            else do
-              writeTQueue (ysRecvBuf stream) payload
-              writeTVar (ysRecvWindow stream) (w - payloadLen)
-              pure False
-        when overWindow $ sendGoAway sess GoAwayProtocol
-      Nothing -> pure ()
-  -- Handle FIN flag
-  when (flagFIN flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
-    case mStream of
-      Just stream -> atomically $ do
-        st <- readTVar (ysState stream)
-        case st of
-          StreamEstablished -> writeTVar (ysState stream) StreamRemoteClose
-          StreamLocalClose -> writeTVar (ysState stream) StreamClosed
-          StreamSYNSent -> writeTVar (ysState stream) StreamRemoteClose
-          _ -> pure ()
-      Nothing -> pure ()
-  -- Handle RST flag
-  when (flagRST flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
-    case mStream of
-      Just stream -> atomically $ writeTVar (ysState stream) StreamReset
-      Nothing -> pure ()
+      declaredLen = yhLength hdr
+  -- Handle SYN first so the flow-control check below sees the new stream
+  synOk <-
+    if flagSYN flags
+      then acceptInboundSYN sess sid
+      else pure True
+  if not synOk
+    then do
+      sendGoAway sess GoAwayProtocol
+      pure False
+    else do
+      -- Flow control: validate the declared length against the receive
+      -- window BEFORE reading the payload off the transport. A frame that
+      -- overruns the window is a protocol error and must not cause the
+      -- session to buffer attacker-controlled amounts of memory.
+      reserved <- reserveRecvWindow sess sid declaredLen
+      if not reserved
+        then do
+          sendGoAway sess GoAwayProtocol
+          pure False
+        else do
+          payload <-
+            if declaredLen > 0
+              then ysessRead sess (fromIntegral declaredLen)
+              else pure BS.empty
+          -- Handle ACK flag: transition SYNSent -> Established
+          when (flagACK flags) $ handleAckFlag sess sid
+          -- Deliver payload to stream buffer (window already reserved)
+          when (BS.length payload > 0) $ do
+            mStream <- lookupStream sess sid
+            case mStream of
+              Just stream -> atomically $ writeTQueue (ysRecvBuf stream) payload
+              Nothing -> pure () -- unknown stream: discard
+          -- Handle FIN flag
+          when (flagFIN flags) $ applyRemoteFin sess sid
+          -- Handle RST flag
+          when (flagRST flags) $ applyRemoteRst sess sid
+          pure True
 
--- | Handle a WindowUpdate frame: update send window, manage stream lifecycle.
-handleWindowUpdate :: YamuxSession -> YamuxHeader -> IO ()
+-- | Handle a WindowUpdate frame: update send window, manage stream
+-- lifecycle. Returns False on fatal protocol error.
+handleWindowUpdate :: YamuxSession -> YamuxHeader -> IO Bool
 handleWindowUpdate sess hdr = do
   let sid = yhStreamId hdr
       flags = yhFlags hdr
       delta = yhLength hdr
   -- Handle SYN flag: create new inbound stream (with parity + duplicate validation)
-  when (flagSYN flags) $ do
-    valid <- atomically $ validateInboundSYN sess sid
-    if not valid
-      then sendGoAway sess GoAwayProtocol
-      else do
-        stream <- newStream sess sid StreamSYNReceived
-        atomically $ do
-          modifyTVar' (ysessStreams sess) (Map.insert sid stream)
-          writeTQueue (ysessAcceptCh sess) stream
-  -- Handle ACK flag
-  when (flagACK flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
-    case mStream of
-      Just stream -> atomically $ do
-        st <- readTVar (ysState stream)
-        case st of
-          StreamSYNSent -> writeTVar (ysState stream) StreamEstablished
-          _ -> pure ()
-      Nothing -> pure ()
-  -- Update send window
-  when (delta > 0) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
-    case mStream of
-      Just stream -> atomically $ do
-        w <- readTVar (ysSendWindow stream)
-        writeTVar (ysSendWindow stream) (w + delta)
-      Nothing -> pure ()
-  -- Handle FIN flag
-  when (flagFIN flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
-    case mStream of
-      Just stream -> atomically $ do
-        st <- readTVar (ysState stream)
-        case st of
-          StreamEstablished -> writeTVar (ysState stream) StreamRemoteClose
-          StreamLocalClose -> writeTVar (ysState stream) StreamClosed
-          _ -> pure ()
-      Nothing -> pure ()
-  -- Handle RST flag
-  when (flagRST flags) $ do
-    mStream <- atomically $ Map.lookup sid <$> readTVar (ysessStreams sess)
-    case mStream of
-      Just stream -> atomically $ writeTVar (ysState stream) StreamReset
-      Nothing -> pure ()
+  synOk <-
+    if flagSYN flags
+      then acceptInboundSYN sess sid
+      else pure True
+  if not synOk
+    then do
+      sendGoAway sess GoAwayProtocol
+      pure False
+    else do
+      -- Handle ACK flag
+      when (flagACK flags) $ handleAckFlag sess sid
+      -- Update send window
+      when (delta > 0) $ do
+        mStream <- lookupStream sess sid
+        case mStream of
+          Just stream -> atomically $ do
+            w <- readTVar (ysSendWindow stream)
+            writeTVar (ysSendWindow stream) (w + delta)
+          Nothing -> pure ()
+      -- Handle FIN flag
+      when (flagFIN flags) $ applyRemoteFin sess sid
+      -- Handle RST flag
+      when (flagRST flags) $ applyRemoteRst sess sid
+      pure True
+
+-- | Look up a stream by ID.
+lookupStream :: YamuxSession -> Word32 -> IO (Maybe YamuxStream)
+lookupStream sess sid = Map.lookup sid <$> readTVarIO (ysessStreams sess)
+
+-- | Validate and register an inbound SYN (parity + duplicate check).
+-- Returns False on protocol error; the caller sends GoAway and stops.
+acceptInboundSYN :: YamuxSession -> Word32 -> IO Bool
+acceptInboundSYN sess sid = do
+  valid <- atomically $ validateInboundSYN sess sid
+  if not valid
+    then pure False
+    else do
+      stream <- newStream sess sid StreamSYNReceived
+      atomically $ do
+        modifyTVar' (ysessStreams sess) (Map.insert sid stream)
+        writeTQueue (ysessAcceptCh sess) stream
+      pure True
+
+-- | Reserve receive window for a declared Data-frame length before the
+-- payload is read off the transport. Returns False on a flow-control
+-- violation (declared length exceeds the stream's receive window or the
+-- absolute maxStreamWindowSize bound); the session must then terminate.
+reserveRecvWindow :: YamuxSession -> Word32 -> Word32 -> IO Bool
+reserveRecvWindow sess sid len
+  | len == 0 = pure True
+  | len > maxStreamWindowSize = pure False
+  | otherwise = atomically $ do
+      streams <- readTVar (ysessStreams sess)
+      case Map.lookup sid streams of
+        -- Unknown stream: payload is read and discarded, bounded by the
+        -- maxStreamWindowSize check above (defence in depth)
+        Nothing -> pure True
+        Just stream -> do
+          w <- readTVar (ysRecvWindow stream)
+          if len > w
+            then pure False
+            else do
+              writeTVar (ysRecvWindow stream) (w - len)
+              pure True
+
+-- | ACK flag: transition SYNSent -> Established.
+handleAckFlag :: YamuxSession -> Word32 -> IO ()
+handleAckFlag sess sid = do
+  mStream <- lookupStream sess sid
+  case mStream of
+    Just stream -> atomically $ do
+      st <- readTVar (ysState stream)
+      case st of
+        StreamSYNSent -> writeTVar (ysState stream) StreamEstablished
+        _ -> pure ()
+    Nothing -> pure ()
+
+-- | Shared FIN transition (spec.md, Closing a stream). The remote may
+-- half-close from any pre-close state: nothing in the spec ties FIN to
+-- the local ACK state, and go-libp2p pipelines SYN, data and FIN in one
+-- burst, so SYNSent/SYNReceived must transition like Established.
+applyRemoteFin :: YamuxSession -> Word32 -> IO ()
+applyRemoteFin sess sid = do
+  mStream <- lookupStream sess sid
+  case mStream of
+    Just stream -> atomically $ do
+      st <- readTVar (ysState stream)
+      case st of
+        StreamSYNSent -> writeTVar (ysState stream) StreamRemoteClose
+        StreamSYNReceived -> writeTVar (ysState stream) StreamRemoteClose
+        StreamEstablished -> writeTVar (ysState stream) StreamRemoteClose
+        StreamLocalClose -> writeTVar (ysState stream) StreamClosed
+        _ -> pure ()
+    Nothing -> pure ()
+
+-- | Shared RST transition: any state -> Reset.
+applyRemoteRst :: YamuxSession -> Word32 -> IO ()
+applyRemoteRst sess sid = do
+  mStream <- lookupStream sess sid
+  case mStream of
+    Just stream -> atomically $ writeTVar (ysState stream) StreamReset
+    Nothing -> pure ()
 
 -- | Handle a Ping frame (StreamID must be 0).
 -- SYN: echo back with ACK flag and same opaque value.
