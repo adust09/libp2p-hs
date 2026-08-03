@@ -3,11 +3,14 @@ module LibP2P.DHT.LookupSpec (spec) where
 import Test.Hspec
 
 import Control.Concurrent.STM
+import Control.Monad (unless)
+import Data.Bits ((.&.))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Time (getCurrentTime)
+import Data.Word (Word8)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT
 import LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
@@ -26,22 +29,131 @@ mkNodeWithMock pid mockSend = do
   node <- mkTestNode pid
   pure node { dhtSendRequest = mockSend }
 
--- | Create a mock network: a map from PeerId to their response function.
--- Each "node" returns closerPeers based on its local knowledge.
-type MockNetwork = Map.Map PeerId (DHTMessage -> DHTMessage)
+-- Issue #173: wire-level mock plumbing -----------------------------------
+--
+-- The old mocks were constant functions that never read the request, so a
+-- lookup could put any bytes in any field and every test stayed green.
+-- Every mock sender now behaves like a spec-conformant remote peer:
+--
+--   1. the outbound DHTMessage is serialized through the real
+--      uvarint-framed protobuf encoding (as it would go on the wire),
+--   2. the frame and the spec field tags for type/key are checked against
+--      hand-computed constants (independent of the implementation),
+--   3. the payload is re-parsed with the real decoder, and the handler
+--      answers based on the decoded request's type and key,
+--   4. the handler's response is delivered back through the same wire
+--      encoding, as the real dhtSendRequest would deliver it.
+--
+-- A wire-format regression in the request or response path now turns the
+-- lookup tests red instead of being invisible.
+
+-- | Spec enum value per request type, hand-transcribed from
+-- specs/kad-dht dht.proto. Deliberately NOT derived from the Haskell
+-- 'Enum' instance: reordering the constructors must fail here.
+specTypeCode :: MessageType -> Word8
+specTypeCode PutValue     = 0
+specTypeCode GetValue     = 1
+specTypeCode AddProvider  = 2
+specTypeCode GetProviders = 3
+specTypeCode FindNode     = 4
+
+-- | Minimal independent uvarint decoder (deliberately not
+-- 'LibP2P.Core.Varint', which the code under test uses).
+uvarint :: BS.ByteString -> Either String (Int, BS.ByteString)
+uvarint = go (0 :: Int) 0
+  where
+    go shift acc bs = case BS.uncons bs of
+      Nothing -> Left "mock: truncated uvarint"
+      Just (b, rest) ->
+        let acc' = acc + fromIntegral (b .&. 0x7F) * (2 ^ shift)
+        in if b < 0x80 then Right (acc', rest) else go (shift + 7) acc' rest
+
+-- | Decode an outbound request exactly as a remote peer would receive it.
+decodeWireRequest :: DHTMessage -> Either String DHTMessage
+decodeWireRequest msg = do
+  let framed = encodeFramed msg
+  (frameLen, body) <- uvarint framed
+  unless (BS.length body == frameLen) $
+    Left "mock: frame length prefix does not match payload length"
+  let key = msgKey msg
+  unless (not (BS.null key)) $
+    Left "mock: request carries no wire key"
+  -- Golden prefix, hand-computed from the protobuf spec: tag 0x08
+  -- (field 1, varint) + type code, then tag 0x12 (field 2,
+  -- length-delimited) + key length + key bytes. Request keys in these
+  -- tests are < 128 bytes, so the length fits a single varint byte.
+  let expectedPrefix =
+        BS.pack [0x08, specTypeCode (msgType msg), 0x12, fromIntegral (BS.length key)]
+          <> key
+  unless (BS.length key >= 128 || expectedPrefix `BS.isPrefixOf` body) $
+    Left "mock: request bytes do not carry spec field tags 1 (type) and 2 (key)"
+  decodeFramed maxDHTMessageSize framed
+
+-- | Deliver a handler's response the way the real sender would: encoded
+-- to the wire and parsed back. Non-empty peer lists must be encoded at
+-- the spec field numbers (closerPeers = 8, tag 0x42; providerPeers = 9,
+-- tag 0x4A) — a necessary condition that breaks encoder/decoder symmetry.
+deliverWireResponse :: DHTMessage -> Either String DHTMessage
+deliverWireResponse resp = do
+  let framed = encodeFramed resp
+  (frameLen, body) <- uvarint framed
+  unless (BS.length body == frameLen) $
+    Left "mock: response frame length prefix does not match payload length"
+  unless (null (msgCloserPeers resp) || BS.elem 0x42 body) $
+    Left "mock: closerPeers not encoded at spec field 8 (tag 0x42)"
+  unless (null (msgProviderPeers resp) || BS.elem 0x4A body) $
+    Left "mock: providerPeers not encoded at spec field 9 (tag 0x4A)"
+  decodeFramed maxDHTMessageSize framed
+
+-- | Create a mock network: a map from PeerId to their request handler.
+-- Handlers receive the request as decoded off the wire and may reject it.
+type MockNetwork = Map.Map PeerId (DHTMessage -> Either String DHTMessage)
 
 -- | Build a mock sendRequest from a MockNetwork.
---
--- Issue #173: mock senders must read the request rather than return a
--- canned constant. A query without a wire key would be a client-side bug
--- that a constant mock silently masks, so reject it like a real peer.
 mockSendFromNetwork :: MockNetwork -> PeerId -> DHTMessage -> IO (Either String DHTMessage)
-mockSendFromNetwork network pid msg
-  | BS.null (msgKey msg) = pure (Left "mock: request carries no wire key")
-  | otherwise =
-      case Map.lookup pid network of
-        Nothing -> pure (Left "peer not found in mock network")
-        Just handler -> pure (Right (handler msg))
+mockSendFromNetwork network pid msg = pure $ do
+  req <- decodeWireRequest msg
+  handler <- maybe (Left "peer not found in mock network") Right (Map.lookup pid network)
+  resp <- handler req
+  deliverWireResponse resp
+
+-- | Handler that validates the decoded request's type and wire key
+-- before answering. Anything unexpected fails the query, which the
+-- test then observes as missing peers/values.
+expecting :: MessageType -> BS.ByteString -> DHTMessage -> DHTMessage -> Either String DHTMessage
+expecting wantType wantKey resp = expectingOneOf wantType [wantKey] resp
+
+-- | Like 'expecting' but accepts any of several wire keys (bootstrap
+-- issues one lookup per bucket representative, each with its own key).
+expectingOneOf :: MessageType -> [BS.ByteString] -> DHTMessage -> DHTMessage -> Either String DHTMessage
+expectingOneOf wantType wantKeys resp req
+  | msgType req /= wantType =
+      Left $ "mock: expected " ++ show wantType ++ " request, got " ++ show (msgType req)
+  | msgKey req `notElem` wantKeys =
+      Left $ "mock: wrong wire key in " ++ show wantType ++ " request: " ++ show (BS.unpack (msgKey req))
+  | otherwise = Right resp
+
+-- | A FIND_NODE response carrying the given closer peers.
+findNodeReply :: [DHTPeer] -> DHTMessage
+findNodeReply closer = emptyDHTMessage { msgType = FindNode, msgCloserPeers = closer }
+
+-- | A mock sender that records something about each decoded request
+-- before responding; wire decoding failures propagate to the lookup.
+recordingSend
+  :: (PeerId -> DHTMessage -> IO ())        -- ^ observe the decoded request
+  -> (DHTMessage -> Either String DHTMessage) -- ^ answer it
+  -> PeerId -> DHTMessage -> IO (Either String DHTMessage)
+recordingSend observe respond pid msg =
+  case decodeWireRequest msg of
+    Left err -> pure (Left err)
+    Right req -> do
+      observe pid req
+      pure (respond req >>= deliverWireResponse)
+
+-- | Record the decoded wire key of each request into an IORef.
+recordKeys :: IORef [BS.ByteString] -> PeerId -> DHTMessage -> IO ()
+recordKeys ref _pid req =
+  atomicModifyIORef' ref (\ks -> (ks ++ [msgKey req], ()))
 
 spec :: Spec
 spec = do
@@ -53,9 +165,8 @@ spec = do
       now <- getCurrentTime
       sentKeysRef <- newIORef ([] :: [BS.ByteString])
       let targetPid = mkPeerId (BS.pack [42, 42, 42, 42])
-          mockSend _pid msg = do
-            atomicModifyIORef' sentKeysRef (\ks -> (ks ++ [msgKey msg], ()))
-            pure (Right (emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] }))
+          mockSend = recordingSend (recordKeys sentKeysRef)
+                                   (\_ -> Right (findNodeReply []))
       node <- mkNodeWithMock localPid mockSend
       let pidA = mkPeerId (BS.pack [10])
           entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
@@ -69,8 +180,10 @@ spec = do
 
     it "with local-only routing table returns local peers" $ do
       now <- getCurrentTime
-      -- Create node with some peers in routing table, no network
-      node <- mkNodeWithMock localPid (\_ _ -> pure (Left "no network"))
+      -- Node with peers in the routing table, all network queries fail —
+      -- but even a failing mock validates the request's wire format first.
+      node <- mkNodeWithMock localPid
+        (\_ msg -> pure (decodeWireRequest msg >> Left "no network"))
       let peers = [mkPeerId (BS.pack [i]) | i <- [2..6]]
           entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
@@ -88,20 +201,15 @@ spec = do
           pidB = mkPeerId (BS.pack [20])
           pidC = mkPeerId (BS.pack [30])
           targetPid = mkPeerId (BS.pack [42, 42, 42, 42])
-          -- Mock network: A returns B as closer, B returns C as closer
+          wantKey = peerIdBytes targetPid
+          -- Mock network: A returns B as closer, B returns C as closer.
+          -- Each hop checks the decoded request targets the right key.
           network = Map.fromList
-            [ (pidA, \_ -> emptyDHTMessage
-                { msgType = FindNode
-                , msgCloserPeers = [DHTPeer (peerIdBytes pidB) [] NotConnected]
-                })
-            , (pidB, \_ -> emptyDHTMessage
-                { msgType = FindNode
-                , msgCloserPeers = [DHTPeer (peerIdBytes pidC) [] NotConnected]
-                })
-            , (pidC, \_ -> emptyDHTMessage
-                { msgType = FindNode
-                , msgCloserPeers = []  -- terminus
-                })
+            [ (pidA, expecting FindNode wantKey
+                (findNodeReply [DHTPeer (peerIdBytes pidB) [] NotConnected]))
+            , (pidB, expecting FindNode wantKey
+                (findNodeReply [DHTPeer (peerIdBytes pidC) [] NotConnected]))
+            , (pidC, expecting FindNode wantKey (findNodeReply []))  -- terminus
             ]
       node <- mkNodeWithMock localPid (mockSendFromNetwork network)
       -- Seed routing table with A
@@ -119,22 +227,24 @@ spec = do
     it "terminates when all k-closest queried" $ do
       now <- getCurrentTime
       -- All peers return empty closerPeers → terminates after querying seeds
-      let peers = [mkPeerId (BS.pack [i]) | i <- [2..6]]
+      let targetPid = mkPeerId (BS.pack [0xFF, 0xFF])
+          peers = [mkPeerId (BS.pack [i]) | i <- [2..6]]
           network = Map.fromList
-            [(pid, \_ -> emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] })
+            [(pid, expecting FindNode (peerIdBytes targetPid) (findNodeReply []))
             | pid <- peers]
       node <- mkNodeWithMock localPid (mockSendFromNetwork network)
       let entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
         foldl (\r e -> fst (insertPeer e r)) rt entries
 
-      result <- iterativeFindNode node (mkPeerId (BS.pack [0xFF, 0xFF]))
+      result <- iterativeFindNode node targetPid
       length result `shouldBe` length peers
 
     it "handles query failures gracefully" $ do
       now <- getCurrentTime
-      -- All queries fail
-      node <- mkNodeWithMock localPid (\_ _ -> pure (Left "connection refused"))
+      -- All queries fail (after wire-format validation)
+      node <- mkNodeWithMock localPid
+        (\_ msg -> pure (decodeWireRequest msg >> Left "connection refused"))
       let peers = [mkPeerId (BS.pack [i]) | i <- [2..4]]
           entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
@@ -147,16 +257,17 @@ spec = do
     it "terminates early when total peers < k" $ do
       now <- getCurrentTime
       -- Only 3 peers, all return empty
-      let peers = [mkPeerId (BS.pack [i]) | i <- [2..4]]
+      let targetPid = mkPeerId (BS.pack [99])
+          peers = [mkPeerId (BS.pack [i]) | i <- [2..4]]
           network = Map.fromList
-            [(pid, \_ -> emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] })
+            [(pid, expecting FindNode (peerIdBytes targetPid) (findNodeReply []))
             | pid <- peers]
       node <- mkNodeWithMock localPid (mockSendFromNetwork network)
       let entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
         foldl (\r e -> fst (insertPeer e r)) rt entries
 
-      result <- iterativeFindNode node (mkPeerId (BS.pack [99]))
+      result <- iterativeFindNode node targetPid
       length result `shouldBe` 3  -- only 3 peers total, less than k=20
 
     it "queries peers in XOR distance order, not lexicographic key order" $ do
@@ -175,10 +286,11 @@ spec = do
           sortedByDist = sortByDistance targetKey entries
           closestAlpha = Set.fromList $ map entryPeerId (take alphaValue sortedByDist)
 
-      -- Mock network: each peer returns empty but records query order
-      let mockSend pid _msg = do
-            atomicModifyIORef' queryOrderRef (\xs -> (xs ++ [pid], ()))
-            pure (Right (emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] }))
+      -- Mock network: each peer records the query order, then checks the
+      -- decoded request before returning an empty reply.
+      let mockSend = recordingSend
+            (\pid _req -> atomicModifyIORef' queryOrderRef (\xs -> (xs ++ [pid], ())))
+            (expecting FindNode (peerIdBytes targetPid) (findNodeReply []))
 
       node <- mkNodeWithMock localPid mockSend
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
@@ -200,11 +312,11 @@ spec = do
           targetKey = peerIdToKey targetPid
           entries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) peers
           expectedOrder = map entryPeerId (sortByDistance targetKey entries)
+          network = Map.fromList
+            [(pid, expecting FindNode (peerIdBytes targetPid) (findNodeReply []))
+            | pid <- peers]
 
-      let mockSend _pid _msg =
-            pure (Right (emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] }))
-
-      node <- mkNodeWithMock localPid mockSend
+      node <- mkNodeWithMock localPid (mockSendFromNetwork network)
       atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
         foldl (\r e -> fst (insertPeer e r)) rt entries
 
@@ -221,14 +333,11 @@ spec = do
           pidB = mkPeerId (BS.pack [20])
           addrB = either error id (fromText "/ip4/192.0.2.1/tcp/4001")
           targetPid = mkPeerId (BS.pack [42])
+          wantKey = peerIdBytes targetPid
           network = Map.fromList
-            [ (pidA, \_ -> emptyDHTMessage
-                { msgType = FindNode
-                , msgCloserPeers =
-                    [DHTPeer (peerIdBytes pidB) [toBytes addrB] NotConnected]
-                })
-            , (pidB, \_ -> emptyDHTMessage
-                { msgType = FindNode, msgCloserPeers = [] })
+            [ (pidA, expecting FindNode wantKey
+                (findNodeReply [DHTPeer (peerIdBytes pidB) [toBytes addrB] NotConnected]))
+            , (pidB, expecting FindNode wantKey (findNodeReply []))
             ]
       node <- mkNodeWithMock localPid (mockSendFromNetwork network)
       let entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
@@ -245,9 +354,8 @@ spec = do
       sentKeysRef <- newIORef ([] :: [BS.ByteString])
       let key = BS.pack [0xCA, 0xFE]
           record = DHTRecord key (BS.pack [0xDE, 0xAD]) "2024-01-01T00:00:00Z"
-          mockSend _pid msg = do
-            atomicModifyIORef' sentKeysRef (\ks -> (ks ++ [msgKey msg], ()))
-            pure (Right (emptyDHTMessage
+          mockSend = recordingSend (recordKeys sentKeysRef)
+            (\_ -> Right (emptyDHTMessage
               { msgType = GetValue, msgRecord = Just record, msgCloserPeers = [] }))
           validator = Validator (\_ _ -> Right ()) (\_ _ -> Right 0)
       node <- mkNodeWithMock localPid mockSend
@@ -267,15 +375,15 @@ spec = do
           key = BS.pack [0xCA, 0xFE]
           record = DHTRecord key (BS.pack [0xDE, 0xAD]) "2024-01-01T00:00:00Z"
           network = Map.fromList
-            [ (pidA, \_ -> emptyDHTMessage
+            [ (pidA, expecting GetValue key (emptyDHTMessage
                 { msgType = GetValue
                 , msgRecord = Just record
                 , msgCloserPeers = []
-                })
+                }))
             ]
           validator = Validator
             { valValidate = \_ _ -> Right ()
-            , valSelect = \_ vals -> Right 0  -- always pick first
+            , valSelect = \_ _vals -> Right 0  -- always pick first
             }
       node <- mkNodeWithMock localPid (mockSendFromNetwork network)
       let entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
@@ -285,33 +393,39 @@ spec = do
       result <- iterativeGetValue node validator key
       result `shouldBe` Right record
 
-    it "corrects outdated peers with PUT_VALUE" $ do
+    it "corrects outdated peers with PUT_VALUE carrying the best record" $ do
       now <- getCurrentTime
-      putCalls <- newTVarIO ([] :: [PeerId])
+      putCalls <- newTVarIO ([] :: [(PeerId, DHTMessage)])
       let pidA = mkPeerId (BS.pack [10])
           pidB = mkPeerId (BS.pack [20])
           key = BS.pack [0xCA, 0xFE]
           oldRecord = DHTRecord key (BS.pack [0x01]) "2024-01-01T00:00:00Z"
           newRecord = DHTRecord key (BS.pack [0x02]) "2024-06-01T00:00:00Z"
-          -- A has old value, B has new (better) value
+          -- A has old value (and must later accept the repair), B has new.
           network = Map.fromList
-            [ (pidA, \_ -> emptyDHTMessage
-                { msgType = GetValue
-                , msgRecord = Just oldRecord
-                , msgCloserPeers = [DHTPeer (peerIdBytes pidB) [] NotConnected]
-                })
-            , (pidB, \_ -> emptyDHTMessage
+            [ (pidA, \req -> case msgType req of
+                GetValue -> expecting GetValue key (emptyDHTMessage
+                  { msgType = GetValue
+                  , msgRecord = Just oldRecord
+                  , msgCloserPeers = [DHTPeer (peerIdBytes pidB) [] NotConnected]
+                  }) req
+                PutValue -> expecting PutValue key
+                  (emptyDHTMessage { msgType = PutValue, msgKey = key }) req
+                other -> Left $ "mock: unexpected request type " ++ show other)
+            , (pidB, expecting GetValue key (emptyDHTMessage
                 { msgType = GetValue
                 , msgRecord = Just newRecord
                 , msgCloserPeers = []
-                })
+                }))
             ]
-          -- Custom sender that also tracks PUT_VALUE calls
-          mockSend pid msg = do
-            case msgType msg of
-              PutValue -> atomically $ modifyTVar' putCalls (pid :)
-              _ -> pure ()
-            mockSendFromNetwork network pid msg
+          -- Custom sender that also captures decoded PUT_VALUE requests
+          mockSend pid msg = case decodeWireRequest msg of
+            Left err -> pure (Left err)
+            Right req -> do
+              case msgType req of
+                PutValue -> atomically $ modifyTVar' putCalls ((pid, req) :)
+                _ -> pure ()
+              mockSendFromNetwork network pid msg
           validator = Validator
             { valValidate = \_ _ -> Right ()
             , valSelect = \_ vals ->
@@ -327,9 +441,14 @@ spec = do
       case result of
         Right rec -> recValue rec `shouldBe` BS.pack [0x02]
         Left err -> expectationFailure $ "Expected value, got: " ++ err
-      -- Verify PUT_VALUE was sent to peer A (outdated)
+      -- The repair PUT_VALUE must go to peer A (outdated) and carry the
+      -- winning record under the same key, as decoded off the wire.
       puts <- readTVarIO putCalls
-      puts `shouldSatisfy` (\ps -> pidA `elem` ps)
+      case lookup pidA puts of
+        Nothing -> expectationFailure "no PUT_VALUE repair sent to outdated peer A"
+        Just req -> do
+          msgKey req `shouldBe` key
+          msgRecord req `shouldBe` Just newRecord
 
     it "selects best value via Validator.select" $ do
       now <- getCurrentTime
@@ -339,16 +458,21 @@ spec = do
           recA = DHTRecord key (BS.pack [1]) "2024-01-01T00:00:00Z"
           recB = DHTRecord key (BS.pack [2]) "2024-06-01T00:00:00Z"
           network = Map.fromList
-            [ (pidA, \_ -> emptyDHTMessage
+            [ (pidA, expecting GetValue key (emptyDHTMessage
                 { msgType = GetValue
                 , msgRecord = Just recA
                 , msgCloserPeers = [DHTPeer (peerIdBytes pidB) [] NotConnected]
-                })
-            , (pidB, \_ -> emptyDHTMessage
-                { msgType = GetValue
-                , msgRecord = Just recB
-                , msgCloserPeers = []
-                })
+                }))
+            , (pidB, \req -> case msgType req of
+                GetValue -> expecting GetValue key (emptyDHTMessage
+                  { msgType = GetValue
+                  , msgRecord = Just recB
+                  , msgCloserPeers = []
+                  }) req
+                -- B returned the losing value, so it receives the repair.
+                PutValue -> expecting PutValue key
+                  (emptyDHTMessage { msgType = PutValue, msgKey = key }) req
+                other -> Left $ "mock: unexpected request type " ++ show other)
             ]
           -- Always select index 0 (first = current best)
           validator = Validator
@@ -371,9 +495,8 @@ spec = do
       now <- getCurrentTime
       sentKeysRef <- newIORef ([] :: [BS.ByteString])
       let key = BS.pack [0xDD, 0xEE, 0xFF]
-          mockSend _pid msg = do
-            atomicModifyIORef' sentKeysRef (\ks -> (ks ++ [msgKey msg], ()))
-            pure (Right (emptyDHTMessage
+          mockSend = recordingSend (recordKeys sentKeysRef)
+            (\_ -> Right (emptyDHTMessage
               { msgType = GetProviders, msgCloserPeers = [], msgProviderPeers = [] }))
       node <- mkNodeWithMock localPid mockSend
       let pidA = mkPeerId (BS.pack [10])
@@ -394,16 +517,16 @@ spec = do
           providerPeer1 = DHTPeer (BS.pack [50]) [] Connected
           providerPeer2 = DHTPeer (BS.pack [60]) [] Connected
           network = Map.fromList
-            [ (pidA, \_ -> emptyDHTMessage
+            [ (pidA, expecting GetProviders key (emptyDHTMessage
                 { msgType = GetProviders
                 , msgCloserPeers = [DHTPeer (peerIdBytes pidB) [] NotConnected]
                 , msgProviderPeers = [providerPeer1]
-                })
-            , (pidB, \_ -> emptyDHTMessage
+                }))
+            , (pidB, expecting GetProviders key (emptyDHTMessage
                 { msgType = GetProviders
                 , msgCloserPeers = []
                 , msgProviderPeers = [providerPeer2]
-                })
+                }))
             ]
       node <- mkNodeWithMock localPid (mockSendFromNetwork network)
       let entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
@@ -423,11 +546,11 @@ spec = do
           providerAddr = either error id (fromText "/ip4/192.0.2.7/tcp/4001")
           providerPeer = DHTPeer (BS.pack [50]) [toBytes providerAddr] Connected
           network = Map.fromList
-            [ (pidA, \_ -> emptyDHTMessage
+            [ (pidA, expecting GetProviders key (emptyDHTMessage
                 { msgType = GetProviders
                 , msgCloserPeers = []
                 , msgProviderPeers = [providerPeer]
-                })
+                }))
             ]
       node <- mkNodeWithMock localPid (mockSendFromNetwork network)
       let entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
@@ -441,9 +564,8 @@ spec = do
     it "self-lookup sends raw peer IDs as wire keys" $ do
       sentKeysRef <- newIORef ([] :: [BS.ByteString])
       let seedPid = mkPeerId (BS.pack [10])
-          mockSend _pid msg = do
-            atomicModifyIORef' sentKeysRef (\ks -> (ks ++ [msgKey msg], ()))
-            pure (Right (emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] }))
+          mockSend = recordingSend (recordKeys sentKeysRef)
+                                   (\_ -> Right (findNodeReply []))
       node <- mkNodeWithMock localPid mockSend
 
       bootstrap node [seedPid]
@@ -457,20 +579,20 @@ spec = do
             sentKeys
 
     it "performs self-lookup and populates nearby buckets" $ do
-      now <- getCurrentTime
       let seedPid = mkPeerId (BS.pack [10])
           pidB = mkPeerId (BS.pack [20])
           pidC = mkPeerId (BS.pack [30])
+          -- Bootstrap issues FIND_NODE for our own peer ID plus one per
+          -- bucket representative; every request must target one of them.
+          refreshKeys = map peerIdBytes [localPid, seedPid, pidB, pidC]
           -- Seed returns B and C as closer peers
           network = Map.fromList
-            [ (seedPid, \_ -> emptyDHTMessage
-                { msgType = FindNode
-                , msgCloserPeers = [ DHTPeer (peerIdBytes pidB) [] NotConnected
-                                   , DHTPeer (peerIdBytes pidC) [] NotConnected
-                                   ]
-                })
-            , (pidB, \_ -> emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] })
-            , (pidC, \_ -> emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] })
+            [ (seedPid, expectingOneOf FindNode refreshKeys
+                (findNodeReply [ DHTPeer (peerIdBytes pidB) [] NotConnected
+                               , DHTPeer (peerIdBytes pidC) [] NotConnected
+                               ]))
+            , (pidB, expectingOneOf FindNode refreshKeys (findNodeReply []))
+            , (pidC, expectingOneOf FindNode refreshKeys (findNodeReply []))
             ]
       node <- mkNodeWithMock localPid (mockSendFromNetwork network)
 
@@ -483,11 +605,11 @@ spec = do
       length allEntries `shouldSatisfy` (>= 1)
 
     it "bootstrap respects timeout (completes even with slow peers)" $ do
-      now <- getCurrentTime
       -- All queries return empty → bootstrap completes quickly
       let seedPid = mkPeerId (BS.pack [10])
           network = Map.fromList
-            [ (seedPid, \_ -> emptyDHTMessage { msgType = FindNode, msgCloserPeers = [] })
+            [ (seedPid, expectingOneOf FindNode
+                (map peerIdBytes [localPid, seedPid]) (findNodeReply []))
             ]
       node <- mkNodeWithMock localPid (mockSendFromNetwork network)
       -- This should complete without hanging

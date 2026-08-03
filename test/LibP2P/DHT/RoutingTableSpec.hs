@@ -225,8 +225,16 @@ spec = do
 -- Helpers
 
 -- | XOR distance as raw ByteString for sorting comparison.
+--
+-- Issue #173: this oracle used to silently truncate unequal-length
+-- operands, byte-for-byte mirroring the implementation's old truncation
+-- bug (#146). Keys are SHA-256 digests, so unequal lengths are always a
+-- test bug — fail loudly instead of reproducing the truncation.
 xorDist :: DHTKey -> DHTKey -> BS.ByteString
-xorDist (DHTKey a) (DHTKey b) = BS.pack (BS.zipWith xor a b)
+xorDist (DHTKey a) (DHTKey b)
+  | BS.length a /= BS.length b =
+      error "xorDist oracle: operands must be equal-length SHA-256 digests"
+  | otherwise = BS.pack (BS.zipWith xor a b)
 
 -- | Group entries by their bucket index relative to a self key.
 groupByBucket :: DHTKey -> [BucketEntry] -> [(Int, [BucketEntry])]
