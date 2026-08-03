@@ -9,6 +9,7 @@ module LibP2P.Protocol.GossipSub.Router
     -- * Peer management
   , addPeer
   , removePeer
+  , setPeerIP
     -- * Topic subscription
   , join
   , leave
@@ -29,16 +30,18 @@ module LibP2P.Protocol.GossipSub.Router
   , forwardMessage
     -- * Scoring
   , peerScore
+    -- * Peer exchange
+  , selectPXPeers
   ) where
 
 import Prelude
 import Control.Exception (throwIO)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Control.Concurrent.STM
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.Time (UTCTime, addUTCTime)
+import Data.Time (UTCTime, addUTCTime, diffUTCTime)
 import Data.Word (Word64)
 import Crypto.Random (getRandomBytes)
 import List.Shuffle (sampleIO)
@@ -47,7 +50,16 @@ import LibP2P.Crypto.Key (KeyPair (..), sign)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Protocol.GossipSub.Types
 import LibP2P.Protocol.GossipSub.MessageCache (newMessageCache, cachePut, cacheGet)
-import LibP2P.Protocol.GossipSub.Score (computeScore, addP7Penalty, recordMeshFailure, recordInvalidMessage)
+import LibP2P.Protocol.GossipSub.Score
+  ( computeScore
+  , addP7Penalty
+  , recordMeshFailure
+  , recordInvalidMessage
+  , recordFirstDelivery
+  , recordMeshDelivery
+  , markPeerInMesh
+  , unmarkPeerInMesh
+  )
 import LibP2P.Protocol.GossipSub.Validation (validateMessage, signingBytes)
 
 -- | Create a new GossipSub router with empty state.
@@ -69,6 +81,8 @@ newRouter params localPid sendRPC getTime = do
   hbCount  <- newTVarIO 0
   onMsg    <- newTVarIO (\_ _ -> pure ())
   validators <- newTVarIO Map.empty
+  promises <- newTVarIO Map.empty
+  onPX     <- newTVarIO (\_ _ -> pure ())
   pure GossipSubRouter
     { gsParams         = params
     , gsLocalPeerId    = localPid
@@ -82,12 +96,14 @@ newRouter params localPid sendRPC getTime = do
     , gsScoreParams    = defaultPeerScoreParams
     , gsThresholds     = defaultScoreThresholds
     , gsIPPeerCount    = ipCount
+    , gsIWantPromises  = promises
     , gsMessageCache   = mcache
     , gsHeartbeatCount = hbCount
     , gsSendRPC        = sendRPC
     , gsGetTime        = getTime
     , gsOnMessage      = onMsg
     , gsValidators     = validators
+    , gsOnPeerExchange = onPX
     }
 
 -- Topic validation
@@ -123,12 +139,44 @@ addPeer router pid proto isOutbound now = atomically $
         , psCachedScore     = 0
         } m
 
--- | Remove a disconnected peer and clean up mesh/fanout membership.
+-- | Remove a disconnected peer and clean up mesh/fanout membership,
+-- IP colocation tracking (P6) and outstanding IWANT promises.
 removePeer :: GossipSubRouter -> PeerId -> IO ()
 removePeer router pid = atomically $ do
+  peers <- readTVar (gsPeers router)
+  case Map.lookup pid peers >>= psIPAddress of
+    Just ip -> modifyTVar' (gsIPPeerCount router) (removeIPMember ip pid)
+    Nothing -> pure ()
   modifyTVar' (gsPeers router) (Map.delete pid)
   modifyTVar' (gsMesh router) (Map.map (Set.delete pid))
   modifyTVar' (gsFanout router) (Map.map (Set.delete pid))
+  modifyTVar' (gsIWantPromises router) $
+    Map.filterWithKey (\(p, _) _ -> p /= pid)
+
+-- | Record a peer's IP address for P6 (IP colocation) scoring.
+-- No-op for unknown peers; replaces any previously recorded address.
+setPeerIP :: GossipSubRouter -> PeerId -> ByteString -> IO ()
+setPeerIP router pid ip = atomically $ do
+  peers <- readTVar (gsPeers router)
+  case Map.lookup pid peers of
+    Nothing -> pure ()
+    Just ps -> do
+      case psIPAddress ps of
+        Just oldIp | oldIp /= ip ->
+          modifyTVar' (gsIPPeerCount router) (removeIPMember oldIp pid)
+        _ -> pure ()
+      modifyTVar' (gsPeers router) $
+        Map.insert pid ps { psIPAddress = Just ip }
+      modifyTVar' (gsIPPeerCount router) $
+        Map.insertWith Set.union ip (Set.singleton pid)
+
+-- | Drop a peer from an IP's membership set, deleting empty sets.
+removeIPMember :: ByteString -> PeerId
+               -> Map.Map ByteString (Set.Set PeerId)
+               -> Map.Map ByteString (Set.Set PeerId)
+removeIPMember ip pid = Map.update
+  (\s -> let s' = Set.delete pid s
+         in if Set.null s' then Nothing else Just s') ip
 
 -- Topic subscription
 
@@ -186,6 +234,11 @@ join router topic = do
   -- fanoutPeers was captured before the mesh insert; currentMesh already
   -- contains the promoted peers, so it must not be subtracted here (#155).
   let allNewMeshPeers = Set.union fanoutPeers newPeers
+  -- Start the P1 mesh clock for every peer entering the mesh (#156)
+  now <- gsGetTime router
+  atomically $ modifyTVar' (gsPeers router) $ \pm ->
+    Set.foldl' (\m pid -> Map.adjust (markPeerInMesh topic now) pid m)
+      pm allNewMeshPeers
   mapM_ (\pid -> gsSendRPC router pid (graftRPC topic)) (Set.toList allNewMeshPeers)
 
 -- | Unsubscribe from a topic (LEAVE): announce, PRUNE with backoff, delete mesh.
@@ -200,14 +253,21 @@ leave router topic = do
       unsubRPC = emptyRPC { rpcSubscriptions = [SubOpts False topic] }
   mapM_ (\pid -> gsSendRPC router pid unsubRPC) allPeerIds
 
-  -- 3. Send PRUNE with unsubscribe backoff to mesh peers, then delete
+  -- 3. Send PRUNE with unsubscribe backoff and peer exchange to mesh
+  -- peers, then delete (gossipsub-v1.1.md PRUNE peer exchange: help the
+  -- pruned peer re-form its mesh without a discovery service)
   meshPeers <- atomically $ do
     m <- readTVar (gsMesh router)
     let mp = Map.findWithDefault Set.empty topic m
     modifyTVar' (gsMesh router) (Map.delete topic)
     pure mp
   let backoffSecs = round (paramUnsubBackoff (gsParams router)) :: Word64
-  mapM_ (\pid -> gsSendRPC router pid (pruneRPC topic [] (Just backoffSecs))) (Set.toList meshPeers)
+  mapM_ (\pid -> do
+          atomically $ modifyTVar' (gsPeers router) $
+            Map.adjust (unmarkPeerInMesh topic) pid
+          px <- selectPXPeers router topic pid
+          gsSendRPC router pid (pruneRPC topic px (Just backoffSecs)))
+    (Set.toList meshPeers)
 
 -- Publishing
 
@@ -239,10 +299,15 @@ publish router topic payload mKeyPair = do
 
   if paramFloodPublish (gsParams router)
     then do
-      -- Flood publish: send to ALL peers in topic
+      -- Flood publish: send to all topic peers scoring at or above the
+      -- publish threshold (gossipsub-v1.1.md flood publishing)
       peers <- readTVarIO (gsPeers router)
-      let targets = Map.foldlWithKey' (\acc pid ps ->
-            if Set.member topic (psTopics ps) && pid /= gsLocalPeerId router
+      ipMap <- readTVarIO (gsIPPeerCount router)
+      let threshold = stPublishThreshold (gsThresholds router)
+          targets = Map.foldlWithKey' (\acc pid ps ->
+            if Set.member topic (psTopics ps)
+               && pid /= gsLocalPeerId router
+               && computeScore (gsScoreParams router) pid ps ipMap now >= threshold
             then pid : acc
             else acc) [] peers
       mapM_ (\pid -> gsSendRPC router pid pubRPC) targets
@@ -283,8 +348,18 @@ publish router topic payload mKeyPair = do
 -- Inbound RPC handling
 
 -- | Handle an inbound RPC from a peer.
+--
+-- Graylisted peers (score below 'stGraylistThreshold') have their RPCs
+-- ignored entirely (gossipsub-v1.1.md graylist).
 handleRPC :: GossipSubRouter -> PeerId -> RPC -> IO ()
 handleRPC router sender rpc = do
+  score <- peerScore router sender
+  if score < stGraylistThreshold (gsThresholds router)
+    then pure ()
+    else handleRPC' router sender rpc
+
+handleRPC' :: GossipSubRouter -> PeerId -> RPC -> IO ()
+handleRPC' router sender rpc = do
   -- Process subscriptions
   handleSubscriptions router sender (rpcSubscriptions rpc)
 
@@ -311,32 +386,81 @@ handlePublishedMessage router sender msg =
     Left _err -> rejectMessage router sender msg
     Right ()  -> do
       let msgId = paramMessageIdFn (gsParams router) msg
+          topic = msgTopic msg
       now <- gsGetTime router
 
-      -- Deduplicate
-      alreadySeen <- atomically $ do
+      -- Deduplicate, keeping the first-seen time for the P3 near-first window
+      mFirstSeen <- atomically $ do
         s <- readTVar (gsSeen router)
-        if Map.member msgId s
-          then pure True
-          else do
+        case Map.lookup msgId s of
+          Just firstSeen -> pure (Just firstSeen)
+          Nothing -> do
             writeTVar (gsSeen router) (Map.insert msgId now s)
-            pure False
+            pure Nothing
 
-      unless alreadySeen $ do
-        accepted <- runTopicValidator router sender msg
-        if not accepted
-          then rejectMessage router sender msg
-          else do
-            -- Cache the message for IWANT responses
-            atomically $ modifyTVar' (gsMessageCache router) $
-              cachePut msgId msg
+      -- A signature-valid delivery fulfils any outstanding IWANT promise
+      -- for this message ID (P7 promise tracking, gossipsub-v1.1.md)
+      atomically $ modifyTVar' (gsIWantPromises router) $
+        Map.filterWithKey (\(_, mid) _ -> mid /= msgId)
 
-            -- Forward to mesh peers (excluding sender)
-            forwardMessage router sender msg
+      case mFirstSeen of
+        Just firstSeen ->
+          -- Duplicate: count as a mesh delivery (P3) when the sender is
+          -- in our mesh and delivered within the near-first window
+          creditMeshDelivery router sender topic (Just (firstSeen, now))
+        Nothing -> do
+          accepted <- runTopicValidator router sender msg
+          if not accepted
+            then rejectMessage router sender msg
+            else do
+              -- First valid delivery: P2, plus P3 for mesh senders (#156)
+              creditFirstDelivery router sender topic
+              creditMeshDelivery router sender topic Nothing
 
-            -- Deliver to application
-            onMsg <- readTVarIO (gsOnMessage router)
-            onMsg (msgTopic msg) msg
+              -- Cache the message for IWANT responses
+              atomically $ modifyTVar' (gsMessageCache router) $
+                cachePut msgId msg
+
+              -- Forward to mesh peers (excluding sender)
+              forwardMessage router sender msg
+
+              -- Deliver to application
+              onMsg <- readTVarIO (gsOnMessage router)
+              onMsg (msgTopic msg) msg
+
+-- | Record a P2 first-message delivery for the sender.
+creditFirstDelivery :: GossipSubRouter -> PeerId -> Topic -> IO ()
+creditFirstDelivery router sender topic = atomically $
+  modifyTVar' (gsPeers router) $ Map.adjust bump sender
+  where
+    tsp = Map.findWithDefault defaultTopicScoreParams topic
+      (pspTopicParams (gsScoreParams router))
+    bump ps =
+      let tps = Map.findWithDefault defaultTopicPeerState topic (psTopicState ps)
+      in ps { psTopicState =
+                Map.insert topic (recordFirstDelivery tsp tps) (psTopicState ps) }
+
+-- | Record a P3 mesh delivery for a sender in our mesh. For duplicates,
+-- the delivery only counts inside the near-first window after the first
+-- sighting (gossipsub-v1.1.md mesh message delivery rate).
+creditMeshDelivery :: GossipSubRouter -> PeerId -> Topic
+                   -> Maybe (UTCTime, UTCTime) -> IO ()
+creditMeshDelivery router sender topic mWindow = do
+  meshMap <- readTVarIO (gsMesh router)
+  let inMesh = Set.member sender (Map.findWithDefault Set.empty topic meshMap)
+      tsp = Map.findWithDefault defaultTopicScoreParams topic
+        (pspTopicParams (gsScoreParams router))
+      withinWindow = case mWindow of
+        Nothing -> True
+        Just (firstSeen, now) ->
+          diffUTCTime now firstSeen <= tspMeshMessageDeliveryWindow tsp
+  when (inMesh && withinWindow) $ atomically $
+    modifyTVar' (gsPeers router) $ Map.adjust
+      (\ps ->
+        let tps = Map.findWithDefault defaultTopicPeerState topic (psTopicState ps)
+        in ps { psTopicState =
+                  Map.insert topic (recordMeshDelivery tsp tps) (psTopicState ps) })
+      sender
 
 -- | Run the topic validator, if one is registered. No validator means accept.
 runTopicValidator :: GossipSubRouter -> PeerId -> PubSubMessage -> IO Bool
@@ -378,7 +502,11 @@ handleOneGraft router sender now (Graft topic) = do
   let subscribed = Set.member topic subs
 
   if not subscribed
-    then pure [Prune topic [] Nothing]  -- Not subscribed → PRUNE
+    then
+      -- gossipsub-v1.1.md GRAFT flood protection: GRAFTs for unknown
+      -- topics are ignored — replying with PRUNE (the v1.0 behaviour)
+      -- lets an attacker elicit traffic with spam GRAFTs (#157).
+      pure []
     else do
       -- Check backoff
       backoffMap <- readTVarIO (gsBackoff router)
@@ -386,22 +514,33 @@ handleOneGraft router sender now (Graft topic) = do
             Nothing -> False
             Just expires -> now < expires
 
-      -- Check score (stub: always >= 0 in Phase 9a)
       score <- peerScore router sender
+
+      -- Any rejection PRUNEs with a fresh backoff and never includes
+      -- peer exchange (no PX for misbehaving or negative-score peers)
+      let backoffSecs = round (paramPruneBackoff (gsParams router)) :: Word64
+          rejectWithBackoff = do
+            atomically $ modifyTVar' (gsBackoff router) $
+              Map.insert (sender, topic)
+                (addUTCTime (paramPruneBackoff (gsParams router)) now)
+            pure [Prune topic [] (Just backoffSecs)]
 
       if inBackoff
         then do
-          -- P7 penalty: GRAFT during backoff is a protocol violation
+          -- GRAFT flood protection: re-GRAFTing inside the backoff window
+          -- is a protocol violation — penalise (P7) and prune with backoff
           atomically $ modifyTVar' (gsPeers router) $
             Map.adjust addP7Penalty sender
-          let backoffSecs = round (paramPruneBackoff (gsParams router)) :: Word64
-          pure [Prune topic [] (Just backoffSecs)]
+          rejectWithBackoff
         else if score < 0
-          then pure [Prune topic [] Nothing]
+          then rejectWithBackoff
           else do
-            -- Accept: add sender to mesh
-            atomically $ modifyTVar' (gsMesh router) $
-              Map.insertWith Set.union topic (Set.singleton sender)
+            -- Accept: add sender to mesh and start its P1 mesh clock
+            atomically $ do
+              modifyTVar' (gsMesh router) $
+                Map.insertWith Set.union topic (Set.singleton sender)
+              modifyTVar' (gsPeers router) $
+                Map.adjust (markPeerInMesh topic now) sender
             pure []
 
 -- | Handle PRUNE: remove from mesh and start backoff.
@@ -423,9 +562,12 @@ handleOnePrune router sender now prune = do
         in ps { psTopicState = Map.insert topic topicSt' (psTopicState ps) }
       ) sender
     Nothing -> pure ()
-  -- Remove sender from mesh
-  atomically $ modifyTVar' (gsMesh router) $
-    Map.adjust (Set.delete sender) topic
+  -- Remove sender from mesh and stop its P1 mesh clock
+  atomically $ do
+    modifyTVar' (gsMesh router) $
+      Map.adjust (Set.delete sender) topic
+    modifyTVar' (gsPeers router) $
+      Map.adjust (unmarkPeerInMesh topic) sender
   -- Start backoff timer
   let backoffDuration = case pruneBackoff prune of
         Just secs -> fromIntegral secs
@@ -433,26 +575,49 @@ handleOnePrune router sender now prune = do
       expires = addUTCTime backoffDuration now
   atomically $ modifyTVar' (gsBackoff router) $
     Map.insert (sender, topic) expires
+  -- Honour peer exchange, but only from peers whose score clears the
+  -- PX acceptance threshold (gossipsub-v1.1.md: PX from low-scoring
+  -- peers is an eclipse-attack vector)
+  unless (null (prunePeers prune)) $ do
+    score <- peerScore router sender
+    when (score >= stAcceptPXThreshold (gsThresholds router)) $ do
+      onPX <- readTVarIO (gsOnPeerExchange router)
+      onPX topic (prunePeers prune)
 
 -- | Handle IHAVE: request unseen messages via IWANT.
+--
+-- Gossip from peers below the gossip threshold is ignored
+-- (gossipsub-v1.1.md gossip threshold). One advertised-and-requested
+-- message ID is tracked as an IWANT promise: if the peer never delivers
+-- it before the follow-up deadline, it is a P7 behavioural violation.
 handleIHave :: GossipSubRouter -> PeerId -> [IHave] -> IO ()
 handleIHave router sender ihaves = do
-  seenMap <- readTVarIO (gsSeen router)
-  let unseen = concatMap (\(IHave _ mids) ->
-        filter (\mid -> not (Map.member mid seenMap)) mids) ihaves
-  unless (null unseen) $
-    gsSendRPC router sender emptyRPC
-      { rpcControl = Just emptyControlMessage { ctrlIWant = [IWant unseen] } }
+  score <- peerScore router sender
+  unless (score < stGossipThreshold (gsThresholds router) || null ihaves) $ do
+    seenMap <- readTVarIO (gsSeen router)
+    let unseen = concatMap (\(IHave _ mids) ->
+          filter (\mid -> not (Map.member mid seenMap)) mids) ihaves
+    unless (null unseen) $ do
+      now <- gsGetTime router
+      promised <- sampleIO 1 unseen
+      let deadline = addUTCTime (paramIWantFollowupTime (gsParams router)) now
+      atomically $ modifyTVar' (gsIWantPromises router) $ \m ->
+        foldr (\mid -> Map.insert (sender, mid) deadline) m promised
+      gsSendRPC router sender emptyRPC
+        { rpcControl = Just emptyControlMessage { ctrlIWant = [IWant unseen] } }
 
 -- | Handle IWANT: respond with cached messages from the message cache.
+-- Requests from peers below the gossip threshold are ignored.
 handleIWant :: GossipSubRouter -> PeerId -> [IWant] -> IO ()
 handleIWant router sender iwants = do
-  cache <- readTVarIO (gsMessageCache router)
-  let requestedIds = concatMap iwantMessageIds iwants
-      found = [ msg | mid <- requestedIds
-                     , Just msg <- [cacheGet mid cache] ]
-  unless (null found) $
-    gsSendRPC router sender emptyRPC { rpcPublish = found }
+  score <- peerScore router sender
+  unless (score < stGossipThreshold (gsThresholds router)) $ do
+    cache <- readTVarIO (gsMessageCache router)
+    let requestedIds = concatMap iwantMessageIds iwants
+        found = [ msg | mid <- requestedIds
+                       , Just msg <- [cacheGet mid cache] ]
+    unless (null found) $
+      gsSendRPC router sender emptyRPC { rpcPublish = found }
 
 -- | Handle subscription changes from a peer.
 handleSubscriptions :: GossipSubRouter -> PeerId -> [SubOpts] -> IO ()
@@ -483,8 +648,7 @@ forwardMessage router sender msg = do
 
 -- Scoring
 
--- | Compute peer score using Score.computeScore (P1-P4, P6, P7).
--- P5 (application-specific) is not included here.
+-- | Compute peer score using Score.computeScore (P1-P7).
 peerScore :: GossipSubRouter -> PeerId -> IO Double
 peerScore router pid = do
   peers <- readTVarIO (gsPeers router)
@@ -492,7 +656,27 @@ peerScore router pid = do
   ipMap <- readTVarIO (gsIPPeerCount router)
   case Map.lookup pid peers of
     Nothing -> pure 0
-    Just ps -> pure $ computeScore (gsScoreParams router) ps ipMap now
+    Just ps -> pure $ computeScore (gsScoreParams router) pid ps ipMap now
+
+-- Peer exchange
+
+-- | Select peer-exchange records for a PRUNE: up to 'paramPrunePeers'
+-- random peers subscribed to the topic with non-negative score,
+-- excluding the pruned peer itself (gossipsub-v1.1.md peer exchange).
+selectPXPeers :: GossipSubRouter -> Topic -> PeerId -> IO [PeerExchangeInfo]
+selectPXPeers router topic excluded = do
+  now <- gsGetTime router
+  peers <- readTVarIO (gsPeers router)
+  ipMap <- readTVarIO (gsIPPeerCount router)
+  let candidates =
+        [ pid | (pid, ps) <- Map.toList peers
+              , pid /= excluded
+              , pid /= gsLocalPeerId router
+              , Set.member topic (psTopics ps)
+              , computeScore (gsScoreParams router) pid ps ipMap now >= 0 ]
+  chosen <- sampleIO
+    (min (paramPrunePeers (gsParams router)) (length candidates)) candidates
+  pure [ PeerExchangeInfo (peerIdBytes pid) Nothing | pid <- chosen ]
 
 -- Helper: construct a GRAFT RPC
 graftRPC :: Topic -> RPC

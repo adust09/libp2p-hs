@@ -49,6 +49,9 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.Protocol.GossipSub.Heartbeat (runHeartbeat)
 import LibP2P.Protocol.GossipSub.Message (readRPCMessage, writeRPCMessage)
+import LibP2P.Core.Binary (word32BE)
+import LibP2P.Multiaddr (protocols)
+import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.Protocol.GossipSub.Router
   ( addPeer
   , handleRPC
@@ -57,6 +60,7 @@ import LibP2P.Protocol.GossipSub.Router
   , newRouter
   , publish
   , removePeer
+  , setPeerIP
   )
 import qualified Data.Set as Set
 import LibP2P.Protocol.GossipSub.Types
@@ -156,6 +160,16 @@ openAndNegotiate conn = do
     Accepted _ -> pure (Just stream)
     NoProtocol -> pure Nothing
 
+-- | Extract the remote IP bytes (4 for IPv4, 16 for IPv6) from a
+-- connection's multiaddr, for P6 IP colocation scoring.
+remoteIPBytes :: Connection -> Maybe ByteString
+remoteIPBytes conn = go (protocols (connRemoteAddr conn))
+  where
+    go (IP4 w  : _)   = Just (word32BE w)
+    go (IP6 bs : _)   = Just bs
+    go (_      : ps)  = go ps
+    go []             = Nothing
+
 -- | Try to send an RPC on a stream, catching exceptions.
 trySend :: StreamIO -> RPC -> IO (Either () ())
 trySend stream rpc =
@@ -166,11 +180,12 @@ trySend stream rpc =
 --
 -- Reads framed RPCs in a loop and dispatches each to the Router's handleRPC.
 -- On error or EOF, cleans up the peer's cached stream and removes the peer.
-handleGossipSubStream :: GossipSubNode -> StreamIO -> PeerId -> IO ()
-handleGossipSubStream node stream pid = do
-  -- Register peer with router
+handleGossipSubStream :: GossipSubNode -> StreamIO -> PeerId -> Maybe ByteString -> IO ()
+handleGossipSubStream node stream pid mIP = do
+  -- Register peer with router (IP feeds P6 colocation scoring)
   now <- getCurrentTime
   addPeer (gsnRouter node) pid GossipSubPeer False now
+  mapM_ (setPeerIP (gsnRouter node) pid) mIP
   -- Read loop
   readLoop
   -- Cleanup on disconnect
@@ -190,7 +205,8 @@ startGossipSub :: GossipSubNode -> IO ()
 startGossipSub node = do
   -- Register inbound stream handler on Switch
   setStreamHandler (gsnSwitch node) gossipSubProtocolId
-    (\conn stream -> handleGossipSubStream node stream (connPeerId conn))
+    (\conn stream ->
+      handleGossipSubStream node stream (connPeerId conn) (remoteIPBytes conn))
   -- Register connection notifier to auto-open GossipSub streams to new peers
   atomically $ modifyTVar' (swNotifiers (gsnSwitch node))
     (onNewConnection node :)
@@ -211,9 +227,10 @@ onNewConnection node conn = do
     Just stream -> do
       -- Cache the outbound stream
       atomically $ modifyTVar' (gsnStreams node) (Map.insert pid stream)
-      -- Register peer
+      -- Register peer (IP feeds P6 colocation scoring)
       now <- getCurrentTime
       addPeer (gsnRouter node) pid GossipSubPeer True now
+      mapM_ (setPeerIP (gsnRouter node) pid) (remoteIPBytes conn)
       -- Send current subscriptions to the new peer
       sendCurrentSubscriptions node stream
       -- Start read loop on this stream to receive RPCs from the peer

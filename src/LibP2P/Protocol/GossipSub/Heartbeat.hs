@@ -16,15 +16,25 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async)
 import Control.Concurrent.STM
 import Control.Monad (forM_, unless, when)
+import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import Data.Ord (Down (..))
 import Data.Time (UTCTime, addUTCTime, diffUTCTime)
 import Data.Word (Word64)
 import List.Shuffle (sampleIO)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Protocol.GossipSub.Types
 import LibP2P.Protocol.GossipSub.MessageCache (cacheGetGossipIds, cacheShift)
-import LibP2P.Protocol.GossipSub.Score (computeScore, decayPeerCounters)
+import LibP2P.Protocol.GossipSub.Router (selectPXPeers)
+import LibP2P.Protocol.GossipSub.Score
+  ( computeScore
+  , decayPeerCounters
+  , addP7Penalty
+  , refreshMeshTime
+  , markPeerInMesh
+  , unmarkPeerInMesh
+  )
 
 -- | Run a single heartbeat cycle. Exported for testing.
 heartbeatOnce :: GossipSubRouter -> IO ()
@@ -32,6 +42,7 @@ heartbeatOnce router = do
   meshMaintenance router
   fanoutMaintenance router
   emitGossip router
+  expireIWantPromises router
   decayAllScores router
   cleanSeenCache router
   -- Increment heartbeat counter
@@ -76,18 +87,21 @@ pruneNegativeScore router topic meshPeers now = do
   let negatives = Set.filter (\pid ->
         case Map.lookup pid peers of
           Nothing -> False
-          Just ps -> computeScore scoreParams ps ipMap now < 0
+          Just ps -> computeScore scoreParams pid ps ipMap now < 0
         ) meshPeers
-  -- Send PRUNE to negative-score peers
+  -- Send PRUNE to negative-score peers (no PX for negative-score peers)
   forM_ (Set.toList negatives) $ \pid -> do
     let backoffSecs = round (paramPruneBackoff (gsParams router)) :: Word64
     gsSendRPC router pid emptyRPC
       { rpcControl = Just emptyControlMessage
           { ctrlPrune = [Prune topic [] (Just backoffSecs)] }
       }
-    -- Start backoff
-    atomically $ modifyTVar' (gsBackoff router) $
-      Map.insert (pid, topic) (addUTCTime (paramPruneBackoff (gsParams router)) now)
+    -- Start backoff and stop the P1 mesh clock
+    atomically $ do
+      modifyTVar' (gsBackoff router) $
+        Map.insert (pid, topic) (addUTCTime (paramPruneBackoff (gsParams router)) now)
+      modifyTVar' (gsPeers router) $
+        Map.adjust (unmarkPeerInMesh topic) pid
   -- Update mesh
   let remaining = Set.difference meshPeers negatives
   atomically $ modifyTVar' (gsMesh router) $
@@ -111,7 +125,7 @@ fillUndersubscribed router topic meshPeers now = do
                            , Set.member topic (psTopics ps)
                            , not (Set.member pid meshPeers)
                            , not (isInBackoff backoffMap pid topic now)
-                           , computeScore (gsScoreParams router) ps ipMap now >= 0
+                           , computeScore (gsScoreParams router) pid ps ipMap now >= 0
                            ]
       let needed = d - Set.size meshPeers
       selected <- sampleIO (min needed (length eligible)) eligible
@@ -120,32 +134,63 @@ fillUndersubscribed router topic meshPeers now = do
         gsSendRPC router pid emptyRPC
           { rpcControl = Just emptyControlMessage { ctrlGraft = [Graft topic] } }
       let newMesh = Set.union meshPeers (Set.fromList selected)
-      atomically $ modifyTVar' (gsMesh router) $
-        Map.insert topic newMesh
+      atomically $ do
+        modifyTVar' (gsMesh router) $ Map.insert topic newMesh
+        -- Start the P1 mesh clock for the newly grafted peers
+        modifyTVar' (gsPeers router) $ \pm ->
+          foldl' (\m pid -> Map.adjust (markPeerInMesh topic now) pid m)
+            pm selected
       pure newMesh
 
--- | Trim mesh if above D_hi by randomly removing excess peers, send PRUNE.
+-- | Trim mesh if above D_hi down to D peers, send PRUNE with PX.
+--
+-- Per gossipsub-v1.1.md mesh maintenance: keep the best D_score peers by
+-- score, select the rest at random, under the constraint that at least
+-- D_out of the kept peers are outbound connections.
 trimOversubscribed :: GossipSubRouter -> Topic -> Set.Set PeerId -> IO ()
 trimOversubscribed router topic meshPeers = do
   let params = gsParams router
-      dhi = paramDhi params
-      d   = paramD params
+      dhi    = paramDhi params
+      d      = paramD params
+      dscore = paramDscore params
+      dout   = paramDout params
   when (Set.size meshPeers > dhi) $ do
     now <- gsGetTime router
-    -- Keep D peers: select D random peers to keep
-    let meshList = Set.toList meshPeers
-    kept <- sampleIO d meshList
-    let keptSet = Set.fromList kept
+    peersMap <- readTVarIO (gsPeers router)
+    ipMap <- readTVarIO (gsIPPeerCount router)
+    let scoreOf pid = case Map.lookup pid peersMap of
+          Nothing -> 0
+          Just ps -> computeScore (gsScoreParams router) pid ps ipMap now
+        isOutbound pid = maybe False psIsOutbound (Map.lookup pid peersMap)
+        ranked = sortOn (Down . scoreOf) (Set.toList meshPeers)
+        (best, rest) = splitAt (min dscore d) ranked
+    restKept <- sampleIO (max 0 (d - length best)) rest
+    -- keptList is ordered best-first: the score-retained peers, then the
+    -- random selection. D_out swaps drop from the tail first.
+    let keptList = best ++ restKept
+        kept0 = Set.fromList keptList
+        outDeficit = max 0 (dout - length (filter isOutbound keptList))
+        swapIn = take outDeficit
+          (filter (\p -> isOutbound p && not (Set.member p kept0)) ranked)
+        swapOut = take (length swapIn)
+          (filter (not . isOutbound) (reverse keptList))
+        keptSet = Set.union
+          (Set.difference kept0 (Set.fromList swapOut))
+          (Set.fromList swapIn)
         toRemove = Set.difference meshPeers keptSet
-    -- Send PRUNE to removed peers
+    -- Send PRUNE with peer exchange to removed peers
     forM_ (Set.toList toRemove) $ \pid -> do
       let backoffSecs = round (paramPruneBackoff params) :: Word64
+      px <- selectPXPeers router topic pid
       gsSendRPC router pid emptyRPC
         { rpcControl = Just emptyControlMessage
-            { ctrlPrune = [Prune topic [] (Just backoffSecs)] }
+            { ctrlPrune = [Prune topic px (Just backoffSecs)] }
         }
-      atomically $ modifyTVar' (gsBackoff router) $
-        Map.insert (pid, topic) (addUTCTime (paramPruneBackoff params) now)
+      atomically $ do
+        modifyTVar' (gsBackoff router) $
+          Map.insert (pid, topic) (addUTCTime (paramPruneBackoff params) now)
+        modifyTVar' (gsPeers router) $
+          Map.adjust (unmarkPeerInMesh topic) pid
     -- Update mesh
     atomically $ modifyTVar' (gsMesh router) $
       Map.insert topic keptSet
@@ -184,11 +229,13 @@ fanoutMaintenance router = do
 
 emitGossip :: GossipSubRouter -> IO ()
 emitGossip router = do
+  now <- gsGetTime router
   meshMap <- readTVarIO (gsMesh router)
   fanoutMap <- readTVarIO (gsFanout router)
   subs <- readTVarIO (gsSubscriptions router)
   cache <- readTVarIO (gsMessageCache router)
   peersMap <- readTVarIO (gsPeers router)
+  ipMap <- readTVarIO (gsIPPeerCount router)
   let params = gsParams router
       -- gossipsub-v1.0.md heartbeat: gossip covers "each topic in
       -- mesh+fanout", so topics we publish to without subscribing
@@ -201,10 +248,15 @@ emitGossip router = do
     let gossipIds = cacheGetGossipIds topic cache
     unless (null gossipIds) $ do
       let meshPeers = Map.findWithDefault Set.empty topic meshMap
-          -- Eligible: subscribed to topic, not in mesh
+          -- Eligible: subscribed to topic, not in mesh, and scoring at or
+          -- above the gossip threshold — no gossip is emitted towards
+          -- peers below it (gossipsub-v1.1.md gossip threshold)
+          gossipThreshold = stGossipThreshold (gsThresholds router)
           nonMeshPeers = [ pid | (pid, ps) <- Map.toList peersMap
                                , Set.member topic (psTopics ps)
                                , not (Set.member pid meshPeers)
+                               , computeScore (gsScoreParams router) pid ps ipMap now
+                                   >= gossipThreshold
                                ]
           -- Select max(D_lazy, |eligible| * gossipFactor) targets
           dlazy = paramDlazy params
@@ -220,12 +272,30 @@ emitGossip router = do
   -- Rotate cache
   atomically $ modifyTVar' (gsMessageCache router) cacheShift
 
+-- IWANT promise expiry (P7)
+
+-- | Penalise peers whose IWANT promises expired without delivery
+-- (gossipsub-v1.1.md: a peer that advertises via IHAVE but never sends
+-- the requested message commits a behavioural violation).
+expireIWantPromises :: GossipSubRouter -> IO ()
+expireIWantPromises router = do
+  now <- gsGetTime router
+  broken <- atomically $ do
+    promises <- readTVar (gsIWantPromises router)
+    let (expired, live) = Map.partition (<= now) promises
+    writeTVar (gsIWantPromises router) live
+    pure (map fst (Map.keys expired))
+  atomically $ modifyTVar' (gsPeers router) $ \pm ->
+    foldl' (\m pid -> Map.adjust addP7Penalty pid m) pm broken
+
 -- Score decay
 
+-- | Refresh accrued mesh time (P1 input) and decay all scoring counters.
 decayAllScores :: GossipSubRouter -> IO ()
-decayAllScores router = atomically $
-  modifyTVar' (gsPeers router) $
-    Map.map (decayPeerCounters (gsScoreParams router))
+decayAllScores router = do
+  now <- gsGetTime router
+  atomically $ modifyTVar' (gsPeers router) $
+    Map.map (decayPeerCounters (gsScoreParams router) . refreshMeshTime now)
 
 -- Seen cache cleanup
 
