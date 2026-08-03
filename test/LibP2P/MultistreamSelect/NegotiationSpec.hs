@@ -98,6 +98,34 @@ spec = do
           framed = BS.pack [0x02] <> truncated
       decodeMessage framed `shouldSatisfy` isLeft
 
+  describe "Negotiation - pre-handshake read limits" $ do
+    -- go-multistream rejects messages over 1024 bytes ("incoming message
+    -- was too large"). Without this cap an unauthenticated peer can declare
+    -- a huge length and make us allocate/read without bound.
+    it "rejects an oversized declared message length before reading the payload" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      -- Declare a (2^32 - 1)-byte message; only the varint prefix is sent.
+      -- The responder must reject the length instead of blocking to read 4 GiB.
+      streamWrite streamA (BS.pack [0xff, 0xff, 0xff, 0xff, 0x0f])
+      result <- timeout 1000000 (negotiateResponder streamB ["/noise"])
+      result `shouldBe` Just NoProtocol
+
+    it "rejects a message length just above the 1024-byte cap" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      -- varint(1025) = 0x81 0x08; no payload follows
+      streamWrite streamA (BS.pack [0x81, 0x08])
+      result <- timeout 1000000 (negotiateResponder streamB ["/noise"])
+      result `shouldBe` Just NoProtocol
+
+    -- The varint read loop itself must be bounded: the unsigned-varint spec
+    -- caps varints at 9 bytes, so a stream of continuation bytes (0x80) must
+    -- be aborted instead of being accumulated indefinitely.
+    it "aborts an unterminated varint prefix after the 9-byte spec limit" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      streamWrite streamA (BS.pack (replicate 64 0x80))
+      result <- timeout 1000000 (negotiateResponder streamB ["/noise"])
+      result `shouldBe` Just NoProtocol
+
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
 isLeft _ = False
