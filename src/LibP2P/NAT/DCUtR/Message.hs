@@ -32,7 +32,8 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
 import Data.Word (Word32)
-import Proto3.Wire.Decode (Parser, RawMessage, ParseError, at, one, repeated, parse)
+import qualified Data.Text.Lazy as TL
+import Proto3.Wire.Decode (Parser (..), RawMessage, ParseError (..), at, one, repeated, parse)
 import qualified Proto3.Wire.Decode as Decode
 import qualified Proto3.Wire.Encode as Encode
 import Proto3.Wire.Types (FieldNumber (..))
@@ -83,14 +84,15 @@ decodeHolePunchMessage :: ByteString -> Either ParseError HolePunchMessage
 decodeHolePunchMessage = parse holePunchParser
 
 holePunchParser :: Parser RawMessage HolePunchMessage
-holePunchParser = HolePunchMessage
-  <$> (toHPType <$> at (one Decode.uint32 0) (FieldNumber 1))
-  <*> at (repeated Decode.byteString) (FieldNumber 2)
-  where
-    toHPType :: Word32 -> HolePunchType
-    toHPType w = case wordToHolePunchType w of
-      Just t  -> t
-      Nothing -> HPConnect  -- default for unknown (should not happen per spec)
+holePunchParser = do
+  -- The type field is required; an absent field decodes as the default 0,
+  -- which is not a valid HolePunch type and is rejected below.
+  typeWord <- at (one Decode.uint32 0) (FieldNumber 1)
+  obsAddrs <- at (repeated Decode.byteString) (FieldNumber 2)
+  case wordToHolePunchType typeWord of
+    Just t  -> pure (HolePunchMessage t obsAddrs)
+    Nothing -> Parser $ const $ Left $
+      WireTypeError (TL.pack ("unknown or missing HolePunch type: " ++ show typeWord))
 
 -- Wire framing
 

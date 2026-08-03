@@ -80,6 +80,18 @@ spec = do
           decoded = decodeHolePunchMessage encoded
       decoded `shouldBe` Right connectManyAddrs
 
+    it "rejects a message with an unknown type value" $ do
+      -- field 1 (varint): tag 0x08, value 200 (not CONNECT=100 or SYNC=300)
+      let bytes = BS.pack [0x08, 0xC8, 0x01]
+      case decodeHolePunchMessage bytes of
+        Left _ -> pure ()
+        Right msg -> expectationFailure $ "Decoded unknown type as: " ++ show msg
+
+    it "rejects a message missing the type field" $ do
+      case decodeHolePunchMessage BS.empty of
+        Left _ -> pure ()
+        Right msg -> expectationFailure $ "Decoded missing type as: " ++ show msg
+
   describe "DCUtR Message type wire values" $ do
     it "CONNECT maps to wire value 100" $ do
       holePunchTypeToWord HPConnect `shouldBe` 100
