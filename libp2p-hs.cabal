@@ -82,6 +82,7 @@ library
     LibP2P.Protocol.GossipSub.Message
     LibP2P.Protocol.GossipSub.Router
     LibP2P.Protocol.GossipSub.Score
+    LibP2P.Protocol.GossipSub.Validation
     LibP2P.Protocol.GossipSub.MessageCache
     LibP2P.Protocol.GossipSub.Heartbeat
     LibP2P.Protocol.GossipSub.Handler
@@ -168,6 +169,7 @@ test-suite libp2p-hs-test
     LibP2P.Protocol.GossipSub.MessageSpec
     LibP2P.Protocol.GossipSub.RouterSpec
     LibP2P.Protocol.GossipSub.ScoreSpec
+    LibP2P.Protocol.GossipSub.ValidationSpec
     LibP2P.Protocol.GossipSub.MessageCacheSpec
     LibP2P.Protocol.GossipSub.HeartbeatSpec
     LibP2P.Protocol.GossipSub.HandlerSpec
