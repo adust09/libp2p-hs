@@ -40,7 +40,7 @@ data SignedEnvelope = SignedEnvelope
   , seDomain      :: !ByteString    -- ^ Domain separation string
   , sePayloadType :: !ByteString    -- ^ Payload type (multicodec bytes)
   , sePayload     :: !ByteString    -- ^ Payload bytes
-  , seSignature   :: !ByteString    -- ^ Ed25519 signature
+  , seSignature   :: !ByteString    -- ^ Signature over the signing content
   } deriving (Show, Eq)
 
 -- | Build the content that gets signed (RFC 0002).
