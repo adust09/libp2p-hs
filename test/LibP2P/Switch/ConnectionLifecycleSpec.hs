@@ -258,7 +258,7 @@ spec = do
       (remotePid, _remoteKP) <- mkTestIdentity
       sw <- newSwitch localPid localKP
       usageMVar <- newEmptyMVar
-      setStreamHandler sw "/test/1.0.0" $ \_stream _pid -> do
+      setStreamHandler sw "/test/1.0.0" $ \_conn _stream -> do
         usage <- peerUsage sw remotePid
         putMVar usageMVar (fmap ruStreamsInbound usage)
       conn <- mkDummyConnection remotePid (fail "no outbound")

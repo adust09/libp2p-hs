@@ -7,6 +7,7 @@ import Control.Concurrent.STM
   , atomically
   , newEmptyTMVarIO
   , newTQueueIO
+  , newTVarIO
   , putTMVar
   , readTQueue
   , readTVar
@@ -22,11 +23,20 @@ import LibP2P.Crypto.Key (kpPublic)
 import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
+import LibP2P.Multiaddr (Multiaddr (..))
+import LibP2P.Multiaddr.Codec (encodeProtocols)
+import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import LibP2P.Protocol.Identify
 import LibP2P.Protocol.Identify.Message (IdentifyInfo (..), decodeIdentify, encodeIdentify, maxIdentifySize)
 import LibP2P.Switch (newSwitch, setStreamHandler)
-import LibP2P.Switch.Types (Switch (..))
+import LibP2P.Switch.Types
+  ( ConnState (..)
+  , Connection (..)
+  , Direction (..)
+  , MuxerSession (..)
+  , Switch (..)
+  )
 import Data.Word (Word8)
 import System.IO.Error (mkIOError, eofErrorType)
 import Test.Hspec
@@ -40,6 +50,25 @@ mkTestSwitch = do
   setStreamHandler sw "/test/1.0.0" (\_ _ -> pure ())
   setStreamHandler sw "/test/2.0.0" (\_ _ -> pure ())
   pure sw
+
+-- | Create a dummy upgraded Connection with a known remote multiaddr.
+mkTestConnection :: PeerId -> Multiaddr -> IO Connection
+mkTestConnection pid remoteAddr = do
+  stateVar <- newTVarIO ConnOpen
+  pure Connection
+    { connPeerId     = pid
+    , connDirection  = Inbound
+    , connLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
+    , connRemoteAddr = remoteAddr
+    , connSecurity   = "/noise"
+    , connMuxer      = "/yamux/1.0.0"
+    , connSession    = MuxerSession
+        { muxOpenStream   = fail "test connection: no muxer"
+        , muxAcceptStream = fail "test connection: no muxer"
+        , muxClose        = pure ()
+        }
+    , connState      = stateVar
+    }
 
 -- | Create a stream pair where the writer can signal EOF via streamClose.
 -- After close is called, reads on the other side throw an IOError.
@@ -114,8 +143,9 @@ spec = do
     it "handleIdentify writes a varint-length-prefixed protobuf" $ do
       sw <- mkTestSwitch
       (streamA, streamB) <- mkClosableStreamPair
+      conn <- mkTestConnection (PeerId "remote") (Multiaddr [IP4 0x7f000001, TCP 4001])
       -- handleIdentify writes the framed protobuf to streamA and closes it (EOF)
-      writer <- async $ handleIdentify sw streamA (PeerId "remote")
+      writer <- async $ handleIdentify sw conn streamA
       -- Read all raw bytes from streamB until EOF
       bytesOrErr <- readAllBytes streamB
       wait writer
@@ -131,6 +161,24 @@ spec = do
               Right info -> do
                 idProtocolVersion info `shouldBe` Just "ipfs/0.1.0"
                 idAgentVersion info `shouldBe` Just "libp2p-hs/0.1.0"
+
+    it "handleIdentify populates observedAddr with the connection's remote address" $ do
+      sw <- mkTestSwitch
+      (streamA, streamB) <- mkClosableStreamPair
+      -- The address of the remote peer as seen by us (specs/identify: observedAddr)
+      let observedProtos = [IP4 0x7f000001, TCP 45678]
+      conn <- mkTestConnection (PeerId "remote") (Multiaddr observedProtos)
+      writer <- async $ handleIdentify sw conn streamA
+      bytesOrErr <- readAllBytes streamB
+      wait writer
+      case bytesOrErr of
+        Left err -> expectationFailure $ "reading stream failed: " ++ err
+        Right bs -> case decodeUvarint bs of
+          Left err -> expectationFailure $ "no varint length prefix: " ++ err
+          Right (_len, payload) -> case decodeIdentify payload of
+            Left parseErr -> expectationFailure $ "Decode failed: " ++ show parseErr
+            Right info ->
+              idObservedAddr info `shouldBe` Just (encodeProtocols observedProtos)
 
     it "handleIdentify closes stream after writing (signals EOF)" $ do
       sw <- mkTestSwitch
@@ -163,7 +211,8 @@ spec = do
             , streamClose    = pure ()
             }
       -- handleIdentify should write + close the stream
-      writer <- async $ handleIdentify sw testStream (PeerId "remote")
+      conn <- mkTestConnection (PeerId "remote") (Multiaddr [IP4 0x7f000001, TCP 4001])
+      writer <- async $ handleIdentify sw conn testStream
       bytesOrErr <- readAllBytes readerStream
       wait writer
       -- Stream close should have been called by handleIdentify
@@ -191,7 +240,8 @@ spec = do
       streamWrite streamA (frame encoded)
       streamClose streamA
       -- handleIdentifyPush reads from streamB
-      handleIdentifyPush sw streamB remotePeerId
+      conn <- mkTestConnection remotePeerId (Multiaddr [IP4 0x7f000001, TCP 4001])
+      handleIdentifyPush sw conn streamB
       -- Check peer store
       store <- atomically $ readTVar (swPeerStore sw)
       case Map.lookup remotePeerId store of
