@@ -3,6 +3,7 @@ module LibP2P.NAT.AutoNAT.AutoNATSpec (spec) where
 import Test.Hspec
 
 import qualified Data.ByteString as BS
+import qualified Data.Text as T
 import Control.Concurrent.Async (withAsync)
 import Control.Concurrent.STM (newTQueueIO, atomically, writeTQueue, readTQueue, TQueue)
 import Data.Word (Word8)
@@ -56,6 +57,43 @@ relayedAddr = Multiaddr [IP4 0xCB007101, TCP 4001, P2P (BS.pack [1,2,3]), P2PCir
 remoteObservedAddr :: Multiaddr
 remoteObservedAddr = Multiaddr [IP4 0xCB007105, TCP 12345]
 
+-- | IPv6 host 2001:db8::1 (16 bytes).
+ip6HostA :: BS.ByteString
+ip6HostA = BS.pack [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+
+-- | IPv6 host 2001:db8::2 (16 bytes).
+ip6HostB :: BS.ByteString
+ip6HostB = BS.pack [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]
+
+-- | Remote observed IPv6 address: /ip6/2001:db8::1/tcp/12345
+ipv6ObservedAddr :: Multiaddr
+ipv6ObservedAddr = Multiaddr [IP6 ip6HostA, TCP 12345]
+
+-- | Candidate matching the observed IPv6 host: /ip6/2001:db8::1/tcp/4001
+ipv6MatchAddr :: Multiaddr
+ipv6MatchAddr = Multiaddr [IP6 ip6HostA, TCP 4001]
+
+-- | Candidate with a different IPv6 host: /ip6/2001:db8::2/tcp/4001
+ipv6OtherAddr :: Multiaddr
+ipv6OtherAddr = Multiaddr [IP6 ip6HostB, TCP 4001]
+
+-- | Observed address without any IP component: /dns/example.com/tcp/4001
+dnsObservedAddr :: Multiaddr
+dnsObservedAddr = Multiaddr [DNS (T.pack "example.com"), TCP 4001]
+
+-- | Build a DIAL message claiming the given peer id and addresses.
+mkDialMsg :: PeerId -> [Multiaddr] -> AutoNATMessage
+mkDialMsg (PeerId pidBytes) addrs = AutoNATMessage
+  { anMsgType = Just DIAL
+  , anMsgDial = Just AutoNATDial
+      { anDialPeer = Just AutoNATPeerInfo
+          { anPeerId = pidBytes
+          , anAddrs = map toBytes addrs
+          }
+      }
+  , anMsgDialResponse = Nothing
+  }
+
 spec :: Spec
 spec = do
   describe "AutoNAT handler (server side)" $ do
@@ -71,7 +109,7 @@ spec = do
             { anMsgType = Just DIAL
             , anMsgDial = Just AutoNATDial
                 { anDialPeer = Just AutoNATPeerInfo
-                    { anPeerId = let PeerId bs = testPeerId in bs
+                    { anPeerId = let PeerId bs = remotePeerId in bs
                     , anAddrs = [addrBytes]
                     }
                 }
@@ -101,7 +139,7 @@ spec = do
             { anMsgType = Just DIAL
             , anMsgDial = Just AutoNATDial
                 { anDialPeer = Just AutoNATPeerInfo
-                    { anPeerId = let PeerId bs = testPeerId in bs
+                    { anPeerId = let PeerId bs = remotePeerId in bs
                     , anAddrs = [addrBytes]
                     }
                 }
@@ -128,7 +166,7 @@ spec = do
             { anMsgType = Just DIAL
             , anMsgDial = Just AutoNATDial
                 { anDialPeer = Just AutoNATPeerInfo
-                    { anPeerId = let PeerId bs = testPeerId in bs
+                    { anPeerId = let PeerId bs = remotePeerId in bs
                     , anAddrs = []
                     }
                 }
@@ -182,7 +220,7 @@ spec = do
             { anMsgType = Just DIAL
             , anMsgDial = Just AutoNATDial
                 { anDialPeer = Just AutoNATPeerInfo
-                    { anPeerId = let PeerId bs = testPeerId in bs
+                    { anPeerId = let PeerId bs = remotePeerId in bs
                     , anAddrs = [matchAddr, nonMatchAddr]
                     }
                 }
@@ -200,6 +238,115 @@ spec = do
           addrs `shouldBe` [publicAddr]
         _ -> expectationFailure $ "Expected 1 dial-back call, got " ++ show (length dialed)
 
+    it "dials back only candidates matching the observed IPv6 host" $ do
+      dialedRef <- newIORef ([] :: [[Multiaddr]])
+      (clientStream, serverStream) <- mkStreamPair
+      let config = AutoNATConfig
+            { natThreshold = 3
+            , natDialBack = \_pid addrs -> do
+                modifyIORef' dialedRef (addrs :)
+                pure (Right ())
+            }
+          -- Same IPv6 host, different IPv6 host, and an IPv4 address
+          dialMsg = mkDialMsg remotePeerId [ipv6MatchAddr, ipv6OtherAddr, publicAddr]
+      writeAutoNATMessage clientStream dialMsg
+      handleAutoNAT config serverStream remotePeerId ipv6ObservedAddr
+      _ <- readAutoNATMessage clientStream maxAutoNATMessageSize
+      dialed <- readIORef dialedRef
+      case dialed of
+        [addrs] -> addrs `shouldBe` [ipv6MatchAddr]
+        _ -> expectationFailure $ "Expected 1 dial-back call, got " ++ show (length dialed)
+
+    it "responds E_DIAL_REFUSED when no candidate matches the observed IP" $ do
+      dialedRef <- newIORef ([] :: [[Multiaddr]])
+      (clientStream, serverStream) <- mkStreamPair
+      let config = AutoNATConfig
+            { natThreshold = 3
+            , natDialBack = \_pid addrs -> do
+                modifyIORef' dialedRef (addrs :)
+                pure (Right ())
+            }
+          -- Observed over IPv6, but only IPv4 candidates are offered
+          dialMsg = mkDialMsg remotePeerId [publicAddr, privateAddr]
+      writeAutoNATMessage clientStream dialMsg
+      handleAutoNAT config serverStream remotePeerId ipv6ObservedAddr
+      result <- readAutoNATMessage clientStream maxAutoNATMessageSize
+      case result of
+        Right resp ->
+          case anMsgDialResponse resp of
+            Just dr -> anRespStatus dr `shouldBe` Just EDialRefused
+            Nothing -> expectationFailure "Expected DialResponse"
+        Left err -> expectationFailure $ "Read failed: " ++ err
+      dialed <- readIORef dialedRef
+      dialed `shouldBe` []
+
+    it "responds E_DIAL_REFUSED when the observed address has no IP component" $ do
+      dialedRef <- newIORef ([] :: [[Multiaddr]])
+      (clientStream, serverStream) <- mkStreamPair
+      let config = AutoNATConfig
+            { natThreshold = 3
+            , natDialBack = \_pid addrs -> do
+                modifyIORef' dialedRef (addrs :)
+                pure (Right ())
+            }
+          dialMsg = mkDialMsg remotePeerId [publicAddr, ipv6MatchAddr]
+      writeAutoNATMessage clientStream dialMsg
+      -- Observed address carries no IP: the filter must drop everything,
+      -- never fall through to dialling all requested addresses
+      handleAutoNAT config serverStream remotePeerId dnsObservedAddr
+      result <- readAutoNATMessage clientStream maxAutoNATMessageSize
+      case result of
+        Right resp ->
+          case anMsgDialResponse resp of
+            Just dr -> anRespStatus dr `shouldBe` Just EDialRefused
+            Nothing -> expectationFailure "Expected DialResponse"
+        Left err -> expectationFailure $ "Read failed: " ++ err
+      dialed <- readIORef dialedRef
+      dialed `shouldBe` []
+
+    it "responds E_BAD_REQUEST when the claimed peer id differs from the connected peer" $ do
+      dialedRef <- newIORef ([] :: [[Multiaddr]])
+      (clientStream, serverStream) <- mkStreamPair
+      let config = AutoNATConfig
+            { natThreshold = 3
+            , natDialBack = \_pid addrs -> do
+                modifyIORef' dialedRef (addrs :)
+                pure (Right ())
+            }
+          -- Message claims testPeerId, but the connection is authenticated as remotePeerId
+          dialMsg = mkDialMsg testPeerId [publicAddr]
+      writeAutoNATMessage clientStream dialMsg
+      handleAutoNAT config serverStream remotePeerId remoteObservedAddr
+      result <- readAutoNATMessage clientStream maxAutoNATMessageSize
+      case result of
+        Right resp ->
+          case anMsgDialResponse resp of
+            Just dr -> anRespStatus dr `shouldBe` Just EBadRequest
+            Nothing -> expectationFailure "Expected DialResponse"
+        Left err -> expectationFailure $ "Read failed: " ++ err
+      dialed <- readIORef dialedRef
+      dialed `shouldBe` []
+
+    it "caps the number of dial-back addresses per request" $ do
+      dialedRef <- newIORef ([] :: [[Multiaddr]])
+      (clientStream, serverStream) <- mkStreamPair
+      let config = AutoNATConfig
+            { natThreshold = 3
+            , natDialBack = \_pid addrs -> do
+                modifyIORef' dialedRef (addrs :)
+                pure (Right ())
+            }
+          -- Many same-IP addresses on different ports; all pass the IP filter
+          manyAddrs = [Multiaddr [IP4 0xCB007105, TCP p] | p <- [4001 .. 4064]]
+          dialMsg = mkDialMsg remotePeerId manyAddrs
+      writeAutoNATMessage clientStream dialMsg
+      handleAutoNAT config serverStream remotePeerId remoteObservedAddr
+      _ <- readAutoNATMessage clientStream maxAutoNATMessageSize
+      dialed <- readIORef dialedRef
+      case dialed of
+        [addrs] -> length addrs `shouldBe` maxDialBackAddrs
+        _ -> expectationFailure $ "Expected 1 dial-back call, got " ++ show (length dialed)
+
     it "rejects requests from relayed connections" $ do
       (clientStream, serverStream) <- mkStreamPair
       let config = AutoNATConfig
@@ -211,7 +358,7 @@ spec = do
             { anMsgType = Just DIAL
             , anMsgDial = Just AutoNATDial
                 { anDialPeer = Just AutoNATPeerInfo
-                    { anPeerId = let PeerId bs = testPeerId in bs
+                    { anPeerId = let PeerId bs = remotePeerId in bs
                     , anAddrs = [addrBytes]
                     }
                 }

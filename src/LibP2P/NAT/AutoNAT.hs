@@ -5,11 +5,15 @@
 --
 -- Security rules (from specs/autonat):
 --   - Server MUST NOT dial addresses unless they match the requester's observed IP
+--     (both IPv4 and IPv6; if the observed IP cannot be determined, refuse)
 --   - Server MUST NOT accept dial requests over relayed connections
+--   - Server rejects requests whose claimed peer id differs from the
+--     authenticated peer id of the connection
 module LibP2P.NAT.AutoNAT
   ( -- * Types
     NATStatus (..)
   , AutoNATConfig (..)
+  , maxDialBackAddrs
     -- * Server
   , handleAutoNAT
     -- * Client
@@ -20,7 +24,6 @@ module LibP2P.NAT.AutoNAT
 
 import Data.ByteString (ByteString)
 import qualified Data.Text as T
-import Data.Word (Word32)
 import LibP2P.NAT.AutoNAT.Message
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import LibP2P.Multiaddr (Multiaddr (..), toBytes, fromBytes)
@@ -53,20 +56,36 @@ handleAutoNAT config stream remotePeerId remoteObservedAddr = do
       resp <- processDialRequest config msg remotePeerId remoteObservedAddr
       writeAutoNATMessage stream resp
 
+-- | Maximum number of addresses dialled back per request.
+-- Bounds the work a single request can trigger (go-libp2p applies a
+-- similar per-request address cap).
+maxDialBackAddrs :: Int
+maxDialBackAddrs = 16
+
 -- | Process a DIAL request and produce a response.
 processDialRequest :: AutoNATConfig -> AutoNATMessage -> PeerId -> Multiaddr -> IO AutoNATMessage
-processDialRequest config msg _remotePeerId remoteObservedAddr
+processDialRequest config msg remotePeerId remoteObservedAddr
   -- Reject requests from relayed connections
   | isRelayedAddr remoteObservedAddr = pure $ mkDialResponse EDialRefused (Just "relayed connection") Nothing
   | otherwise = case anMsgDial msg of
       Nothing -> pure $ mkDialResponse EBadRequest (Just "missing dial field") Nothing
       Just dial -> case anDialPeer dial of
         Nothing -> pure $ mkDialResponse EBadRequest (Just "missing peer info") Nothing
-        Just peerInfo -> do
+        Just peerInfo
+          -- The dial-back target identity must be the authenticated peer,
+          -- not whatever the message claims (go-libp2p behaves the same)
+          | PeerId (anPeerId peerInfo) /= remotePeerId ->
+              pure $ mkDialResponse EBadRequest (Just "peer id mismatch") Nothing
+          | otherwise -> do
           let requestedAddrs = mapMaybe' fromBytes (anAddrs peerInfo)
-              filteredAddrs = filterByObservedIP remoteObservedAddr requestedAddrs
-          if null filteredAddrs
+              filteredAddrs = take maxDialBackAddrs
+                                (filterByObservedIP remoteObservedAddr requestedAddrs)
+          if null requestedAddrs
             then pure $ mkDialResponse EBadRequest (Just "no valid addresses") Nothing
+            else if null filteredAddrs
+            -- Amplification guard: nothing matches the observed IP → refuse,
+            -- never fall back to dialling unverified addresses
+            then pure $ mkDialResponse EDialRefused (Just "no dialable addresses") Nothing
             else do
               let peerId = PeerId (anPeerId peerInfo)
               dialResult <- natDialBack config peerId filteredAddrs
@@ -139,26 +158,26 @@ isRelayedAddr (Multiaddr ps) = any isCircuit ps
     isCircuit P2PCircuit = True
     isCircuit _          = False
 
--- | Extract IP address (as Word32 for IPv4) from a multiaddr.
-extractIP4 :: Multiaddr -> Maybe Word32
-extractIP4 (Multiaddr ps) = go ps
+-- | Extract the first IP component (IPv4 or IPv6) from a multiaddr.
+extractIP :: Multiaddr -> Maybe Protocol
+extractIP (Multiaddr ps) = go ps
   where
     go [] = Nothing
-    go (IP4 addr : _) = Just addr
+    go (p@(IP4 _) : _) = Just p
+    go (p@(IP6 _) : _) = Just p
     go (_ : rest) = go rest
 
--- | Filter addresses to only those matching the observed IP.
+-- | Filter addresses to only those whose IP equals the observed IP.
+--
+-- Spec (autonat-v1): the server MUST NOT dial any multiaddress unless it is
+-- based on the IP address the requesting node is observed as. If the observed
+-- IP cannot be determined, no address is dialable — return the empty list so
+-- the caller refuses the request instead of amplifying it.
 filterByObservedIP :: Multiaddr -> [Multiaddr] -> [Multiaddr]
 filterByObservedIP observed addrs =
-  case extractIP4 observed of
-    Nothing -> addrs  -- can't determine IP, pass all through
-    Just obsIP -> filter (matchesIP obsIP) addrs
-  where
-    matchesIP :: Word32 -> Multiaddr -> Bool
-    matchesIP obsIP addr =
-      case extractIP4 addr of
-        Just ip -> ip == obsIP
-        Nothing -> False  -- non-IP4 addresses are filtered out
+  case extractIP observed of
+    Nothing -> []
+    Just obsIP -> filter (\addr -> extractIP addr == Just obsIP) addrs
 
 -- | mapMaybe for Either (keeping only Right values).
 mapMaybe' :: (a -> Either e b) -> [a] -> [b]
