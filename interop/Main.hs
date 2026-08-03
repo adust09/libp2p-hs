@@ -224,7 +224,7 @@ runDialer sw _pid redisConn timeoutS = do
               Right conn -> do
                 -- A single ping (README steps 5-6): its round-trip time is
                 -- pingRTT, and the total elapsed since t0 is handshakePlusOneRTT.
-                pingResult <- sendPing conn
+                pingResult <- sendPing sw conn
                 t1 <- getCurrentTime
 
                 case pingResult of

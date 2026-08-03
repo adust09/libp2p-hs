@@ -17,6 +17,7 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException, bracket, try)
 import Control.Monad (replicateM)
 import qualified Data.ByteString as BS
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Time.Clock (getCurrentTime)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
@@ -62,8 +63,10 @@ import LibP2P.Protocol.Identify
 import LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
 import LibP2P.Protocol.Ping
   ( PingResult (..)
+  , ping
   , registerPingHandler
   , sendPing
+  , withPingSession
   )
 import LibP2P.Switch.ConnPool (lookupConn)
 import LibP2P.Switch.Dial (dial)
@@ -185,8 +188,8 @@ spec = do
 
   describe "Ping over real TCP" $ do
     it "sendPing returns valid RTT (>0, <1s for loopback)" $ do
-      withConnectedPair $ \_nodeA _nodeB conn -> do
-        result <- timeout 5000000 $ sendPing conn
+      withConnectedPair $ \(swA, _pidA) _nodeB conn -> do
+        result <- timeout 5000000 $ sendPing swA conn
         case result of
           Nothing -> expectationFailure "ping timed out"
           Just (Left err) -> expectationFailure $ "ping failed: " ++ show err
@@ -228,32 +231,45 @@ spec = do
             idObservedAddr info `shouldBe` Just (toBytes (connLocalAddr conn))
 
   describe "Multi-protocol" $ do
-    -- WARNING(#163): this test certifies behaviour the spec forbids.
-    -- specs/ping/ping.md: "The dialing peer MUST NOT keep more than one
-    -- outbound stream for the ping protocol per peer." It passes only
-    -- because sendPing opens a new stream per call. When #163 is fixed
-    -- (stream reuse + close), this test must be inverted — assert a
-    -- single outbound stream across both pings — not extended.
-    it "multiple Ping requests on different streams over same connection" $ do
-      withConnectedPair $ \_nodeA _nodeB conn -> do
-        -- Send two Pings on separate streams over the same muxed connection
-        pingResult1 <- sendPing conn
-        case pingResult1 of
-          Left err -> expectationFailure $ "ping 1 failed: " ++ show err
-          Right (PingResult rtt1) -> rtt1 `shouldSatisfy` (> 0)
-        pingResult2 <- sendPing conn
-        case pingResult2 of
-          Left err -> expectationFailure $ "ping 2 failed: " ++ show err
-          Right (PingResult rtt2) -> rtt2 `shouldSatisfy` (> 0)
+    it "successive pings reuse a single outbound stream over the same connection" $ do
+      -- Regression for #163. specs/ping/ping.md: "The dialing peer MUST
+      -- NOT keep more than one outbound stream for the ping protocol per
+      -- peer." Both pings must run on one stream, opened exactly once.
+      withConnectedPair $ \(swA, _pidA) _nodeB conn -> do
+        opensRef <- newIORef (0 :: Int)
+        let realSession = connSession conn
+            countingSession = realSession
+              { muxOpenStream = do
+                  modifyIORef' opensRef (+ 1)
+                  muxOpenStream realSession
+              }
+            countingConn = conn { connSession = countingSession }
+        result <- timeout 10000000 $ withPingSession swA countingConn $ \sess -> do
+          r1 <- ping sess
+          r2 <- ping sess
+          pure (r1, r2)
+        case result of
+          Nothing -> expectationFailure "ping session timed out"
+          Just (Left err) ->
+            expectationFailure $ "ping session failed to open: " ++ show err
+          Just (Right (r1, r2)) -> do
+            case r1 of
+              Left err -> expectationFailure $ "ping 1 failed: " ++ show err
+              Right (PingResult rtt1) -> rtt1 `shouldSatisfy` (> 0)
+            case r2 of
+              Left err -> expectationFailure $ "ping 2 failed: " ++ show err
+              Right (PingResult rtt2) -> rtt2 `shouldSatisfy` (> 0)
+        opens <- readIORef opensRef
+        opens `shouldBe` 1
 
     it "unknown protocol gets na over real TCP and the connection stays usable" $ do
-      withConnectedPair $ \_nodeA _nodeB conn -> do
+      withConnectedPair $ \(swA, _pidA) _nodeB conn -> do
         stream <- muxOpenStream (connSession conn)
         result <- timeout 5000000 $
           negotiateInitiator stream ["/test/does-not-exist/1.0.0"]
         result `shouldBe` Just NoProtocol
         -- The failed negotiation must not poison the muxed connection.
-        pingAfter <- timeout 5000000 $ sendPing conn
+        pingAfter <- timeout 5000000 $ sendPing swA conn
         case pingAfter of
           Just (Right (PingResult rtt)) -> rtt `shouldSatisfy` (> 0)
           Just (Left err) ->
@@ -319,7 +335,7 @@ spec = do
               dialResult <- timeout 10000000 $ dial swA pidC learnedAddrs
               case dialResult of
                 Just (Right connC) -> do
-                  pingResult <- timeout 5000000 $ sendPing connC
+                  pingResult <- timeout 5000000 $ sendPing swA connC
                   case pingResult of
                     Just (Right (PingResult rtt)) -> rtt `shouldSatisfy` (> 0)
                     other -> expectationFailure $
