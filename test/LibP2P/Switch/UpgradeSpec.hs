@@ -9,6 +9,7 @@ import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
+import LibP2P.Noise.Framing (maxNoisePlaintextSize)
 import LibP2P.Noise.Handshake (HandshakeResult (..))
 import LibP2P.Switch.Types (Connection (..), Direction (..), MuxerSession (..))
 import LibP2P.Switch.Upgrade
@@ -127,6 +128,40 @@ spec = do
       streamWrite encB bigPayload
       received3 <- readExact encA 70000
       received3 `shouldBe` bigPayload
+
+    it "round-trips payloads at the exact single-frame boundary (65519 and 65520 bytes)" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      ((sessA, _), (sessB, _)) <-
+        concurrently
+          (performStreamHandshake kpA Outbound rawA)
+          (performStreamHandshake kpB Inbound rawB)
+      sendRefA <- newIORef sessA
+      recvRefA <- newIORef sessA
+      bufRefA  <- newIORef BS.empty
+      sendRefB <- newIORef sessB
+      recvRefB <- newIORef sessB
+      bufRefB  <- newIORef BS.empty
+      let encA = noiseSessionToStreamIO sendRefA recvRefA bufRefA rawA
+          encB = noiseSessionToStreamIO sendRefB recvRefB bufRefB rawB
+          -- 65519 bytes: the largest plaintext that fits a single Noise
+          -- frame (65535-byte message minus the 16-byte AEAD tag).
+          atLimit = BS.pack (take maxNoisePlaintextSize (cycle [0 .. 255]))
+          -- 65520 bytes: the first size that MUST be split into two
+          -- frames — before chunking existed, this single write corrupted
+          -- the connection (declared length wrapped to 0).
+          overLimit = BS.pack (take (maxNoisePlaintextSize + 1) (cycle [255, 254 .. 0]))
+      streamWrite encA atLimit
+      received <- readExact encB maxNoisePlaintextSize
+      received `shouldBe` atLimit
+      streamWrite encA overLimit
+      received2 <- readExact encB (maxNoisePlaintextSize + 1)
+      received2 `shouldBe` overLimit
+      -- The channel must stay usable in both directions afterwards.
+      streamWrite encB "still alive"
+      received3 <- readExact encA 11
+      received3 `shouldBe` "still alive"
 
   describe "Full upgrade pipeline" $ do
     it "upgradeOutbound + upgradeInbound exchange data on muxed stream" $ do
