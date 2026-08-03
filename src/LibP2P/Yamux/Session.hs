@@ -16,6 +16,7 @@ module LibP2P.Yamux.Session
   , sendGoAway
   , recvLoop
   , sendLoop
+  , acceptBacklog
   ) where
 
 import Control.Concurrent.STM
@@ -25,6 +26,13 @@ import qualified Data.Map.Strict as Map
 import Data.Word (Word32)
 import LibP2P.Yamux.Frame
 import LibP2P.Yamux.Types
+import Numeric.Natural (Natural)
+
+-- | Maximum number of inbound streams buffered while the application
+-- is not accepting (go-yamux AcceptBacklog). The spec requires this
+-- buffer to be bounded to mitigate DoS; excess SYNs are reset.
+acceptBacklog :: Natural
+acceptBacklog = 256
 
 -- | Create a new Yamux session over a transport connection.
 -- Client uses odd stream IDs starting at 1, server uses even starting at 2.
@@ -35,10 +43,10 @@ newSession role writeFn readFn = do
         RoleServer -> 2
   nextId <- newTVarIO startId
   streams <- newTVarIO Map.empty
-  acceptCh <- newTQueueIO
+  acceptCh <- newTBQueueIO acceptBacklog
   sendCh <- newTQueueIO
   shutdown <- newTVarIO False
-  remoteGoAway <- newTVarIO False
+  remoteGoAway <- newTVarIO Nothing
   pings <- newTVarIO Map.empty
   nextPingId <- newTVarIO 1
   pure
@@ -61,17 +69,21 @@ closeSession :: YamuxSession -> IO ()
 closeSession sess = sendGoAway sess GoAwayNormal
 
 -- | Open a new outbound stream. Allocates the next stream ID and sends SYN.
--- Returns YamuxSessionShutdown if the session has sent or received GoAway.
+-- Returns YamuxSessionShutdown after a local GoAway, or YamuxGoAway with
+-- the received code after a remote GoAway.
 openStream :: YamuxSession -> IO (Either YamuxError YamuxStream)
 openStream sess = do
   -- Check shutdown state
-  canOpen <- atomically $ do
+  status <- atomically $ do
     shut <- readTVar (ysessShutdown sess)
     remote <- readTVar (ysessRemoteGoAway sess)
-    pure (not shut && not remote)
-  if not canOpen
-    then pure (Left YamuxSessionShutdown)
-    else do
+    pure $ case (shut, remote) of
+      (True, _) -> Left YamuxSessionShutdown
+      (False, Just code) -> Left (YamuxGoAway code)
+      (False, Nothing) -> Right ()
+  case status of
+    Left err -> pure (Left err)
+    Right () -> do
       -- Allocate stream ID (atomically increment by 2)
       sid <- atomically $ do
         nextId <- readTVar (ysessNextStreamId sess)
@@ -97,7 +109,7 @@ openStream sess = do
 -- Returns YamuxSessionShutdown if the session is shut down.
 acceptStream :: YamuxSession -> IO (Either YamuxError YamuxStream)
 acceptStream sess = do
-  stream <- atomically $ readTQueue (ysessAcceptCh sess)
+  stream <- atomically $ readTBQueue (ysessAcceptCh sess)
   -- Send ACK (WindowUpdate frame with ACK flag)
   let hdr =
         YamuxHeader
@@ -148,10 +160,7 @@ ping sess = do
 sendGoAway :: YamuxSession -> GoAwayCode -> IO ()
 sendGoAway sess code = do
   atomically $ writeTVar (ysessShutdown sess) True
-  let errCode = case code of
-        GoAwayNormal -> 0x00
-        GoAwayProtocol -> 0x01
-        GoAwayInternal -> 0x02
+  let errCode = goAwayCodeToWord32 code
   let hdr =
         YamuxHeader
           { yhVersion = 0
@@ -276,6 +285,9 @@ lookupStream sess sid = Map.lookup sid <$> readTVarIO (ysessStreams sess)
 
 -- | Validate and register an inbound SYN (parity + duplicate check).
 -- Returns False on protocol error; the caller sends GoAway and stops.
+-- When the accept backlog is full the SYN is rejected with RST instead
+-- of being buffered (spec.md, ACK backlog: the buffer MUST be bounded);
+-- that is not a protocol error, so the session stays alive.
 acceptInboundSYN :: YamuxSession -> Word32 -> IO Bool
 acceptInboundSYN sess sid = do
   valid <- atomically $ validateInboundSYN sess sid
@@ -284,9 +296,24 @@ acceptInboundSYN sess sid = do
     else do
       stream <- newStream sess sid StreamSYNReceived
       atomically $ do
-        modifyTVar' (ysessStreams sess) (Map.insert sid stream)
-        writeTQueue (ysessAcceptCh sess) stream
+        full <- isFullTBQueue (ysessAcceptCh sess)
+        if full
+          then writeTQueue (ysessSendCh sess) (rstHeader sid, BS.empty)
+          else do
+            modifyTVar' (ysessStreams sess) (Map.insert sid stream)
+            writeTBQueue (ysessAcceptCh sess) stream
       pure True
+
+-- | Data frame carrying only the RST flag for the given stream.
+rstHeader :: Word32 -> YamuxHeader
+rstHeader sid =
+  YamuxHeader
+    { yhVersion = 0
+    , yhType = FrameData
+    , yhFlags = defaultFlags {flagRST = True}
+    , yhStreamId = sid
+    , yhLength = 0
+    }
 
 -- | Reserve receive window for a declared Data-frame length before the
 -- payload is read off the transport. Returns False on a flow-control
@@ -336,16 +363,23 @@ applyRemoteFin sess sid = do
         StreamSYNSent -> writeTVar (ysState stream) StreamRemoteClose
         StreamSYNReceived -> writeTVar (ysState stream) StreamRemoteClose
         StreamEstablished -> writeTVar (ysState stream) StreamRemoteClose
-        StreamLocalClose -> writeTVar (ysState stream) StreamClosed
+        StreamLocalClose -> do
+          -- Both sides FIN'd: the stream is dead, reclaim its map slot
+          writeTVar (ysState stream) StreamClosed
+          modifyTVar' (ysessStreams sess) (Map.delete sid)
         _ -> pure ()
     Nothing -> pure ()
 
--- | Shared RST transition: any state -> Reset.
+-- | Shared RST transition: any state -> Reset. A reset stream is dead,
+-- so its map slot is reclaimed in the same transaction; the application
+-- still holds the handle and observes StreamReset through it.
 applyRemoteRst :: YamuxSession -> Word32 -> IO ()
 applyRemoteRst sess sid = do
   mStream <- lookupStream sess sid
   case mStream of
-    Just stream -> atomically $ writeTVar (ysState stream) StreamReset
+    Just stream -> atomically $ do
+      writeTVar (ysState stream) StreamReset
+      modifyTVar' (ysessStreams sess) (Map.delete sid)
     Nothing -> pure ()
 
 -- | Handle a Ping frame (StreamID must be 0).
@@ -375,10 +409,16 @@ handlePing sess hdr
   | otherwise = pure ()
 
 -- | Handle a GoAway frame (StreamID must be 0).
--- Parse error code and set ysessRemoteGoAway.
+-- Preserve the received error code so callers can distinguish a clean
+-- shutdown (0x00) from a protocol (0x01) or internal (0x02) error.
+-- A code outside the spec-defined range is itself a protocol violation
+-- and is recorded as GoAwayProtocol.
 handleGoAway :: YamuxSession -> YamuxHeader -> IO ()
-handleGoAway sess _hdr = do
-  atomically $ writeTVar (ysessRemoteGoAway sess) True
+handleGoAway sess hdr = do
+  let code = case word32ToGoAwayCode (yhLength hdr) of
+        Just c -> c
+        Nothing -> GoAwayProtocol
+  atomically $ writeTVar (ysessRemoteGoAway sess) (Just code)
 
 -- | Send loop: dequeues frames from ysessSendCh and writes to transport.
 sendLoop :: YamuxSession -> IO ()
