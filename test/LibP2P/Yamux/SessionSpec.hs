@@ -221,14 +221,14 @@ spec = do
         result <- openStream client
         shouldBeLeft YamuxSessionShutdown result
 
-    it "openStream fails after remote GoAway received" $ do
+    it "openStream fails after remote GoAway received, surfacing the code" $ do
       withSessionPair $ \(client, server) -> do
         sendGoAway server GoAwayNormal
         atomically $ do
           got <- readTVar (ysessRemoteGoAway client)
-          check got
+          check (got == Just GoAwayNormal)
         result <- openStream client
-        shouldBeLeft YamuxSessionShutdown result
+        shouldBeLeft (YamuxGoAway GoAwayNormal) result
 
     it "existing streams continue after GoAway" $ do
       withSessionPair $ \(client, server) -> do

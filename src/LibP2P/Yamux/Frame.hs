@@ -7,6 +7,8 @@ module LibP2P.Yamux.Frame
   , Flags (..)
   , YamuxHeader (..)
   , GoAwayCode (..)
+  , goAwayCodeToWord32
+  , word32ToGoAwayCode
   , encodeHeader
   , decodeHeader
   , defaultFlags
@@ -48,6 +50,20 @@ data GoAwayCode
   | GoAwayProtocol  -- ^ 0x01: Protocol error
   | GoAwayInternal  -- ^ 0x02: Internal error
   deriving (Show, Eq)
+
+-- | Wire encoding of a GoAway code (carried in the Length field).
+goAwayCodeToWord32 :: GoAwayCode -> Word32
+goAwayCodeToWord32 GoAwayNormal = 0x00
+goAwayCodeToWord32 GoAwayProtocol = 0x01
+goAwayCodeToWord32 GoAwayInternal = 0x02
+
+-- | Decode a received GoAway code. The spec defines only 0x00-0x02;
+-- anything else is Nothing and the receiver decides how to treat it.
+word32ToGoAwayCode :: Word32 -> Maybe GoAwayCode
+word32ToGoAwayCode 0x00 = Just GoAwayNormal
+word32ToGoAwayCode 0x01 = Just GoAwayProtocol
+word32ToGoAwayCode 0x02 = Just GoAwayInternal
+word32ToGoAwayCode _ = Nothing
 
 -- | Frame flags (bitmask).
 data Flags = Flags

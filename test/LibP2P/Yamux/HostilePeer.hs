@@ -17,6 +17,7 @@ module LibP2P.Yamux.HostilePeer
   , acceptWithin
   , awaitState
   , awaitTrue
+  , awaitRemoteGoAway
   ) where
 
 import Control.Concurrent.Async (withAsync)
@@ -103,3 +104,17 @@ awaitTrue var = do
   case result of
     Just () -> pure ()
     Nothing -> expectationFailure "expected TVar to become True within 1s"
+
+-- | Block until the session records a remote GoAway with the given
+-- code, failing after 1s.
+awaitRemoteGoAway :: YamuxSession -> GoAwayCode -> Expectation
+awaitRemoteGoAway sess expected = do
+  result <- timeout 1000000 $ atomically $ do
+    got <- readTVar (ysessRemoteGoAway sess)
+    check (got == Just expected)
+  case result of
+    Just () -> pure ()
+    Nothing -> do
+      actual <- readTVarIO (ysessRemoteGoAway sess)
+      expectationFailure $
+        "expected remote GoAway " <> show (Just expected) <> " but got " <> show actual

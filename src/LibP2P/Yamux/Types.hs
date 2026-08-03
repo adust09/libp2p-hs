@@ -12,7 +12,7 @@ module LibP2P.Yamux.Types
   , YamuxSession (..)
   ) where
 
-import Control.Concurrent.STM (TMVar, TQueue, TVar)
+import Control.Concurrent.STM (TBQueue, TMVar, TQueue, TVar)
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word32)
@@ -61,10 +61,10 @@ data YamuxSession = YamuxSession
   { ysessRole :: !SessionRole
   , ysessNextStreamId :: !(TVar Word32) -- ^ Next ID to allocate
   , ysessStreams :: !(TVar (Map.Map Word32 YamuxStream)) -- ^ Active streams
-  , ysessAcceptCh :: !(TQueue YamuxStream) -- ^ Inbound streams (max 256 pending)
+  , ysessAcceptCh :: !(TBQueue YamuxStream) -- ^ Inbound streams, bounded to acceptBacklog (256); excess SYNs are reset
   , ysessSendCh :: !(TQueue (YamuxHeader, ByteString)) -- ^ Outbound frame queue
   , ysessShutdown :: !(TVar Bool) -- ^ Local GoAway sent
-  , ysessRemoteGoAway :: !(TVar Bool) -- ^ Remote GoAway received
+  , ysessRemoteGoAway :: !(TVar (Maybe GoAwayCode)) -- ^ Code of the remote GoAway, if one was received
   , ysessPings :: !(TVar (Map.Map Word32 (TMVar ()))) -- ^ Pending ping responses
   , ysessNextPingId :: !(TVar Word32)
   , ysessWrite :: !(ByteString -> IO ()) -- ^ Underlying transport write
