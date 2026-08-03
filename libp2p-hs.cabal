@@ -76,6 +76,7 @@ library
     LibP2P.NAT.Relay.Client
     LibP2P.NAT.DCUtR.Message
     LibP2P.NAT.DCUtR
+    LibP2P.NAT
     LibP2P.Noise.Framing
     LibP2P.Noise.Handshake
     LibP2P.Noise.Session
@@ -168,6 +169,7 @@ test-suite libp2p-hs-test
     LibP2P.NAT.Relay.ClientSpec
     LibP2P.NAT.DCUtR.MessageSpec
     LibP2P.NAT.DCUtR.DCUtRSpec
+    LibP2P.NAT.RegistrationSpec
     LibP2P.Protocol.GossipSub.TypesSpec
     LibP2P.Protocol.GossipSub.MessageSpec
     LibP2P.Protocol.GossipSub.RouterSpec

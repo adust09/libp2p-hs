@@ -14,6 +14,7 @@
 --   addTransport sw tcp
 --   registerIdentifyHandlers sw
 --   registerPingHandler sw
+--   _relayState <- registerNATHandlers sw defaultNATConfig
 --   addrs <- switchListen sw defaultConnectionGater [fromText "/ip4/127.0.0.1/tcp/0"]
 --   print addrs
 --   -- ... dial other peers, etc.
@@ -74,6 +75,19 @@ module LibP2P
   , PingResult (..)
   , PingError (..)
 
+    -- * NAT traversal (AutoNAT, Circuit Relay v2, DCUtR)
+  , NATConfig (..)
+  , defaultNATConfig
+  , registerNATHandlers
+  , registerAutoNATHandler
+  , registerRelayHopHandler
+  , registerRelayStopHandler
+  , registerDCUtRHandler
+  , RelayState
+  , RelayConfig (..)
+  , defaultRelayConfig
+  , newRelayState
+
     -- * GossipSub
   , GossipSubNode (..)
   , GossipSubParams (..)
@@ -92,6 +106,16 @@ import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes, toBase58, parse
 import LibP2P.Multiaddr (Multiaddr (..), fromText, splitP2P, toText)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO (..))
+import LibP2P.NAT
+  ( NATConfig (..)
+  , defaultNATConfig
+  , registerAutoNATHandler
+  , registerDCUtRHandler
+  , registerNATHandlers
+  , registerRelayHopHandler
+  , registerRelayStopHandler
+  )
+import LibP2P.NAT.Relay (RelayConfig (..), RelayState, defaultRelayConfig, newRelayState)
 import LibP2P.Protocol.GossipSub.Handler
   ( GossipSubNode (..)
   , gossipJoin
