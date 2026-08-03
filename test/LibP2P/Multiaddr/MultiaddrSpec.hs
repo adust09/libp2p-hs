@@ -28,11 +28,13 @@ spec = do
     it "encodes quic-v1 as protocol code 461, not legacy quic 460" $
       encodeProtocols [QuicV1] `shouldBe` encodeUvarint 461
 
-    it "encodes zero-address protocols (ws, wss, p2p-circuit)" $ do
-      let ps = [QuicV1, WS, P2PCircuit]
-      let encoded = encodeProtocols ps
-      -- Each is just its varint code, no address bytes
-      BS.length encoded `shouldSatisfy` (> 0)
+    it "encodes each zero-address protocol to exactly its varint code" $ do
+      encodeProtocols [QuicV1] `shouldBe` BS.pack [0xcd, 0x03]
+      encodeProtocols [WS] `shouldBe` BS.pack [0xdd, 0x03]
+      encodeProtocols [WSS] `shouldBe` BS.pack [0xde, 0x03]
+      encodeProtocols [P2PCircuit] `shouldBe` BS.pack [0xa2, 0x02]
+      encodeProtocols [WebTransport] `shouldBe` BS.pack [0xd1, 0x03]
+      encodeProtocols [NoiseProto] `shouldBe` BS.pack [0xc6, 0x03]
 
   describe "Binary decoding" $ do
     it "decodes /ip4/127.0.0.1/tcp/4001 from bytes" $ do
@@ -49,8 +51,13 @@ spec = do
     it "rejects unassigned code 467 (formerly used for yamux)" $
       decodeProtocols (encodeUvarint 467) `shouldSatisfy` isLeft
 
-    it "fails on empty input" $
+    it "decodes empty input as the empty protocol list" $
       decodeProtocols BS.empty `shouldBe` Right []
+
+    it "rejects a varint-prefixed component with an absurd declared length" $ do
+      -- dns (53) claiming a 2^63-1 byte address must not decode as DNS ""
+      let bytes = encodeUvarint 53 <> encodeUvarint (2 ^ (63 :: Int) - 1)
+      decodeProtocols bytes `shouldSatisfy` isLeft
 
     it "fails on unknown protocol code" $ do
       -- 0xff 0x7f = varint 16383, unknown protocol
