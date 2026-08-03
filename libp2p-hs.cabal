@@ -134,6 +134,7 @@ test-suite libp2p-hs-test
     LibP2P.Core.VarintSpec
     LibP2P.Core.MultihashSpec
     LibP2P.Multiaddr.MultiaddrSpec
+    LibP2P.Multiaddr.ProtocolSpec
     LibP2P.Crypto.PeerIdSpec
     LibP2P.Crypto.RSASpec
     LibP2P.Crypto.Secp256k1Spec
