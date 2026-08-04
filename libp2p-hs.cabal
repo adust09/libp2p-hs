@@ -143,6 +143,7 @@ test-suite libp2p-hs-test
     LibP2P.Crypto.KeyImportSpec
     LibP2P.Crypto.SpecVectors
     LibP2P.Crypto.SpecVectorsSpec
+    LibP2P.EofStream
     LibP2P.MultistreamSelect.NegotiationSpec
     LibP2P.Yamux.FrameSpec
     LibP2P.Yamux.HostilePeer
