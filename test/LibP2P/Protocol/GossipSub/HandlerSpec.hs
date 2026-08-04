@@ -28,6 +28,7 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.Protocol.GossipSub.Handler
   ( GossipSubNode (..)
+  , floodSubProtocolId
   , gossipJoin
   , gossipLeave
   , gossipPublish
@@ -281,6 +282,23 @@ spec = do
       case (h11', h10') of
         (Nothing, Nothing) -> pure ()
         _ -> expectationFailure "both protocol versions should be unregistered after stop"
+
+    -- Issue #157 last item: floodsub compatibility — /floodsub/1.0.0 is
+    -- registered alongside the meshsub protocols so floodsub-only peers
+    -- get a pubsub stream.
+    it "registers a handler for /floodsub/1.0.0 and removes it on stop" $ do
+      (sw, _pid) <- mkTestSwitch
+      node <- newGossipSubNode sw testParams
+      startGossipSub node
+      hFs <- lookupStreamHandler sw floodSubProtocolId
+      case hFs of
+        Just _  -> pure ()
+        Nothing -> expectationFailure "/floodsub/1.0.0 should be registered"
+      stopGossipSub node
+      hFs' <- lookupStreamHandler sw floodSubProtocolId
+      case hFs' of
+        Nothing -> pure ()
+        Just _  -> expectationFailure "/floodsub/1.0.0 should be unregistered after stop"
 
   describe "stopGossipSub" $ do
     it "cancels heartbeat and unregisters handler" $ do

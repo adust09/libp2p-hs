@@ -26,6 +26,7 @@ module LibP2P.Protocol.GossipSub.Handler
     -- * Constants
   , gossipSubProtocolId
   , gossipSubProtocolIdV10
+  , floodSubProtocolId
   ) where
 
 import Control.Concurrent.Async (Async, async, cancel)
@@ -91,14 +92,22 @@ gossipSubProtocolId = "/meshsub/1.1.0"
 gossipSubProtocolIdV10 :: ProtocolId
 gossipSubProtocolIdV10 = "/meshsub/1.0.0"
 
+-- | FloodSub protocol ID, advertised alongside the meshsub protocols so
+-- that floodsub-only peers still get a pubsub stream (#157,
+-- gossipsub-v1.0.md "Compatibility with FloodSub").
+floodSubProtocolId :: ProtocolId
+floodSubProtocolId = "/floodsub/1.0.0"
+
 -- | All protocol IDs we register and offer, preferred first.
 gossipSubProtocolIds :: [ProtocolId]
-gossipSubProtocolIds = [gossipSubProtocolId, gossipSubProtocolIdV10]
+gossipSubProtocolIds =
+  [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
 
 -- | Map a negotiated protocol ID to the peer's protocol version.
 protocolFor :: ProtocolId -> PeerProtocol
 protocolFor proto
   | proto == gossipSubProtocolIdV10 = GossipSubV10Peer
+  | proto == floodSubProtocolId     = FloodSubPeer
   | otherwise                       = GossipSubPeer
 
 -- | A GossipSub node: Router + Switch integration.

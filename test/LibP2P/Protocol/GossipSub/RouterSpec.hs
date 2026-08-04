@@ -121,6 +121,13 @@ addSubscribedPeer router pid topic = do
   atomically $ modifyTVar' (gsPeers router) $
     Map.adjust (\ps -> ps { psTopics = Set.singleton topic }) pid
 
+-- | Add a /floodsub/1.0.0 peer that is subscribed to a topic.
+addFloodSubPeer :: GossipSubRouter -> PeerId -> Topic -> IO ()
+addFloodSubPeer router pid topic = do
+  addPeer router pid FloodSubPeer False fixedTime
+  atomically $ modifyTVar' (gsPeers router) $
+    Map.adjust (\ps -> ps { psTopics = Set.singleton topic }) pid
+
 spec :: Spec
 spec = do
   describe "GossipSub.Router" $ do
@@ -1292,3 +1299,132 @@ spec = do
         sent <- readIORef logRef
         let publishedTo = [ pid | (pid, rpc) <- sent, not (null (rpcPublish rpc)) ]
         publishedTo `shouldBe` [dp]
+
+    -- Issue #157 last item: floodsub compatibility (gossipsub-v1.0.md
+    -- "Compatibility with FloodSub"). Floodsub peers receive every message
+    -- for topics they subscribe to, are never mesh members, and are never
+    -- sent gossipsub control messages.
+    describe "FloodSub compatibility (#157)" $ do
+      it "forwardMessage floods to a subscribed floodsub peer outside the mesh" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let fsPeer   = mkPeerId 9
+            meshPeer = mkPeerId 1
+            sender   = mkPeerId 2
+        addSubscribedPeer router meshPeer "t"
+        addSubscribedPeer router sender "t"
+        addFloodSubPeer router fsPeer "t"
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "t" (Set.fromList [meshPeer, sender])
+        kp <- newKeyPair
+        forwardMessage router sender (signedMessage kp "t" (BS.pack [1]))
+        sent <- readIORef logRef
+        let recipients = Set.fromList
+              [ pid | (pid, rpc) <- sent, not (null (rpcPublish rpc)) ]
+        recipients `shouldBe` Set.fromList [meshPeer, fsPeer]
+
+      it "forwardMessage skips floodsub peers subscribed to other topics" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let fsPeer = mkPeerId 9
+            sender = mkPeerId 2
+        addSubscribedPeer router sender "t"
+        addFloodSubPeer router fsPeer "other"
+        kp <- newKeyPair
+        forwardMessage router sender (signedMessage kp "t" (BS.pack [1]))
+        sent <- readIORef logRef
+        let recipients = [ pid | (pid, rpc) <- sent, not (null (rpcPublish rpc)) ]
+        recipients `shouldBe` []
+
+      it "mesh publish always includes subscribed floodsub peers" $ do
+        (router, logRef) <- mkTestRouterWithParams
+          defaultGossipSubParams { paramFloodPublish = False } localPid
+        let fsPeer   = mkPeerId 9
+            meshPeer = mkPeerId 1
+        addSubscribedPeer router meshPeer "t"
+        addFloodSubPeer router fsPeer "t"
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "t" (Set.singleton meshPeer)
+        kp <- newKeyPair
+        publish router "t" (BS.pack [1]) (Just kp)
+        sent <- readIORef logRef
+        let publishedTo = Set.fromList
+              [ pid | (pid, rpc) <- sent, not (null (rpcPublish rpc)) ]
+        publishedTo `shouldBe` Set.fromList [meshPeer, fsPeer]
+
+      it "fanout publish reaches floodsub peers without selecting them into fanout" $ do
+        (router, logRef) <- mkTestRouterWithParams
+          defaultGossipSubParams { paramFloodPublish = False } localPid
+        let fsPeer = mkPeerId 9
+            gsPeer = mkPeerId 1
+        addSubscribedPeer router gsPeer "t"
+        addFloodSubPeer router fsPeer "t"
+        kp <- newKeyPair
+        publish router "t" (BS.pack [1]) (Just kp)
+        sent <- readIORef logRef
+        let publishedTo = Set.fromList
+              [ pid | (pid, rpc) <- sent, not (null (rpcPublish rpc)) ]
+        publishedTo `shouldBe` Set.fromList [gsPeer, fsPeer]
+        fanout <- readTVarIO (gsFanout router)
+        Set.member fsPeer (Map.findWithDefault Set.empty "t" fanout)
+          `shouldBe` False
+
+      it "delivers and forwards an inbound message from a floodsub peer" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let fsPeer   = mkPeerId 9
+            meshPeer = mkPeerId 1
+        addFloodSubPeer router fsPeer "t"
+        addSubscribedPeer router meshPeer "t"
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "t" (Set.singleton meshPeer)
+        deliveredRef <- newIORef []
+        atomically $ writeTVar (gsOnMessage router) $
+          \topic msg -> modifyIORef' deliveredRef (++ [(topic, msgData msg)])
+        kp <- newKeyPair
+        let msg = signedMessage kp "t" (BS.pack [42])
+        handleRPC router fsPeer emptyRPC { rpcPublish = [msg] }
+        readIORef deliveredRef `shouldReturn` [("t", BS.pack [42])]
+        sent <- readIORef logRef
+        let forwardedTo = [ pid | (pid, rpc) <- sent, not (null (rpcPublish rpc)) ]
+        forwardedTo `shouldBe` [meshPeer]
+
+      it "join never adds a floodsub peer to the mesh or sends it control" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let fsPeer = mkPeerId 9
+        addFloodSubPeer router fsPeer "t"
+        join router "t"
+        mesh <- readTVarIO (gsMesh router)
+        Set.member fsPeer (Map.findWithDefault Set.empty "t" mesh) `shouldBe` False
+        sent <- readIORef logRef
+        let controlTo = [ pid | (pid, rpc) <- sent
+                              , Just _ <- [rpcControl rpc] ]
+        controlTo `shouldBe` []
+
+      it "ignores GRAFT from a floodsub peer without grafting it" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let fsPeer = mkPeerId 9
+        addFloodSubPeer router fsPeer "t"
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "t")
+        handleGraft router fsPeer [Graft "t"]
+        mesh <- readTVarIO (gsMesh router)
+        Set.member fsPeer (Map.findWithDefault Set.empty "t" mesh) `shouldBe` False
+        sent <- readIORef logRef
+        prunesTo fsPeer sent `shouldBe` []
+
+      it "never replies PRUNE to a rejected GRAFT from a floodsub peer" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let fsPeer = mkPeerId 9
+            routerNeg = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const (-1) } }
+        addFloodSubPeer routerNeg fsPeer "t"
+        atomically $ modifyTVar' (gsSubscriptions routerNeg) (Set.insert "t")
+        handleGraft routerNeg fsPeer [Graft "t"]
+        sent <- readIORef logRef
+        prunesTo fsPeer sent `shouldBe` []
+
+      it "never replies IWANT to an IHAVE from a floodsub peer" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let fsPeer = mkPeerId 9
+        addFloodSubPeer router fsPeer "t"
+        handleIHave router fsPeer [IHave "t" [BS.pack [1]]]
+        sent <- readIORef logRef
+        iwantsSent sent `shouldBe` []

@@ -130,6 +130,7 @@ fillUndersubscribed router topic meshPeers now = do
                            , Set.member topic (psTopics ps)
                            , not (Set.member pid meshPeers)
                            , not (Set.member pid direct)  -- never graft direct peers
+                           , psProtocol ps /= FloodSubPeer  -- floodsub peers have no mesh (#157)
                            , not (isInBackoff backoffMap pid topic now)
                            , computeScore (gsScoreParams router) pid ps ipMap now >= 0
                            ]
@@ -224,6 +225,7 @@ fanoutMaintenance router = do
                                , Set.member topic (psTopics ps)
                                , not (Set.member pid fanoutPeers)
                                , not (Set.member pid direct)
+                               , psProtocol ps /= FloodSubPeer  -- flooded, never fanout members (#157)
                                ]
           let needed = d - Set.size fanoutPeers
           selected <- sampleIO (min needed (length eligible)) eligible
@@ -257,11 +259,13 @@ emitGossip router = do
       let meshPeers = Map.findWithDefault Set.empty topic meshMap
           -- Eligible: subscribed to topic, not in mesh, and scoring at or
           -- above the gossip threshold — no gossip is emitted towards
-          -- peers below it (gossipsub-v1.1.md gossip threshold)
+          -- peers below it (gossipsub-v1.1.md gossip threshold). Floodsub
+          -- peers never receive control messages, IHAVE included (#157).
           gossipThreshold = stGossipThreshold (gsThresholds router)
           nonMeshPeers = [ pid | (pid, ps) <- Map.toList peersMap
                                , Set.member topic (psTopics ps)
                                , not (Set.member pid meshPeers)
+                               , psProtocol ps /= FloodSubPeer
                                , computeScore (gsScoreParams router) pid ps ipMap now
                                    >= gossipThreshold
                                ]

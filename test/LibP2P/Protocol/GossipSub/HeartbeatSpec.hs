@@ -56,6 +56,13 @@ addSubscribedPeer router pid topic now = do
   atomically $ modifyTVar' (gsPeers router) $
     Map.adjust (\ps -> ps { psTopics = Set.singleton topic }) pid
 
+-- | Add a subscribed /floodsub/1.0.0 peer (never a mesh candidate).
+addFloodSubPeer :: GossipSubRouter -> PeerId -> Topic -> UTCTime -> IO ()
+addFloodSubPeer router pid topic now = do
+  addPeer router pid FloodSubPeer False now
+  atomically $ modifyTVar' (gsPeers router) $
+    Map.adjust (\ps -> ps { psTopics = Set.singleton topic }) pid
+
 localPid :: PeerId
 localPid = mkPeerId 0
 
@@ -489,6 +496,47 @@ spec = do
                             , Just ctrl <- [rpcControl rpc]
                             , not (null (ctrlGraft ctrl)) ]
         graftTo `shouldBe` [mkPeerId 1]
+
+    -- Issue #157 last item: floodsub peers are skipped by all mesh/fanout
+    -- maintenance and never receive control messages, including heartbeat
+    -- gossip (gossipsub-v1.0.md "Compatibility with FloodSub").
+    describe "FloodSub compatibility (#157)" $ do
+      it "mesh fill never GRAFTs a floodsub peer" $ do
+        (router, logRef, _) <- mkHeartbeatRouter localPid fixedTime
+        let fsPeer = mkPeerId 9
+        addFloodSubPeer router fsPeer "t" fixedTime
+        addSubscribedPeer router (mkPeerId 1) "t" fixedTime
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "t")
+        heartbeatOnce router
+        mesh <- readTVarIO (gsMesh router)
+        let meshPeers = Map.findWithDefault Set.empty "t" mesh
+        Set.member fsPeer meshPeers `shouldBe` False
+        Set.member (mkPeerId 1) meshPeers `shouldBe` True
+        sent <- readIORef logRef
+        let graftTo = [ pid | (pid, rpc) <- sent
+                            , Just ctrl <- [rpcControl rpc]
+                            , not (null (ctrlGraft ctrl)) ]
+        graftTo `shouldBe` [mkPeerId 1]
+
+      it "heartbeat gossip emits no control to a floodsub peer and never selects it into fanout" $ do
+        (router, logRef, _) <- mkHeartbeatRouter localPid fixedTime
+        let fsPeer = mkPeerId 9
+        addFloodSubPeer router fsPeer "t" fixedTime
+        let mkMsg n = PubSubMessage
+              { msgFrom = Nothing, msgData = BS.pack [n], msgSeqNo = Nothing
+              , msgTopic = "t", msgSignature = Nothing, msgKey = Nothing }
+        atomically $ do
+          modifyTVar' (gsFanout router) (Map.insert "t" Set.empty)
+          modifyTVar' (gsMessageCache router) $ \c ->
+            foldl (\acc n -> cachePut (BS.pack [n]) (mkMsg n) acc) c [1, 2, 3]
+        heartbeatOnce router
+        sent <- readIORef logRef
+        let controlTo = [ pid | (pid, rpc) <- sent
+                              , Just _ <- [rpcControl rpc] ]
+        controlTo `shouldBe` []
+        fanout <- readTVarIO (gsFanout router)
+        Set.member fsPeer (Map.findWithDefault Set.empty "t" fanout)
+          `shouldBe` False
 
     describe "Protocol version gating (#157)" $ do
       it "negative-score PRUNE to a /meshsub/1.0.0 peer omits the backoff field" $ do

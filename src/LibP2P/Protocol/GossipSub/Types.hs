@@ -11,6 +11,7 @@ module LibP2P.Protocol.GossipSub.Types
   ( -- * Protocol constants
     gossipSubProtocolId
   , gossipSubProtocolIdV10
+  , floodSubProtocolId
   , maxRPCSize
     -- * Topic and message identity
   , Topic
@@ -84,6 +85,13 @@ gossipSubProtocolId = "/meshsub/1.1.0"
 -- fully backwards compatible with v1.0 of the protocol).
 gossipSubProtocolIdV10 :: Text
 gossipSubProtocolIdV10 = "/meshsub/1.0.0"
+
+-- | FloodSub protocol identifier. Advertised alongside the meshsub
+-- protocols (gossipsub-v1.0.md "Compatibility with FloodSub"): floodsub
+-- peers receive all messages for topics they subscribe to and are never
+-- sent gossipsub control messages.
+floodSubProtocolId :: Text
+floodSubProtocolId = "/floodsub/1.0.0"
 
 -- | Maximum RPC message size: 1 MiB.
 maxRPCSize :: Int
@@ -261,11 +269,13 @@ defaultGossipSubParams = GossipSubParams
 
 -- | Peer's negotiated protocol capability. Peers on /meshsub/1.0.0 must
 -- not receive v1.1 control extensions (PX records or the backoff field
--- in PRUNE).
+-- in PRUNE). Peers on /floodsub/1.0.0 have no mesh: they are flooded
+-- every message for topics they subscribe to and never receive control
+-- messages (gossipsub-v1.0.md "Compatibility with FloodSub").
 data PeerProtocol
   = GossipSubPeer     -- ^ GossipSub v1.1 (/meshsub/1.1.0)
   | GossipSubV10Peer  -- ^ GossipSub v1.0 (/meshsub/1.0.0)
-  | FloodSubPeer      -- ^ FloodSub only (/floodsub/1.0.0, not yet negotiated)
+  | FloodSubPeer      -- ^ FloodSub only (/floodsub/1.0.0)
   deriving (Show, Eq)
 
 -- | Per-peer state tracked by the router.
