@@ -66,6 +66,7 @@ library
     LibP2P.DHT.Distance
     LibP2P.DHT.RoutingTable
     LibP2P.DHT.Message
+    LibP2P.DHT.Validator
     LibP2P.DHT
     LibP2P.DHT.Lookup
     LibP2P.NAT.AutoNAT.Message
@@ -168,6 +169,7 @@ test-suite libp2p-hs-test
     LibP2P.DHT.MessageSpec
     LibP2P.DHT.DHTSpec
     LibP2P.DHT.LookupSpec
+    LibP2P.DHT.ValidatorSpec
     LibP2P.NAT.AutoNAT.MessageSpec
     LibP2P.NAT.AutoNAT.AutoNATSpec
     LibP2P.Crypto.SignedEnvelopeSpec

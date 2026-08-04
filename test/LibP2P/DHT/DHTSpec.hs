@@ -12,15 +12,19 @@ import Control.Concurrent.STM
 import Crypto.Hash (Digest, SHA256, hash)
 import Data.ByteArray (convert)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BSC
 import qualified Data.Map.Strict as Map
-import Data.Time (getCurrentTime)
+import qualified Data.Text as T
+import Data.Time (addUTCTime, getCurrentTime)
 import Data.Word (Word8)
+import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair (..), PublicKey (..), PrivateKey (..), KeyType (..))
-import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
+import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey, peerIdBytes)
+import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.DHT
 import LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
 import LibP2P.DHT.Message
-import LibP2P.DHT.RoutingTable (insertPeer)
+import LibP2P.DHT.RoutingTable (allPeers, bucketForPeer, insertPeer, newRoutingTable)
 import LibP2P.DHT.Types
 import LibP2P.Multiaddr (Multiaddr, fromText, toBytes)
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), negotiateResponder)
@@ -100,6 +104,33 @@ dummyKeyPair = KeyPair
 -- | A test multiaddr for address propagation assertions.
 testAddr :: Multiaddr
 testAddr = either error id (fromText "/ip4/127.0.0.1/tcp/4001")
+
+-- | Build a valid /pk/ record: key is "/pk/" ++ peer ID multihash,
+-- value is the serialized PublicKey protobuf that hashes to that ID.
+mkPkRecord :: IO (BS.ByteString, BS.ByteString)
+mkPkRecord = do
+  ekp <- generateKeyPair
+  case ekp of
+    Left err -> fail ("keypair generation failed: " ++ err)
+    Right kp -> do
+      let pub = kpPublic kp
+          pid = fromPublicKey pub
+      pure (BSC.pack "/pk/" <> peerIdBytes pid, encodePublicKey pub)
+
+-- | A bucket entry with no addresses for routing-table tests.
+mkEntry :: PeerId -> IO BucketEntry
+mkEntry pid = do
+  now <- getCurrentTime
+  pure (BucketEntry pid (peerIdToKey pid) [] now NotConnected)
+
+-- | Peer IDs that all land in the same k-bucket (index 0) of localPid's
+-- routing table, used to fill a bucket to capacity.
+sameBucketPeers :: Int -> [PeerId]
+sameBucketPeers n =
+  let rt = newRoutingTable localPid
+      candidates = [mkPeerId (BS.pack [10, i]) | i <- [0 .. 255]]
+      inBucket pid = bucketForPeer (peerIdToKey pid) rt == 0
+  in take n (filter inBucket candidates)
 
 -- | Create a stream pair for testing, with close/EOF support.
 -- Closing one end makes reads on the other end fail once the in-flight
@@ -321,10 +352,10 @@ spec = do
           msgType resp `shouldBe` GetValue
         Left err -> expectationFailure $ "Failed: " ++ err
 
-    it "PUT_VALUE stores record" $ do
+    it "PUT_VALUE stores a valid /pk/ record and stamps timeReceived" $ do
       node <- mkTestNode localPid
-      let key = BS.pack [0xBE, 0xEF]
-          rec = DHTRecord key (BS.pack [1, 2, 3]) "2024-06-15T12:00:00Z"
+      (key, value) <- mkPkRecord
+      let rec = DHTRecord key value "2024-06-15T12:00:00Z"
 
       (clientStream, serverStream) <- mkStreamPair
       let request = emptyDHTMessage
@@ -338,7 +369,13 @@ spec = do
       _ <- readFramedMessage clientStream maxDHTMessageSize
 
       stored <- lookupRecord node key
-      stored `shouldBe` Just rec
+      fmap recKey stored `shouldBe` Just key
+      fmap recValue stored `shouldBe` Just value
+      -- Spec: "Time the record was received, set by receiver" — the
+      -- sender's claimed timestamp must be replaced, not echoed into
+      -- the store.
+      fmap recTimeReceived stored `shouldNotBe` Just "2024-06-15T12:00:00Z"
+      fmap (T.null . recTimeReceived) stored `shouldBe` Just False
 
     it "ADD_PROVIDER rejects mismatched sender" $ do
       node <- mkTestNode localPid
@@ -596,3 +633,173 @@ spec = do
       node <- mkTestNode localPid
       result <- getProviders node (BS.pack [0xFF])
       result `shouldBe` []
+
+  -- Issue #148 (1): PUT_VALUE must validate records before storing them.
+  describe "PUT_VALUE validation" $ do
+    it "rejects a record under an unregistered namespace" $ do
+      node <- mkTestNode localPid
+      let key = BS.pack [0xBE, 0xEF]
+          rec = DHTRecord key (BS.pack [1, 2, 3]) ""
+
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage
+            { msgType = PutValue, msgKey = key, msgRecord = Just rec }
+      writeFramedMessage clientStream request
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid
+      resp <- readFramedMessage clientStream maxDHTMessageSize
+
+      stored <- lookupRecord node key
+      stored `shouldBe` Nothing
+      -- The rejected record must not be echoed back as accepted.
+      fmap msgRecord resp `shouldBe` Right Nothing
+
+    it "rejects a /pk/ record bound to a different peer" $ do
+      node <- mkTestNode localPid
+      (_, value) <- mkPkRecord
+      (otherKey, _) <- mkPkRecord
+      let rec = DHTRecord otherKey value ""
+
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage
+            { msgType = PutValue, msgKey = otherKey, msgRecord = Just rec }
+      writeFramedMessage clientStream request
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid
+      _ <- readFramedMessage clientStream maxDHTMessageSize
+
+      stored <- lookupRecord node otherKey
+      stored `shouldBe` Nothing
+
+    it "rejects a record whose embedded key differs from the message key" $ do
+      node <- mkTestNode localPid
+      (key, value) <- mkPkRecord
+      (msgOnlyKey, _) <- mkPkRecord
+      let rec = DHTRecord key value ""
+
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage
+            { msgType = PutValue, msgKey = msgOnlyKey, msgRecord = Just rec }
+      writeFramedMessage clientStream request
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid
+      _ <- readFramedMessage clientStream maxDHTMessageSize
+
+      storedUnderMsgKey <- lookupRecord node msgOnlyKey
+      storedUnderRecKey <- lookupRecord node key
+      storedUnderMsgKey `shouldBe` Nothing
+      storedUnderRecKey `shouldBe` Nothing
+
+  -- Issue #148 (5): provider records must expire after the 48h TTL and
+  -- must not duplicate when a provider republishes.
+  describe "provider TTL" $ do
+    it "getProviders drops entries older than the provider TTL" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let key = BS.pack [0xAA]
+          stalePid = mkPeerId (BS.pack [5])
+          freshPid = mkPeerId (BS.pack [6])
+          stale = ProviderEntry stalePid [] (addUTCTime (negate (49 * 3600)) now)
+          fresh = ProviderEntry freshPid [] now
+      addProvider node key stale
+      addProvider node key fresh
+      result <- getProviders node key
+      map peProvider result `shouldBe` [freshPid]
+
+    it "GET_PROVIDERS omits expired providers" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let key = BS.pack [0xAB]
+          stale = ProviderEntry (mkPeerId (BS.pack [5])) []
+                    (addUTCTime (negate (49 * 3600)) now)
+      addProvider node key stale
+
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage { msgType = GetProviders, msgKey = key }
+      writeFramedMessage clientStream request
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid
+      resp <- readFramedMessage clientStream maxDHTMessageSize
+      fmap msgProviderPeers resp `shouldBe` Right []
+
+    it "addProvider replaces an existing entry for the same provider" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let key = BS.pack [0xAC]
+          pid = mkPeerId (BS.pack [7])
+          older = ProviderEntry pid [] (addUTCTime (negate 60) now)
+          newer = ProviderEntry pid [] now
+      addProvider node key older
+      addProvider node key newer
+      result <- getProviders node key
+      result `shouldBe` [newer]
+
+  -- Issue #148 (4, 6): the routing table must grow from observed peers,
+  -- with the LRS ping-or-drop policy when a bucket is full.
+  describe "routing-table growth" $ do
+    it "an inbound request adds the sender to the routing table" $ do
+      node <- mkTestNode localPid
+      (clientStream, serverStream) <- mkStreamPair
+      let request = emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [7] }
+      writeFramedMessage clientStream request
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid
+      rt <- readTVarIO (dhtRoutingTable node)
+      map entryPeerId (allPeers rt) `shouldContain` [remotePid]
+
+    it "addPeerToTable evicts an unresponsive LRS peer from a full bucket" $ do
+      node0 <- mkTestNode localPid
+      let node = node0 { dhtSendRequest = \_ _ -> pure (Left "unreachable") }
+          bucketPeers = sameBucketPeers (kValue + 1)
+          initial = take kValue bucketPeers
+          newcomer = last bucketPeers
+          lrs = head initial
+      mapM_ (\pid -> do
+               e <- mkEntry pid
+               atomically $ modifyTVar' (dhtRoutingTable node) (fst . insertPeer e))
+            initial
+      entry <- mkEntry newcomer
+      result <- addPeerToTable node entry
+      result `shouldBe` Inserted
+      rt <- readTVarIO (dhtRoutingTable node)
+      let pids = map entryPeerId (allPeers rt)
+      pids `shouldContain` [newcomer]
+      pids `shouldNotContain` [lrs]
+
+    it "addPeerToTable keeps a responsive LRS peer and drops the newcomer" $ do
+      node0 <- mkTestNode localPid
+      let node = node0
+            { dhtSendRequest = \_ _ ->
+                pure (Right (emptyDHTMessage { msgType = FindNode })) }
+          bucketPeers = sameBucketPeers (kValue + 1)
+          initial = take kValue bucketPeers
+          newcomer = last bucketPeers
+          lrs = head initial
+      mapM_ (\pid -> do
+               e <- mkEntry pid
+               atomically $ modifyTVar' (dhtRoutingTable node) (fst . insertPeer e))
+            initial
+      entry <- mkEntry newcomer
+      result <- addPeerToTable node entry
+      result `shouldBe` BucketFull lrs
+      rt <- readTVarIO (dhtRoutingTable node)
+      let pids = map entryPeerId (allPeers rt)
+      pids `shouldContain` [lrs]
+      pids `shouldNotContain` [newcomer]
+
+  -- Issue #148 (3): client-mode nodes must not offer the Kademlia
+  -- protocol for incoming streams.
+  describe "client/server mode" $ do
+    it "registerDHTHandler is a no-op for a client-mode node" $ do
+      sw <- mkMockSwitch localPid
+      node <- newDHTNode sw DHTClient
+      registerDHTHandler node
+      protos <- readTVarIO (swProtocols sw)
+      Map.member dhtProtocolId protos `shouldBe` False
+
+    it "registerDHTHandler registers the protocol for a server-mode node" $ do
+      sw <- mkMockSwitch localPid
+      node <- newDHTNode sw DHTServer
+      registerDHTHandler node
+      protos <- readTVarIO (swProtocols sw)
+      Map.member dhtProtocolId protos `shouldBe` True

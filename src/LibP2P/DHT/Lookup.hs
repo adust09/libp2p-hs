@@ -27,10 +27,16 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Time (UTCTime, getCurrentTime)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
-import LibP2P.DHT (DHTNode (..), ProviderEntry (..), Validator (..), decodePeerAddrs)
+import LibP2P.DHT
+  ( DHTNode (..)
+  , ProviderEntry (..)
+  , Validator (..)
+  , addPeerToTable
+  , decodePeerAddrs
+  )
 import LibP2P.DHT.Distance (keyToDHTKey, peerIdToKey, sortByDistance)
 import LibP2P.DHT.Message
-import LibP2P.DHT.RoutingTable (closestPeers, insertPeer, allPeers)
+import LibP2P.DHT.RoutingTable (allPeers, closestPeers)
 import LibP2P.DHT.Types
 
 -- | Result of an iterative lookup.
@@ -74,10 +80,10 @@ lookupLoop
   -> TVar [BucketEntry]   -- ^ Candidates sorted by XOR distance to target
   -> TVar (Set PeerId)    -- ^ Already queried peers
   -> TVar (Set PeerId)    -- ^ Known peers (all candidates ever seen, for dedup)
-  -> a                    -- ^ Timestamp placeholder (UTCTime)
+  -> UTCTime              -- ^ Lookup start time (last-seen for new entries)
   -> MessageType          -- ^ Query type
   -> IO [BucketEntry]
-lookupLoop node wireKey targetKey candidatesVar queriedVar knownVar _now queryType = go
+lookupLoop node wireKey targetKey candidatesVar queriedVar knownVar now queryType = go
   where
     go = do
       -- Pick up to alpha unqueried candidates closest to target
@@ -101,19 +107,27 @@ lookupLoop node wireKey targetKey candidatesVar queriedVar knownVar _now queryTy
           results <- mapConcurrently (queryPeer node wireKey queryType) toQuery
 
           -- Merge results
-          atomically $ do
+          newEntries <- atomically $ do
             known <- readTVar knownVar
             candidates <- readTVar candidatesVar
             let newPeers = concatMap (either (const []) id) results
                 -- Convert DHTPeers to BucketEntries, excluding already known
                 newEntries = filter (\e -> not (Set.member (entryPeerId e) known))
-                           $ map (dhtPeerToEntry _now) newPeers
+                           $ map (dhtPeerToEntry now) newPeers
                 -- Mark new entries as known
                 newKnown = Set.union known (Set.fromList (map entryPeerId newEntries))
                 -- Merge and re-sort by XOR distance
                 merged = sortByDistance targetKey (candidates ++ newEntries)
             writeTVar candidatesVar merged
             writeTVar knownVar newKnown
+            pure newEntries
+
+          -- Peers encountered throughout the search are inserted in the
+          -- routing table, as per usual business (specs/kad-dht,
+          -- bootstrap process); responders are refreshed as live.
+          insertLookupPeers node
+            [e | (e, Right _) <- zip toQuery results]
+            newEntries
 
           -- Check termination: have we queried top-k?
           shouldContinue <- atomically $ do
@@ -179,9 +193,9 @@ valueLoop
   -> TVar (Set PeerId)    -- ^ Peers that returned best value
   -> TVar (Set PeerId)    -- ^ Peers with outdated values
   -> Validator
-  -> a
+  -> UTCTime              -- ^ Lookup start time (last-seen for new entries)
   -> IO (Either String DHTRecord)
-valueLoop node wireKey targetKey candidatesVar queriedVar knownVar bestVar bestPeersVar outdatedVar validator _now = go
+valueLoop node wireKey targetKey candidatesVar queriedVar knownVar bestVar bestPeersVar outdatedVar validator now = go
   where
     go = do
       toQuery <- atomically $ do
@@ -199,19 +213,25 @@ valueLoop node wireKey targetKey candidatesVar queriedVar knownVar bestVar bestP
           results <- mapConcurrently (queryPeerForValue node wireKey) toQuery
 
           -- Process each result
-          mapM_ (processValueResult node targetKey bestVar bestPeersVar outdatedVar validator _now) results
+          mapM_ (processValueResult node targetKey bestVar bestPeersVar outdatedVar validator now) results
 
           -- Merge closer peers from responses
-          atomically $ do
+          newEntries <- atomically $ do
             known <- readTVar knownVar
             candidates <- readTVar candidatesVar
             let newPeers = concatMap (\(_, peers, _) -> either (const []) id peers) results
                 newEntries = filter (\e -> not (Set.member (entryPeerId e) known))
-                           $ map (dhtPeerToEntry _now) newPeers
+                           $ map (dhtPeerToEntry now) newPeers
                 newKnown = Set.union known (Set.fromList (map entryPeerId newEntries))
                 merged = sortByDistance targetKey (candidates ++ newEntries)
             writeTVar candidatesVar merged
             writeTVar knownVar newKnown
+            pure newEntries
+
+          -- Grow the routing table from peers seen this round.
+          insertLookupPeers node
+            [e | (e, (_, Right _, _)) <- zip toQuery results]
+            newEntries
 
           -- Check termination
           shouldContinue <- atomically $ do
@@ -253,16 +273,22 @@ queryPeerForValue node wireKey entry = do
     Right resp -> (entryPeerId entry, Right (msgCloserPeers resp), msgRecord resp)
 
 -- | Process a value result: update best/bestPeers/outdated.
+--
+-- Per specs/kad-dht (Entry validation), values retrieved in a GET_VALUE
+-- query are validated before being considered; records failing the
+-- validator are ignored as if the peer had returned no record.
 processValueResult
   :: DHTNode -> DHTKey
   -> TVar (Maybe DHTRecord)
   -> TVar (Set PeerId)
   -> TVar (Set PeerId)
   -> Validator
-  -> a
+  -> UTCTime
   -> (PeerId, Either String [DHTPeer], Maybe DHTRecord)
   -> IO ()
-processValueResult _ _ bestVar bestPeersVar outdatedVar validator _ (pid, _, Just rec) = do
+processValueResult _ _ bestVar bestPeersVar outdatedVar validator _ (pid, _, Just rec)
+  | Left _ <- valValidate validator (recKey rec) (recValue rec) = pure ()
+  | otherwise = do
   atomically $ do
     best <- readTVar bestVar
     case best of
@@ -310,9 +336,9 @@ providerLoop
   -> TVar (Set PeerId)
   -> TVar (Set PeerId)    -- ^ Known peers (dedup)
   -> TVar [ProviderEntry]
-  -> a
+  -> UTCTime              -- ^ Lookup start time (last-seen for new entries)
   -> IO [ProviderEntry]
-providerLoop node wireKey targetKey candidatesVar queriedVar knownVar providersVar _now = go
+providerLoop node wireKey targetKey candidatesVar queriedVar knownVar providersVar now = go
   where
     go = do
       toQuery <- atomically $ do
@@ -330,20 +356,26 @@ providerLoop node wireKey targetKey candidatesVar queriedVar knownVar providersV
           results <- mapConcurrently (queryPeerForProviders node wireKey) toQuery
 
           -- Collect providers and closer peers
-          atomically $ do
+          newEntries <- atomically $ do
             known <- readTVar knownVar
             candidates <- readTVar candidatesVar
             currentProviders <- readTVar providersVar
             let allCloser = concatMap (\(_, closer, _) -> either (const []) id closer) results
                 allProviders = concatMap (\(_, _, provs) -> provs) results
                 newEntries = filter (\e -> not (Set.member (entryPeerId e) known))
-                           $ map (dhtPeerToEntry _now) allCloser
+                           $ map (dhtPeerToEntry now) allCloser
                 newKnown = Set.union known (Set.fromList (map entryPeerId newEntries))
                 merged = sortByDistance targetKey (candidates ++ newEntries)
-                newProviderEntries = map dhtPeerToProvider allProviders
+                newProviderEntries = map (dhtPeerToProvider now) allProviders
             writeTVar candidatesVar merged
             writeTVar knownVar newKnown
             writeTVar providersVar (currentProviders ++ newProviderEntries)
+            pure newEntries
+
+          -- Grow the routing table from peers seen this round.
+          insertLookupPeers node
+            [e | (e, (_, Right _, _)) <- zip toQuery results]
+            newEntries
 
           shouldContinue <- atomically $ do
             candidates <- readTVar candidatesVar
@@ -369,11 +401,9 @@ queryPeerForProviders node wireKey entry = do
 bootstrap :: DHTNode -> [PeerId] -> IO ()
 bootstrap node seeds = do
   now <- getCurrentTime
-  -- Step 1: Add seed peers to routing table
-  rt <- readTVarIO (dhtRoutingTable node)
+  -- Step 1: Add seed peers to routing table (with eviction policy)
   let seedEntries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) seeds
-      rt' = foldl (\r e -> fst (insertPeer e r)) rt seedEntries
-  atomically $ writeTVar (dhtRoutingTable node) rt'
+  mapM_ (addPeerToTable node) seedEntries
 
   -- Step 2: Self-lookup (FIND_NODE for our own peer ID)
   _ <- iterativeFindNode node (dhtLocalPeerId node)
@@ -390,26 +420,32 @@ bootstrap node seeds = do
 
 -- Helpers
 
--- | Convert a DHTPeer to a BucketEntry (with current time).
+-- | Insert peers observed during a lookup round into the routing table:
+-- peers that answered our query (refreshed with a new last-seen time)
+-- and newly discovered candidates from closerPeers. Insertion applies
+-- the full-bucket eviction policy of 'addPeerToTable'.
+insertLookupPeers :: DHTNode -> [BucketEntry] -> [BucketEntry] -> IO ()
+insertLookupPeers node responders discovered = do
+  now <- getCurrentTime
+  mapM_ (\e -> addPeerToTable node e { entryLastSeen = now }) responders
+  mapM_ (addPeerToTable node) discovered
+
+-- | Convert a DHTPeer to a BucketEntry seen at the given time.
 -- Per specs/kad-dht, multiaddrs carried by Peer records are decoded and
 -- kept so the learned peers can be dialled in follow-up queries.
-dhtPeerToEntry :: a -> DHTPeer -> BucketEntry
-dhtPeerToEntry _ peer = BucketEntry
+dhtPeerToEntry :: UTCTime -> DHTPeer -> BucketEntry
+dhtPeerToEntry now peer = BucketEntry
   { entryPeerId   = PeerId (dhtPeerId peer)
   , entryKey      = peerIdToKey (PeerId (dhtPeerId peer))
   , entryAddrs    = decodePeerAddrs (dhtPeerAddrs peer)
-  , entryLastSeen = epochTime
+  , entryLastSeen = now
   , entryConnType = dhtPeerConnType peer
   }
 
--- | Convert a DHTPeer to a ProviderEntry.
-dhtPeerToProvider :: DHTPeer -> ProviderEntry
-dhtPeerToProvider peer = ProviderEntry
+-- | Convert a DHTPeer to a ProviderEntry seen at the given time.
+dhtPeerToProvider :: UTCTime -> DHTPeer -> ProviderEntry
+dhtPeerToProvider now peer = ProviderEntry
   { peProvider  = PeerId (dhtPeerId peer)
   , peAddrs     = decodePeerAddrs (dhtPeerAddrs peer)
-  , peTimestamp = epochTime
+  , peTimestamp = now
   }
-
--- | Epoch time as placeholder (0 seconds from epoch).
-epochTime :: UTCTime
-epochTime = read "2000-01-01 00:00:00 UTC"
