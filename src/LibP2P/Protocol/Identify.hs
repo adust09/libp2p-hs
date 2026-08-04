@@ -45,6 +45,7 @@ import LibP2P.MultistreamSelect.Negotiation
   , StreamIO (..)
   , negotiateInitiator
   , NegotiationResult (..)
+  , readExactBounded
   )
 import LibP2P.Protocol.Identify.Message
   ( IdentifyInfo (..)
@@ -213,11 +214,13 @@ readFramedIdentify stream maxSize = readFramed `catch` onError
             then pure (Left ("identify message too large: "
                              ++ show msgLen ++ " > " ++ show maxSize))
             else do
-              payload <- readExact stream msgLen
-              case decodeIdentify payload of
-                Left parseErr ->
-                  pure (Left ("identify protobuf decode error: " ++ show parseErr))
-                Right info -> pure (Right info)
+              payloadOrErr <- readExactBounded stream maxSize msgLen
+              case payloadOrErr of
+                Left err -> pure (Left ("identify read error: " ++ err))
+                Right payload -> case decodeIdentify payload of
+                  Left parseErr ->
+                    pure (Left ("identify protobuf decode error: " ++ show parseErr))
+                  Right info -> pure (Right info)
 
 -- | Read the bytes of one unsigned varint from a stream (up to 10 bytes).
 readVarintBytes :: StreamIO -> IO BS.ByteString
@@ -230,7 +233,3 @@ readVarintBytes stream = go [] (0 :: Int)
           if b < 0x80
             then pure (BS.pack (reverse (b : acc)))
             else go (b : acc) (n + 1)
-
--- | Read exactly n bytes from a stream.
-readExact :: StreamIO -> Int -> IO BS.ByteString
-readExact stream n = BS.pack <$> mapM (const (streamReadByte stream)) [1 .. n]

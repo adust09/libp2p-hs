@@ -38,7 +38,7 @@ import qualified Proto3.Wire.Decode as Decode
 import qualified Proto3.Wire.Encode as Encode
 import Proto3.Wire.Types (FieldNumber (..))
 import LibP2P.Core.Varint (encodeUvarint, decodeUvarint)
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
+import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), readExactBounded)
 
 -- | DCUtR protocol identifier.
 dcutrProtocolId :: Text
@@ -133,13 +133,12 @@ readHolePunchMessage stream maxSize = do
       if msgLen > maxSize
         then pure (Left $ "DCUtR message too large: " ++ show msgLen)
         else do
-          payload <- readExact stream msgLen
-          case decodeHolePunchMessage payload of
-            Left err -> pure (Left $ "DCUtR protobuf decode error: " ++ show err)
-            Right msg -> pure (Right msg)
-
-readExact :: StreamIO -> Int -> IO ByteString
-readExact stream n = BS.pack <$> mapM (const (streamReadByte stream)) [1 .. n]
+          payloadOrErr <- readExactBounded stream maxSize msgLen
+          case payloadOrErr of
+            Left err -> pure (Left $ "DCUtR read error: " ++ err)
+            Right payload -> case decodeHolePunchMessage payload of
+              Left err -> pure (Left $ "DCUtR protobuf decode error: " ++ show err)
+              Right msg -> pure (Right msg)
 
 readVarintBytes :: StreamIO -> IO ByteString
 readVarintBytes stream = go [] (0 :: Int)

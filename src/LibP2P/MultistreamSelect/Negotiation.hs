@@ -9,9 +9,12 @@ module LibP2P.MultistreamSelect.Negotiation
   , negotiateInitiator
   , negotiateResponder
   , mkMemoryStreamPair
+  , readExactBounded
   ) where
 
 import Control.Concurrent.STM
+import Control.Exception (IOException, catch)
+import Control.Monad (replicateM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Text (Text)
@@ -56,9 +59,44 @@ mkMemoryStreamPair = do
     , StreamIO (writeToQueue queueBtoA) (readFromQueue queueAtoB) (pure ())
     )
 
--- | Read exactly n bytes from a stream.
-readExact :: StreamIO -> Int -> IO ByteString
-readExact stream n = BS.pack <$> mapM (const (streamReadByte stream)) [1 .. n]
+-- | Chunk size for 'readExactBounded'. Bounds the transient boxed-list
+-- allocation per read step regardless of the requested length.
+readChunkSize :: Int
+readChunkSize = 32768
+
+-- | Read exactly @n@ bytes from a stream, bounded by @maxLen@.
+--
+-- Shared by every length-delimited protocol in the stack (see issue
+-- #169): the declared length is validated against the caller's
+-- protocol-defined cap before a single byte is read or allocated, so a
+-- hostile length prefix cannot trigger an unbounded allocation. Bytes
+-- are accumulated in chunks of at most 'readChunkSize', keeping
+-- transient memory use proportional to the chunk size, not to @n@.
+--
+-- I/O failures during the read (stream reset, EOF) are returned as
+-- 'Left' instead of propagating as 'IOException's.
+readExactBounded
+  :: StreamIO
+  -> Int  -- ^ Maximum acceptable length (protocol-defined cap)
+  -> Int  -- ^ Number of bytes to read
+  -> IO (Either String ByteString)
+readExactBounded stream maxLen n
+  | n < 0 =
+      pure (Left ("readExactBounded: negative length: " <> show n))
+  | n > maxLen =
+      pure (Left ("readExactBounded: requested " <> show n
+                  <> " bytes exceeds maximum " <> show maxLen))
+  | n == 0 = pure (Right BS.empty)
+  | otherwise =
+      (Right . BS.concat <$> go n) `catch` \(e :: IOException) ->
+        pure (Left ("readExactBounded: read failed: " <> show e))
+  where
+    go :: Int -> IO [ByteString]
+    go 0 = pure []
+    go remaining = do
+      let m = min readChunkSize remaining
+      chunk <- BS.pack <$> replicateM m (streamReadByte stream)
+      (chunk :) <$> go (remaining - m)
 
 -- | Read a complete multistream-select message from a stream.
 -- Reads varint length byte-by-byte, then reads the full payload.
@@ -76,10 +114,14 @@ readMessage stream = do
           | len > maxMessageLength ->
               pure (Left "readMessage: incoming message too large (max 1024 bytes)")
           | otherwise -> do
-              payload <- readExact stream (fromIntegral len)
-              case decodeMessage (varintBytes <> payload) of
+              payloadOrErr <-
+                readExactBounded stream (fromIntegral maxMessageLength) (fromIntegral len)
+              case payloadOrErr of
                 Left err -> pure (Left err)
-                Right (msg, _) -> pure (Right msg)
+                Right payload ->
+                  case decodeMessage (varintBytes <> payload) of
+                    Left err -> pure (Left err)
+                    Right (msg, _) -> pure (Right msg)
 
 -- | Read a varint one byte at a time from the stream.
 -- The read loop is bounded at 'maxVarintBytes' (9 bytes per the

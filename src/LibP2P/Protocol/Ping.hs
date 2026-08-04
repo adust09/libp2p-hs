@@ -52,6 +52,7 @@ import LibP2P.MultistreamSelect.Negotiation
   ( StreamIO (..)
   , negotiateInitiator
   , NegotiationResult (..)
+  , readExactBounded
   )
 import LibP2P.Switch.Connection (newStream)
 import LibP2P.Switch.Types
@@ -94,10 +95,10 @@ handlePing :: StreamIO -> PeerId -> IO ()
 handlePing stream _remotePeerId = echoLoop `finally` closeQuietly stream
   where
     echoLoop = do
-      result <- (Right <$> readExact stream pingSize) `catch`
-                (\(_ :: SomeException) -> pure (Left ()))
+      result <- readExactBounded stream pingSize pingSize `catch`
+                (\(_ :: SomeException) -> pure (Left "stream closed"))
       case result of
-        Left () -> pure ()  -- Stream closed, exit loop
+        Left _ -> pure ()  -- Stream closed, exit loop
         Right payload -> do
           streamWrite stream payload
           echoLoop
@@ -169,7 +170,7 @@ pingOnce timeoutUs stream = do
   -- the Timeout exception itself and misreport it as a stream error.
   outcome <- try $ timeout timeoutUs $ do
     streamWrite stream payload
-    readExact stream pingSize
+    either fail pure =<< readExactBounded stream pingSize pingSize
   case outcome of
     Left (e :: SomeException) ->
       pure (Left (PingStreamError ("ping I/O failed: " ++ show e)))
@@ -218,7 +219,3 @@ registerPingHandler sw = atomically $ do
 -- | Close a stream, swallowing any exception (best-effort EOF signal).
 closeQuietly :: StreamIO -> IO ()
 closeQuietly stream = streamClose stream `catch` \(_ :: SomeException) -> pure ()
-
--- | Read exactly n bytes from a StreamIO.
-readExact :: StreamIO -> Int -> IO ByteString
-readExact stream n = BS.pack <$> mapM (const (streamReadByte stream)) [1 .. n]

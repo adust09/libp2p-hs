@@ -44,7 +44,7 @@ import Proto3.Wire.Encode (MessageBuilder)
 import qualified Proto3.Wire.Encode as Encode
 import Proto3.Wire.Types (FieldNumber (..))
 import LibP2P.Core.Varint (encodeUvarint, decodeUvarint)
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
+import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), readExactBounded)
 import LibP2P.Protocol.GossipSub.Types
 
 -- Encoding helpers
@@ -257,14 +257,12 @@ readRPCMessage stream maxSize = do
       if msgLen > maxSize
         then pure (Left $ "GossipSub RPC too large: " ++ show msgLen ++ " > " ++ show maxSize)
         else do
-          payload <- readExact stream msgLen
-          case decodeRPC payload of
-            Left err -> pure (Left $ "GossipSub protobuf decode error: " ++ show err)
-            Right rpc -> pure (Right rpc)
-
--- | Read exactly n bytes from a stream.
-readExact :: StreamIO -> Int -> IO ByteString
-readExact stream n = BS.pack <$> mapM (const (streamReadByte stream)) [1 .. n]
+          payloadOrErr <- readExactBounded stream maxSize msgLen
+          case payloadOrErr of
+            Left err -> pure (Left $ "GossipSub read error: " ++ err)
+            Right payload -> case decodeRPC payload of
+              Left err -> pure (Left $ "GossipSub protobuf decode error: " ++ show err)
+              Right rpc -> pure (Right rpc)
 
 -- | Read unsigned varint bytes (up to 10).
 readVarintBytes :: StreamIO -> IO ByteString
