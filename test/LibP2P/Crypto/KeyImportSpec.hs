@@ -58,8 +58,7 @@ spec = describe "private key import (peer-ids spec test vectors)" $ do
     it "signs with the imported DER private key; the spec public key verifies" $
       withImported ecdsaPrivHex $ \kp -> do
         let msg = "cross-implementation ecdsa" :: ByteString
-        signed <- ECDSA.signIO (skBytes (kpPrivate kp)) msg
-        case signed of
+        case ECDSA.sign (skBytes (kpPrivate kp)) msg of
           Left err -> expectationFailure err
           Right sig -> verifyWithSpecPub ecdsaPubHex msg sig
 
@@ -89,8 +88,7 @@ spec = describe "private key import (peer-ids spec test vectors)" $ do
     it "signs with the imported private key; the spec public key verifies" $
       withImported secp256k1PrivHex $ \kp -> do
         let msg = "cross-implementation secp256k1" :: ByteString
-        signed <- Secp256k1.signIO (skBytes (kpPrivate kp)) msg
-        case signed of
+        case Secp256k1.sign (skBytes (kpPrivate kp)) msg of
           Left err -> expectationFailure err
           Right sig -> verifyWithSpecPub secp256k1PubHex msg sig
 

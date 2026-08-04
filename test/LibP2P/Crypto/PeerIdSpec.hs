@@ -44,6 +44,26 @@ spec = do
       let pk = PublicKey Ed25519 rawPubKey
       decodePublicKey (encodePublicKey pk) `shouldBe` Right pk
 
+  describe "Protobuf canonical decoding" $ do
+    it "rejects trailing bytes after the PublicKey message" $ do
+      -- The peer-ids spec requires canonical serialization; accepting
+      -- trailing bytes would give one key multiple byte representations.
+      let pk = PublicKey Ed25519 (BS.replicate 32 0xCC)
+          canonical = encodePublicKey pk
+          padded = canonical <> BS.pack [0xde, 0xad, 0xbe, 0xef]
+      decodePublicKey canonical `shouldBe` Right pk
+      decodePublicKey padded `shouldSatisfy` isLeft
+
+    it "rejects trailing bytes after the PrivateKey message" $ do
+      let sk = PrivateKey Ed25519 (BS.replicate 64 0xDD)
+          padded = encodePrivateKey sk <> BS.singleton 0x00
+      isLeft (decodePrivateKey padded) `shouldBe` True
+
+    it "rejects a non-minimal varint in the key type field" $ do
+      -- 0x81 0x00 is a two-byte encoding of 1 (Ed25519); minimal is 0x01.
+      let bs = BS.pack ([0x08, 0x81, 0x00, 0x12, 0x20] <> replicate 32 0xEE)
+      decodePublicKey bs `shouldSatisfy` isLeft
+
   describe "PeerId derivation" $ do
     it "Ed25519 pubkey (36 bytes serialized) uses identity multihash" $ do
       -- From docs: 36 ≤ 42, so identity multihash:

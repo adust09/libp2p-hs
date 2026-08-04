@@ -5,17 +5,19 @@
 -- - Private key: DER-encoded RFC 5915 ECPrivateKey (SEC1), with the named
 --   curve parameters and the public key included, as emitted by Go's
 --   x509.MarshalECPrivateKey.
--- - Signatures: ECDSA over SHA-256, DER-encoded (SEQUENCE { r, s }).
+-- - Signatures: ECDSA over SHA-256 with deterministic nonces (RFC 6979),
+--   DER-encoded (SEQUENCE { r, s }).
 --
 -- Operates on raw 'ByteString' so this module has no dependency on
 -- "LibP2P.Crypto.Key".
 module LibP2P.Crypto.ECDSA
   ( generate
-  , signIO
+  , sign
   , verify
   , derivePublicKey
   ) where
 
+import Crypto.Hash (Digest, hashWith)
 import Crypto.Hash.Algorithms (SHA256 (..))
 import Crypto.Number.Serialize (i2ospOf_, os2ip)
 import qualified Crypto.PubKey.ECC.ECDSA as ECDSA
@@ -65,15 +67,16 @@ randomScalar = do
   if d >= 1 && d < curveOrder then pure d else randomScalar
 
 -- | Sign a message with a SEC1-DER private key (ECDSA/SHA-256, DER output).
--- Runs in IO because ECDSA signing requires a random nonce.
-signIO :: ByteString -> ByteString -> IO (Either String ByteString)
-signIO privDer msg =
-  case decodePrivateKey privDer of
-    Left err -> pure (Left err)
-    Right d -> do
-      let priv = ECDSA.PrivateKey curve d
-      sig <- ECDSA.sign priv SHA256 msg
-      pure (Right (encodeSignature sig))
+-- Nonces are deterministic per RFC 6979, so signing is pure: the same key
+-- and message always produce the same signature.
+sign :: ByteString -> ByteString -> Either String ByteString
+sign privDer msg = do
+  d <- decodePrivateKey privDer
+  let priv = ECDSA.PrivateKey curve d
+      digest = hashWith SHA256 msg :: Digest SHA256
+      sig = ECDSA.deterministicNonce SHA256 priv digest $ \k ->
+        ECDSA.signDigestWith k priv digest
+  pure (encodeSignature sig)
 
 -- | Derive the SPKI-DER public key from a SEC1-DER private key.
 derivePublicKey :: ByteString -> Either String ByteString

@@ -55,10 +55,10 @@ publicKey = kpPublic
 
 -- | Sign a message with a private key.
 --
--- Ed25519 and RSA signing are deterministic and therefore pure. secp256k1 (ECDSA)
--- requires a random nonce, so its signing lives in IO
--- ('LibP2P.Crypto.Secp256k1.signIO'); local peer identities in this
--- implementation are Ed25519. Returns Left on invalid key bytes.
+-- Signing is deterministic (and therefore pure) for every key type:
+-- Ed25519 and RSA (PKCS#1 v1.5) are deterministic by construction, and
+-- secp256k1/ECDSA use RFC 6979 deterministic nonces. Returns Left on
+-- invalid key bytes.
 sign :: PrivateKey -> ByteString -> Either String ByteString
 sign (PrivateKey Ed25519 skRaw) msg
   | BS.length skRaw /= 64 =
@@ -71,10 +71,8 @@ sign (PrivateKey Ed25519 skRaw) msg
               sig = Ed.sign sk pk msg
            in Right (convert sig)
 sign (PrivateKey RSA skRaw) msg = RSA.sign skRaw msg
-sign (PrivateKey Secp256k1 _) _ =
-  Left "sign: secp256k1 signing runs in IO (LibP2P.Crypto.Secp256k1.signIO)"
-sign (PrivateKey ECDSA _) _ =
-  Left "sign: ECDSA signing runs in IO (LibP2P.Crypto.ECDSA.signIO)"
+sign (PrivateKey Secp256k1 skRaw) msg = Secp256k1.sign skRaw msg
+sign (PrivateKey ECDSA skRaw) msg = ECDSA.sign skRaw msg
 
 -- | Verify a signature against a public key and message.
 -- Supports every libp2p key type so remote peers of any type can be authenticated.
