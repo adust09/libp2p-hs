@@ -32,6 +32,11 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.Protocol.Ping
 import LibP2P.Switch (newSwitch)
+import LibP2P.Switch.ResourceManager
+  ( ResourceScope (..)
+  , ResourceUsage (..)
+  , getOrCreatePeerScope
+  )
 import LibP2P.Switch.Types
   ( ConnState (..)
   , Connection (..)
@@ -107,6 +112,13 @@ mkPingConnection openStream = do
         }
     , connState      = stateVar
     }
+
+-- | Outbound ping streams currently reserved against a peer's resource
+-- scope (a session holds exactly one while open, zero after close).
+readPeerOutboundStreams :: Switch -> PeerId -> IO Int
+readPeerOutboundStreams sw pid = atomically $ do
+  scope <- getOrCreatePeerScope (swResourceMgr sw) pid
+  ruStreamsOutbound <$> readTVar (rsUsage scope)
 
 -- | Read exactly n bytes from a stream.
 readNBytes :: StreamIO -> Int -> IO BS.ByteString
@@ -261,6 +273,78 @@ spec = do
               "expected Left PingStreamError, got: " ++ show other
       done <- timeout 1000000 (wait responder)
       done `shouldBe` Just ()
+
+    it "closePingSession closes the stream and releases its reservation exactly once" $ do
+      -- A session holds exactly one stream reservation against the
+      -- peer's resource scope; closing the session must release it, and
+      -- a double close must not close the stream (or release the
+      -- reservation) a second time.
+      (streamA, _closeA, streamB) <- mkClosableStreamPair
+      closeCountRef <- newIORef (0 :: Int)
+      let countingClose s =
+            s { streamClose = modifyIORef' closeCountRef (+ 1) >> streamClose s }
+      sw <- mkTestSwitch
+      conn <- mkPingConnection (pure (countingClose streamA))
+      responder <- async $ pingResponder streamB
+      opened <- openPingSession sw conn
+      case opened of
+        Left err -> expectationFailure $ "ping session failed to open: " ++ show err
+        Right sess -> do
+          reservedOpen <- readPeerOutboundStreams sw (connPeerId conn)
+          reservedOpen `shouldBe` 1
+          closePingSession sess
+          closePingSession sess
+          closes <- readIORef closeCountRef
+          closes `shouldBe` 1
+          reservedClosed <- readPeerOutboundStreams sw (connPeerId conn)
+          reservedClosed `shouldBe` 0
+      done <- timeout 1000000 (wait responder)
+      done `shouldBe` Just ()
+
+    it "withPingSession closes the session when the action throws" $ do
+      (streamA, _closeA, streamB) <- mkClosableStreamPair
+      closedRef <- newIORef False
+      sw <- mkTestSwitch
+      conn <- mkPingConnection (pure (recordClose closedRef streamA))
+      responder <- async $ pingResponder streamB
+      outcome <- try $ withPingSession sw conn $ \_sess ->
+        throwIO (userError "boom") :: IO ()
+      case outcome of
+        Left (_ :: IOError) -> pure ()  -- the action's exception propagates
+        Right (r :: Either PingError ()) -> expectationFailure $
+          "expected the exception to propagate, got: " ++ show r
+      -- The session (and its stream) must still have been closed, so
+      -- the responder's echo loop sees EOF and exits on its own.
+      closed <- readIORef closedRef
+      closed `shouldBe` True
+      done <- timeout 1000000 (wait responder)
+      done `shouldBe` Just ()
+
+    it "a ping after a timed-out ping on the same session is rejected" $ do
+      -- A late echo from the slow responder would corrupt the next
+      -- exchange, so a failed ping closes the session: the session must
+      -- reject further pings instead of reusing the poisoned stream.
+      (streamA, _closeA, streamB) <- mkClosableStreamPair
+      sw <- mkTestSwitch
+      conn <- mkPingConnection (pure streamA)
+      responder <- async $ do
+        negResult <- negotiateResponder streamB [pingProtocolId]
+        negResult `shouldBe` Accepted pingProtocolId
+        -- Swallow the payload and never echo.
+        _ <- readNBytes streamB pingSize
+        pure ()
+      opened <- openPingSession sw conn
+      case opened of
+        Left err -> expectationFailure $ "ping session failed to open: " ++ show err
+        Right sess -> do
+          first <- pingWithTimeout 200000 sess
+          first `shouldBe` Left PingTimeout
+          second <- ping sess
+          case second of
+            Left (PingStreamError _) -> pure ()
+            other -> expectationFailure $
+              "expected Left PingStreamError after a timed-out ping, got: " ++ show other
+      wait responder
 
     it "pingWithTimeout returns Left PingTimeout and closes the stream when no echo arrives" $ do
       (streamA, _closeA, streamB) <- mkClosableStreamPair
