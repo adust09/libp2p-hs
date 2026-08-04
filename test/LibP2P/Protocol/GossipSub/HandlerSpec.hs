@@ -32,6 +32,7 @@ import LibP2P.Protocol.GossipSub.Handler
   , gossipLeave
   , gossipPublish
   , gossipSubProtocolId
+  , gossipSubProtocolIdV10
   , handleGossipSubStream
   , newGossipSubNode
   , sendCurrentSubscriptions
@@ -138,7 +139,7 @@ spec = do
       -- Create memory stream pair: remote side writes, handler reads
       (remoteStream, handlerStream) <- mkMemoryStreamPair
       -- Spawn handler in background (blocks on read loop)
-      _ <- async $ handleGossipSubStream node handlerStream remotePid Nothing
+      _ <- async $ handleGossipSubStream node handlerStream remotePid GossipSubPeer Nothing
       -- Send a subscription RPC from remote
       writeRPCMessage remoteStream (subscribeRPC "test-topic")
       -- Give handler time to process
@@ -162,7 +163,7 @@ spec = do
       addPeer (gsnRouter node) remotePid GossipSubPeer False now
       (remoteStream, handlerStream) <- mkMemoryStreamPair
       -- Spawn handler
-      _ <- async $ handleGossipSubStream node handlerStream remotePid Nothing
+      _ <- async $ handleGossipSubStream node handlerStream remotePid GossipSubPeer Nothing
       -- Send a publish RPC
       let msg = signedMessage remoteKp "pub-topic" "hello gossipsub"
       writeRPCMessage remoteStream (emptyRPC { rpcPublish = [msg] })
@@ -263,6 +264,24 @@ spec = do
       -- Cleanup
       stopGossipSub node
 
+    -- Issue #157: peers speaking only /meshsub/1.0.0 must still get a
+    -- pubsub stream — both protocol versions are registered and accepted.
+    it "registers handlers for both /meshsub/1.1.0 and /meshsub/1.0.0" $ do
+      (sw, _pid) <- mkTestSwitch
+      node <- newGossipSubNode sw testParams
+      startGossipSub node
+      h11 <- lookupStreamHandler sw gossipSubProtocolId
+      h10 <- lookupStreamHandler sw gossipSubProtocolIdV10
+      case (h11, h10) of
+        (Just _, Just _) -> pure ()
+        _ -> expectationFailure "both protocol versions should be registered"
+      stopGossipSub node
+      h11' <- lookupStreamHandler sw gossipSubProtocolId
+      h10' <- lookupStreamHandler sw gossipSubProtocolIdV10
+      case (h11', h10') of
+        (Nothing, Nothing) -> pure ()
+        _ -> expectationFailure "both protocol versions should be unregistered after stop"
+
   describe "stopGossipSub" $ do
     it "cancels heartbeat and unregisters handler" $ do
       (sw, _pid) <- mkTestSwitch
@@ -297,8 +316,8 @@ spec = do
       (streamAtoB, streamBfromA) <- mkMemoryStreamPair
       (streamBtoA, streamAfromB) <- mkMemoryStreamPair
       -- Spawn stream handlers
-      _ <- async $ handleGossipSubStream nodeB streamBfromA pidA Nothing
-      _ <- async $ handleGossipSubStream nodeA streamAfromB pidB Nothing
+      _ <- async $ handleGossipSubStream nodeB streamBfromA pidA GossipSubPeer Nothing
+      _ <- async $ handleGossipSubStream nodeA streamAfromB pidB GossipSubPeer Nothing
       -- Inject cached outbound streams for sendRPC
       atomically $ do
         writeTVar (gsnStreams nodeA) (Map.singleton pidB streamAtoB)
@@ -328,8 +347,8 @@ spec = do
       (streamAtoB, streamBfromA) <- mkMemoryStreamPair
       (streamBtoA, streamAfromB) <- mkMemoryStreamPair
       -- Spawn stream handlers (registers peers in each router)
-      _ <- async $ handleGossipSubStream nodeB streamBfromA pidA Nothing
-      _ <- async $ handleGossipSubStream nodeA streamAfromB pidB Nothing
+      _ <- async $ handleGossipSubStream nodeB streamBfromA pidA GossipSubPeer Nothing
+      _ <- async $ handleGossipSubStream nodeA streamAfromB pidB GossipSubPeer Nothing
       -- Inject cached outbound streams
       atomically $ do
         writeTVar (gsnStreams nodeA) (Map.singleton pidB streamAtoB)

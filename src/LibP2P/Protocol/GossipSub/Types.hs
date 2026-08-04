@@ -10,6 +10,7 @@
 module LibP2P.Protocol.GossipSub.Types
   ( -- * Protocol constants
     gossipSubProtocolId
+  , gossipSubProtocolIdV10
   , maxRPCSize
     -- * Topic and message identity
   , Topic
@@ -64,6 +65,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Sequence (Seq)
 import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Time (NominalDiffTime, UTCTime)
 import Data.Word (Word64)
@@ -72,6 +74,12 @@ import LibP2P.Crypto.PeerId (PeerId)
 -- | GossipSub v1.1 protocol identifier.
 gossipSubProtocolId :: Text
 gossipSubProtocolId = "/meshsub/1.1.0"
+
+-- | GossipSub v1.0 protocol identifier. Advertised alongside v1.1 for
+-- backwards compatibility (gossipsub-v1.1.md: the v1.1 extensions are
+-- fully backwards compatible with v1.0 of the protocol).
+gossipSubProtocolIdV10 :: Text
+gossipSubProtocolIdV10 = "/meshsub/1.0.0"
 
 -- | Maximum RPC message size: 1 MiB.
 maxRPCSize :: Int
@@ -196,6 +204,14 @@ data GossipSubParams = GossipSubParams
   , paramMcacheGossip       :: !Int              -- ^ Gossip windows (default 3)
   , paramPrunePeers         :: !Int              -- ^ PX peers included in PRUNE (default 16)
   , paramIWantFollowupTime  :: !NominalDiffTime  -- ^ IWANT promise deadline (default 3s)
+  , paramMaxIHaveLength     :: !Int
+    -- ^ Max message ids requested from / served to a peer per heartbeat,
+    -- and max ids advertised in an emitted IHAVE (go default 5000)
+  , paramMaxIHaveMessages   :: !Int
+    -- ^ Max IHAVE batches accepted from a peer per heartbeat (go default 10)
+  , paramDirectPeers        :: !(Set PeerId)
+    -- ^ Direct (explicit) peering agreements (gossipsub-v1.1.md): these
+    -- peers always exchange messages and are never mesh members
   }
 
 -- | Default message ID: concatenation of from and seqno fields.
@@ -227,14 +243,20 @@ defaultGossipSubParams = GossipSubParams
   , paramMcacheGossip      = 3
   , paramPrunePeers        = 16
   , paramIWantFollowupTime = 3
+  , paramMaxIHaveLength    = 5000
+  , paramMaxIHaveMessages  = 10
+  , paramDirectPeers       = Set.empty
   }
 
 -- Peer tracking
 
--- | Peer's protocol capability.
+-- | Peer's negotiated protocol capability. Peers on /meshsub/1.0.0 must
+-- not receive v1.1 control extensions (PX records or the backoff field
+-- in PRUNE).
 data PeerProtocol
-  = GossipSubPeer   -- ^ Supports GossipSub (/meshsub/1.1.0)
-  | FloodSubPeer    -- ^ Supports FloodSub only
+  = GossipSubPeer     -- ^ GossipSub v1.1 (/meshsub/1.1.0)
+  | GossipSubV10Peer  -- ^ GossipSub v1.0 (/meshsub/1.0.0)
+  | FloodSubPeer      -- ^ FloodSub only (/floodsub/1.0.0, not yet negotiated)
   deriving (Show, Eq)
 
 -- | Per-peer state tracked by the router.
@@ -418,6 +440,16 @@ data GossipSubRouter = GossipSubRouter
     -- ^ IWANT promises: message IDs a peer advertised via IHAVE and we
     -- requested, with the delivery deadline. A promise still unfulfilled
     -- past its deadline is a P7 behavioural violation (gossipsub-v1.1.md).
+  , gsIHaveCounts :: !(TVar (Map PeerId Int))
+    -- ^ IHAVE batches accepted per peer since the last heartbeat; batches
+    -- beyond 'paramMaxIHaveMessages' are ignored (gossipsub-v1.1.md
+    -- IHAVE/IWANT flood protection)
+  , gsIAskedCounts :: !(TVar (Map PeerId Int))
+    -- ^ Message ids requested via IWANT per peer since the last
+    -- heartbeat, capped at 'paramMaxIHaveLength'
+  , gsIWantServed :: !(TVar (Map PeerId Int))
+    -- ^ Messages served in response to IWANT per peer since the last
+    -- heartbeat, capped at 'paramMaxIHaveLength'
     -- Message cache (Phase 9c)
   , gsMessageCache  :: !(TVar MessageCache)
     -- ^ Sliding-window message cache for IWANT and IHAVE

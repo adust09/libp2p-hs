@@ -25,6 +25,7 @@ module LibP2P.Protocol.GossipSub.Handler
   , gossipPublish
     -- * Constants
   , gossipSubProtocolId
+  , gossipSubProtocolIdV10
   ) where
 
 import Control.Concurrent.Async (Async, async, cancel)
@@ -81,9 +82,24 @@ import LibP2P.Switch.Types
   , Switch (..)
   )
 
--- | GossipSub protocol ID.
+-- | GossipSub v1.1 protocol ID (preferred).
 gossipSubProtocolId :: ProtocolId
 gossipSubProtocolId = "/meshsub/1.1.0"
+
+-- | GossipSub v1.0 protocol ID, advertised alongside v1.1 so that
+-- v1.0-only peers still get a pubsub stream (#157).
+gossipSubProtocolIdV10 :: ProtocolId
+gossipSubProtocolIdV10 = "/meshsub/1.0.0"
+
+-- | All protocol IDs we register and offer, preferred first.
+gossipSubProtocolIds :: [ProtocolId]
+gossipSubProtocolIds = [gossipSubProtocolId, gossipSubProtocolIdV10]
+
+-- | Map a negotiated protocol ID to the peer's protocol version.
+protocolFor :: ProtocolId -> PeerProtocol
+protocolFor proto
+  | proto == gossipSubProtocolIdV10 = GossipSubV10Peer
+  | otherwise                       = GossipSubPeer
 
 -- | A GossipSub node: Router + Switch integration.
 data GossipSubNode = GossipSubNode
@@ -149,15 +165,16 @@ openStreamToPeer sw pid = do
                   (\(_ :: SomeException) -> pure (Left ()))
       case result of
         Left () -> pure Nothing
-        Right mStream -> pure mStream
+        Right mStream -> pure (fst <$> mStream)
 
--- | Open a mux stream and negotiate /meshsub/1.1.0.
-openAndNegotiate :: Connection -> IO (Maybe StreamIO)
+-- | Open a mux stream and negotiate a GossipSub protocol, preferring
+-- /meshsub/1.1.0 and falling back to /meshsub/1.0.0 (#157).
+openAndNegotiate :: Connection -> IO (Maybe (StreamIO, PeerProtocol))
 openAndNegotiate conn = do
   stream <- muxOpenStream (connSession conn)
-  negResult <- negotiateInitiator stream [gossipSubProtocolId]
+  negResult <- negotiateInitiator stream gossipSubProtocolIds
   case negResult of
-    Accepted _ -> pure (Just stream)
+    Accepted proto -> pure (Just (stream, protocolFor proto))
     NoProtocol -> pure Nothing
 
 -- | Extract the remote IP bytes (4 for IPv4, 16 for IPv6) from a
@@ -179,12 +196,14 @@ trySend stream rpc =
 -- | Handle an inbound GossipSub stream.
 --
 -- Reads framed RPCs in a loop and dispatches each to the Router's handleRPC.
+-- The peer's negotiated protocol version gates v1.1 control extensions.
 -- On error or EOF, cleans up the peer's cached stream and removes the peer.
-handleGossipSubStream :: GossipSubNode -> StreamIO -> PeerId -> Maybe ByteString -> IO ()
-handleGossipSubStream node stream pid mIP = do
+handleGossipSubStream :: GossipSubNode -> StreamIO -> PeerId -> PeerProtocol
+                      -> Maybe ByteString -> IO ()
+handleGossipSubStream node stream pid proto mIP = do
   -- Register peer with router (IP feeds P6 colocation scoring)
   now <- getCurrentTime
-  addPeer (gsnRouter node) pid GossipSubPeer False now
+  addPeer (gsnRouter node) pid proto False now
   mapM_ (setPeerIP (gsnRouter node) pid) mIP
   -- Read loop
   readLoop
@@ -203,10 +222,13 @@ handleGossipSubStream node stream pid mIP = do
 -- | Start the GossipSub node: register stream handler, notifier, and start heartbeat.
 startGossipSub :: GossipSubNode -> IO ()
 startGossipSub node = do
-  -- Register inbound stream handler on Switch
-  setStreamHandler (gsnSwitch node) gossipSubProtocolId
-    (\conn stream ->
-      handleGossipSubStream node stream (connPeerId conn) (remoteIPBytes conn))
+  -- Register inbound stream handlers for both protocol versions (#157)
+  mapM_ (\protoId ->
+      setStreamHandler (gsnSwitch node) protoId
+        (\conn stream ->
+          handleGossipSubStream node stream (connPeerId conn)
+            (protocolFor protoId) (remoteIPBytes conn)))
+    gossipSubProtocolIds
   -- Register connection notifier to auto-open GossipSub streams to new peers
   atomically $ modifyTVar' (swNotifiers (gsnSwitch node))
     (onNewConnection node :)
@@ -224,12 +246,13 @@ onNewConnection node conn = do
   mStream <- openAndNegotiate conn
   case mStream of
     Nothing -> pure ()  -- Peer doesn't support GossipSub
-    Just stream -> do
+    Just (stream, proto) -> do
       -- Cache the outbound stream
       atomically $ modifyTVar' (gsnStreams node) (Map.insert pid stream)
-      -- Register peer (IP feeds P6 colocation scoring)
+      -- Register peer with its negotiated protocol version
+      -- (IP feeds P6 colocation scoring)
       now <- getCurrentTime
-      addPeer (gsnRouter node) pid GossipSubPeer True now
+      addPeer (gsnRouter node) pid proto True now
       mapM_ (setPeerIP (gsnRouter node) pid) (remoteIPBytes conn)
       -- Send current subscriptions to the new peer
       sendCurrentSubscriptions node stream
@@ -283,8 +306,8 @@ stopGossipSub node = do
   case mHb of
     Just hbAsync -> cancel hbAsync `catch` (\(_ :: SomeException) -> pure ())
     Nothing -> pure ()
-  -- Unregister stream handler
-  removeStreamHandler (gsnSwitch node) gossipSubProtocolId
+  -- Unregister stream handlers for both protocol versions
+  mapM_ (removeStreamHandler (gsnSwitch node)) gossipSubProtocolIds
 
 -- | Subscribe to a topic.
 gossipJoin :: GossipSubNode -> Topic -> IO ()

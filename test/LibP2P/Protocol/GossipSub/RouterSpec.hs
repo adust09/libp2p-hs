@@ -17,6 +17,8 @@ import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Protocol.GossipSub.Types
 import LibP2P.Protocol.GossipSub.Router
+import LibP2P.Protocol.GossipSub.Heartbeat (heartbeatOnce)
+import LibP2P.Protocol.GossipSub.MessageCache (cachePut)
 import LibP2P.Protocol.GossipSub.Validation (signingBytes, validateMessage)
 
 -- Test helpers
@@ -52,6 +54,25 @@ mkTestRouter localPid = do
   (logRef, sendFn) <- newSendLog
   router <- newRouter defaultGossipSubParams localPid sendFn fixedTimeSource
   pure (router, logRef)
+
+-- | Create a test router with custom parameters and send logging.
+mkTestRouterWithParams :: GossipSubParams -> PeerId -> IO (GossipSubRouter, IORef [(PeerId, RPC)])
+mkTestRouterWithParams params pid = do
+  (logRef, sendFn) <- newSendLog
+  router <- newRouter params pid sendFn fixedTimeSource
+  pure (router, logRef)
+
+-- | All IWANT id lists sent, in order.
+iwantsSent :: [(PeerId, RPC)] -> [[MessageId]]
+iwantsSent sent =
+  [ iwantMessageIds iw
+  | (_, rpc) <- sent, Just ctrl <- [rpcControl rpc], iw <- ctrlIWant ctrl ]
+
+-- | All PRUNEs sent to a given peer.
+prunesTo :: PeerId -> [(PeerId, RPC)] -> [Prune]
+prunesTo pid sent =
+  [ p | (to, rpc) <- sent, to == pid
+      , Just ctrl <- [rpcControl rpc], p <- ctrlPrune ctrl ]
 
 -- | Create a test router with adjustable time.
 mkTestRouterWithTime :: PeerId -> UTCTime -> IO (GossipSubRouter, IORef [(PeerId, RPC)], IORef UTCTime)
@@ -1075,3 +1096,185 @@ spec = do
             Just tps -> tpsMeshFailurePenalty tps `shouldBe` 25
             Nothing -> expectationFailure "topic state not found"
           Nothing -> expectationFailure "peer not found"
+
+    -- Issue #157 remainder: peers that negotiated /meshsub/1.0.0 must not
+    -- receive v1.1 control extensions (PX records, backoff field).
+    describe "Protocol version gating (#157)" $ do
+      it "leave sends a bare PRUNE (no PX, no backoff) to a /meshsub/1.0.0 peer" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let v10Peer = mkPeerId 1
+            other   = mkPeerId 2
+        addPeer router v10Peer GossipSubV10Peer False fixedTime
+        atomically $ modifyTVar' (gsPeers router) $
+          Map.adjust (\ps -> ps { psTopics = Set.singleton "blocks" }) v10Peer
+        addSubscribedPeer router other "blocks"
+        atomically $ do
+          modifyTVar' (gsMesh router) (Map.insert "blocks" (Set.singleton v10Peer))
+          modifyTVar' (gsSubscriptions router) (Set.insert "blocks")
+        writeIORef logRef []
+        leave router "blocks"
+        sent <- readIORef logRef
+        case prunesTo v10Peer sent of
+          [p] -> do
+            prunePeers p `shouldBe` []
+            pruneBackoff p `shouldBe` Nothing
+          _ -> expectationFailure "expected exactly one PRUNE to the v1.0 peer"
+
+      it "GRAFT rejection PRUNE to a /meshsub/1.0.0 peer omits backoff and PX" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            routerNeg = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const (-1) } }
+        addPeer routerNeg sender GossipSubV10Peer False fixedTime
+        atomically $ modifyTVar' (gsSubscriptions routerNeg) (Set.insert "blocks")
+        handleGraft routerNeg sender [Graft "blocks"]
+        sent <- readIORef logRef
+        case prunesTo sender sent of
+          [p] -> do
+            prunePeers p `shouldBe` []
+            pruneBackoff p `shouldBe` Nothing
+          _ -> expectationFailure "expected exactly one PRUNE reply"
+
+      it "GRAFT rejection PRUNE to a /meshsub/1.1.0 peer carries the backoff field" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            routerNeg = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const (-1) } }
+        addPeer routerNeg sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsSubscriptions routerNeg) (Set.insert "blocks")
+        handleGraft routerNeg sender [Graft "blocks"]
+        sent <- readIORef logRef
+        case prunesTo sender sent of
+          [p] -> pruneBackoff p `shouldBe` Just 60
+          _ -> expectationFailure "expected exactly one PRUNE reply"
+
+    -- Issue #157 remainder: IHAVE/IWANT abuse limits (go-libp2p defaults:
+    -- MaxIHaveLength 5000, MaxIHaveMessages 10, reset every heartbeat).
+    describe "IHAVE/IWANT limits (#157)" $ do
+      it "ignores IHAVE batches beyond paramMaxIHaveMessages per heartbeat" $ do
+        (router, logRef) <- mkTestRouterWithParams
+          defaultGossipSubParams { paramMaxIHaveMessages = 2 } localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        handleIHave router sender [IHave "t" [BS.pack [1]]]
+        handleIHave router sender [IHave "t" [BS.pack [2]]]
+        handleIHave router sender [IHave "t" [BS.pack [3]]]
+        sent <- readIORef logRef
+        length (iwantsSent sent) `shouldBe` 2
+
+      it "caps message ids requested per peer per heartbeat at paramMaxIHaveLength" $ do
+        (router, logRef) <- mkTestRouterWithParams
+          defaultGossipSubParams { paramMaxIHaveLength = 3 } localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        handleIHave router sender [IHave "t" (map (BS.pack . pure) [1..5])]
+        handleIHave router sender [IHave "t" (map (BS.pack . pure) [6..10])]
+        sent <- readIORef logRef
+        sum (map length (iwantsSent sent)) `shouldBe` 3
+
+      it "heartbeat resets the IHAVE budget" $ do
+        (router, logRef) <- mkTestRouterWithParams
+          defaultGossipSubParams { paramMaxIHaveMessages = 1 } localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        handleIHave router sender [IHave "t" [BS.pack [1]]]
+        handleIHave router sender [IHave "t" [BS.pack [2]]]  -- over budget, ignored
+        heartbeatOnce router
+        handleIHave router sender [IHave "t" [BS.pack [3]]]
+        sent <- readIORef logRef
+        length (iwantsSent sent) `shouldBe` 2
+
+      it "serves at most paramMaxIHaveLength messages per peer per heartbeat on IWANT" $ do
+        (router, logRef) <- mkTestRouterWithParams
+          defaultGossipSubParams
+            { paramMaxIHaveLength = 2
+            , paramMessageIdFn = msgData } localPid
+        let sender = mkPeerId 1
+            mkMsg n = PubSubMessage
+              { msgFrom = Nothing, msgData = BS.pack [n], msgSeqNo = Nothing
+              , msgTopic = "t", msgSignature = Nothing, msgKey = Nothing }
+            msgs = map mkMsg [1, 2, 3]
+        addPeer router sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsMessageCache router) $ \c ->
+          foldl (\acc m -> cachePut (msgData m) m acc) c msgs
+        handleIWant router sender [IWant (map msgData msgs)]
+        sent <- readIORef logRef
+        let served = concat [ rpcPublish rpc | (pid, rpc) <- sent, pid == sender ]
+        length served `shouldBe` 2
+
+    -- Issue #157 remainder: direct (explicit) peering agreements,
+    -- gossipsub-v1.1.md: direct peers always exchange messages and are
+    -- never part of the mesh.
+    describe "Direct peers (#157)" $ do
+      it "forwardMessage always includes subscribed direct peers outside the mesh" $ do
+        let dp = mkPeerId 9
+        (router, logRef) <- mkTestRouterWithParams
+          defaultGossipSubParams { paramDirectPeers = Set.singleton dp } localPid
+        let meshPeer = mkPeerId 1
+            sender   = mkPeerId 2
+        mapM_ (\pid -> addSubscribedPeer router pid "t") [meshPeer, sender, dp]
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "t" (Set.fromList [meshPeer, sender])
+        kp <- newKeyPair
+        forwardMessage router sender (signedMessage kp "t" (BS.pack [1]))
+        sent <- readIORef logRef
+        let recipients = Set.fromList
+              [ pid | (pid, rpc) <- sent, not (null (rpcPublish rpc)) ]
+        recipients `shouldBe` Set.fromList [meshPeer, dp]
+
+      it "join never adds a direct peer to the mesh" $ do
+        let dp = mkPeerId 9
+        (router, logRef) <- mkTestRouterWithParams
+          defaultGossipSubParams { paramDirectPeers = Set.singleton dp } localPid
+        addSubscribedPeer router dp "t"
+        join router "t"
+        mesh <- readTVarIO (gsMesh router)
+        Set.member dp (Map.findWithDefault Set.empty "t" mesh) `shouldBe` False
+        sent <- readIORef logRef
+        let graftsTo = [ pid | (pid, rpc) <- sent
+                             , Just ctrl <- [rpcControl rpc]
+                             , not (null (ctrlGraft ctrl)) ]
+        graftsTo `shouldBe` []
+
+      it "rejects GRAFT from a direct peer without adding it to the mesh" $ do
+        let dp = mkPeerId 9
+        (router, logRef) <- mkTestRouterWithParams
+          defaultGossipSubParams { paramDirectPeers = Set.singleton dp } localPid
+        addSubscribedPeer router dp "t"
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "t")
+        handleGraft router dp [Graft "t"]
+        mesh <- readTVarIO (gsMesh router)
+        Set.member dp (Map.findWithDefault Set.empty "t" mesh) `shouldBe` False
+        sent <- readIORef logRef
+        length (prunesTo dp sent) `shouldBe` 1
+
+      it "direct peers bypass the graylist" $ do
+        let dp = mkPeerId 9
+        (router, _) <- mkTestRouterWithParams
+          defaultGossipSubParams { paramDirectPeers = Set.singleton dp } localPid
+        let routerGl = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const (-20000) } }
+        addPeer routerGl dp GossipSubPeer False fixedTime
+        handleRPC routerGl dp emptyRPC { rpcSubscriptions = [SubOpts True "t"] }
+        peers <- readTVarIO (gsPeers routerGl)
+        case Map.lookup dp peers of
+          Just ps -> psTopics ps `shouldBe` Set.singleton "t"
+          Nothing -> expectationFailure "peer not found"
+
+      it "flood publish includes direct peers regardless of score" $ do
+        let dp = mkPeerId 9
+        (router, logRef) <- mkTestRouterWithParams
+          defaultGossipSubParams { paramDirectPeers = Set.singleton dp } localPid
+        let routerTh = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore =
+                      \pid -> if pid == dp then -2000 else 0 } }
+        addSubscribedPeer routerTh dp "t"
+        kp <- newKeyPair
+        publish routerTh "t" (BS.pack [1]) (Just kp)
+        sent <- readIORef logRef
+        let publishedTo = [ pid | (pid, rpc) <- sent, not (null (rpcPublish rpc)) ]
+        publishedTo `shouldBe` [dp]
