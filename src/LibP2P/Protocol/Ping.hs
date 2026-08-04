@@ -3,28 +3,46 @@
 -- Protocol ID: /ipfs/ping/1.0.0
 --
 -- Wire format: 32 bytes random → 32 bytes echo. No framing, no protobuf.
--- The handler runs an echo loop: reads 32 bytes, writes them back,
--- until the stream closes. The initiator sends 32 random bytes,
--- measures round-trip time, and verifies the echo matches.
+-- The responder runs an echo loop: reads 32 bytes, writes them back,
+-- until the initiator closes the stream, then closes its own side.
+--
+-- The initiator keeps at most one outbound ping stream per peer
+-- (ping.md: "The dialing peer MUST NOT keep more than one outbound
+-- stream for the ping protocol per peer"). A 'PingSession' holds that
+-- single stream and reuses it for successive pings (ping.md: the peer
+-- "MAY send further payloads on the same stream"); the stream is closed
+-- when the session ends or on the first failed ping. Streams are opened
+-- through the Switch ('newStream'), so each session holds exactly one
+-- stream reservation, released on close.
 module LibP2P.Protocol.Ping
   ( -- * Protocol ID
     pingProtocolId
     -- * Types
   , PingError (..)
   , PingResult (..)
-    -- * Protocol logic
+  , PingSession
+    -- * Responder
   , handlePing
+    -- * Initiator
   , sendPing
+  , openPingSession
+  , ping
+  , pingWithTimeout
+  , closePingSession
+  , withPingSession
     -- * Registration
   , registerPingHandler
     -- * Constants
   , pingSize
+  , pingTimeoutMicros
   ) where
 
 import Control.Concurrent.STM (atomically, readTVar, writeTVar)
-import Control.Exception (SomeException, catch)
+import Control.Exception (SomeException, catch, finally, try)
+import Control.Monad (unless)
 import qualified Data.ByteString as BS
 import Data.ByteString (ByteString)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Time.Clock (NominalDiffTime, diffUTCTime, getCurrentTime)
@@ -35,11 +53,12 @@ import LibP2P.MultistreamSelect.Negotiation
   , negotiateInitiator
   , NegotiationResult (..)
   )
+import LibP2P.Switch.Connection (newStream)
 import LibP2P.Switch.Types
   ( Connection (..)
-  , MuxerSession (..)
   , Switch (..)
   )
+import System.Timeout (timeout)
 
 -- | Ping protocol ID.
 pingProtocolId :: Text
@@ -49,11 +68,16 @@ pingProtocolId = "/ipfs/ping/1.0.0"
 pingSize :: Int
 pingSize = 32
 
+-- | Time to wait for an echo before giving up, in microseconds.
+-- 10 seconds, mirroring go-libp2p's ping timeout.
+pingTimeoutMicros :: Int
+pingTimeoutMicros = 10000000
+
 -- | Ping error types.
 data PingError
-  = PingTimeout          -- ^ No response within timeout
+  = PingTimeout          -- ^ No echo within the timeout
   | PingMismatch         -- ^ Response doesn't match sent bytes
-  | PingStreamError !String  -- ^ Stream I/O error
+  | PingStreamError !String  -- ^ Stream open, negotiation, or I/O error
   deriving (Show, Eq)
 
 -- | Successful ping result.
@@ -63,9 +87,11 @@ data PingResult = PingResult
 
 -- | Handle an inbound Ping request (responder / echo loop).
 --
--- Reads 32 bytes, writes them back. Repeats until stream closes.
+-- Reads 32 bytes, writes them back. Repeats until the initiator closes
+-- its write side (EOF), then closes this side of the stream (ping.md:
+-- the listening peer SHOULD exit the loop and close the stream).
 handlePing :: StreamIO -> PeerId -> IO ()
-handlePing stream _remotePeerId = echoLoop
+handlePing stream _remotePeerId = echoLoop `finally` closeQuietly stream
   where
     echoLoop = do
       result <- (Right <$> readExact stream pingSize) `catch`
@@ -76,29 +102,111 @@ handlePing stream _remotePeerId = echoLoop
           streamWrite stream payload
           echoLoop
 
--- | Send a Ping to a remote peer (initiator side).
+-- | The single outbound ping stream to a peer, negotiated and ready.
 --
--- Opens a new stream, negotiates /ipfs/ping/1.0.0, sends 32 random
--- bytes, reads 32 bytes back, verifies match, measures RTT.
-sendPing :: Connection -> IO (Either PingError PingResult)
-sendPing conn = do
-  stream <- muxOpenStream (connSession conn)
-  result <- negotiateInitiator stream [pingProtocolId]
-  case result of
-    NoProtocol -> pure (Left (PingStreamError "remote does not support ping"))
-    Accepted _ -> do
-      payload <- getRandomBytes pingSize :: IO ByteString
-      t0 <- getCurrentTime
-      streamWrite stream payload
-      response <- (Right <$> readExact stream pingSize) `catch`
-                  (\(_ :: SomeException) -> pure (Left (PingStreamError "read failed")))
-      case response of
-        Left err -> pure (Left err)
-        Right echo
-          | echo /= payload -> pure (Left PingMismatch)
-          | otherwise -> do
-              t1 <- getCurrentTime
-              pure (Right (PingResult (diffUTCTime t1 t0)))
+-- Obtain with 'openPingSession' (or scoped via 'withPingSession'), send
+-- pings with 'ping', and always release with 'closePingSession'. A
+-- session whose ping failed (timeout, mismatch, I/O error) closes its
+-- stream immediately and rejects further pings.
+data PingSession = PingSession
+  { psStream :: !StreamIO
+  , psClosed :: !(IORef Bool)
+  }
+
+-- | Open a ping stream on the connection and negotiate the protocol.
+--
+-- The stream is opened through the Switch so it is counted against the
+-- peer's stream limits; the reservation is released when the session is
+-- closed. On any failure the stream (if opened) is closed before
+-- returning.
+openPingSession :: Switch -> Connection -> IO (Either PingError PingSession)
+openPingSession sw conn = do
+  streamOrErr <- newStream sw conn
+  case streamOrErr of
+    Left err ->
+      pure (Left (PingStreamError ("stream reservation failed: " ++ show err)))
+    Right stream -> do
+      negotiated <- try (negotiateInitiator stream [pingProtocolId])
+      case negotiated of
+        Right (Accepted _) -> do
+          closedRef <- newIORef False
+          pure (Right (PingSession stream closedRef))
+        Right NoProtocol -> do
+          closeQuietly stream
+          pure (Left (PingStreamError "remote does not support ping"))
+        Left (e :: SomeException) -> do
+          closeQuietly stream
+          pure (Left (PingStreamError ("ping negotiation failed: " ++ show e)))
+
+-- | Send one ping on the session with the default timeout
+-- ('pingTimeoutMicros'). The session's stream is reused across calls.
+ping :: PingSession -> IO (Either PingError PingResult)
+ping = pingWithTimeout pingTimeoutMicros
+
+-- | Send one ping on the session, waiting at most the given number of
+-- microseconds for the echo. On failure the session is closed: a stream
+-- whose echo timed out or went wrong cannot be reused, because a late
+-- echo would corrupt the next ping.
+pingWithTimeout :: Int -> PingSession -> IO (Either PingError PingResult)
+pingWithTimeout timeoutUs sess = do
+  closed <- readIORef (psClosed sess)
+  if closed
+    then pure (Left (PingStreamError "ping session is closed"))
+    else do
+      result <- pingOnce timeoutUs (psStream sess)
+      case result of
+        Left err -> do
+          closePingSession sess
+          pure (Left err)
+        ok -> pure ok
+
+-- | One ping exchange on an already-negotiated stream.
+pingOnce :: Int -> StreamIO -> IO (Either PingError PingResult)
+pingOnce timeoutUs stream = do
+  payload <- getRandomBytes pingSize :: IO ByteString
+  t0 <- getCurrentTime
+  -- try must wrap timeout (not the reverse): an inner try would catch
+  -- the Timeout exception itself and misreport it as a stream error.
+  outcome <- try $ timeout timeoutUs $ do
+    streamWrite stream payload
+    readExact stream pingSize
+  case outcome of
+    Left (e :: SomeException) ->
+      pure (Left (PingStreamError ("ping I/O failed: " ++ show e)))
+    Right Nothing -> pure (Left PingTimeout)
+    Right (Just echo)
+      | echo /= payload -> pure (Left PingMismatch)
+      | otherwise -> do
+          t1 <- getCurrentTime
+          pure (Right (PingResult (diffUTCTime t1 t0)))
+
+-- | Close the session's stream (signalling EOF to the responder's echo
+-- loop) and release its stream reservation. Idempotent.
+closePingSession :: PingSession -> IO ()
+closePingSession sess = do
+  alreadyClosed <- atomicModifyIORef' (psClosed sess) (\c -> (True, c))
+  unless alreadyClosed $ closeQuietly (psStream sess)
+
+-- | Run an action with a ping session, closing it afterwards even if
+-- the action throws. Returns Left if the session could not be opened.
+withPingSession
+  :: Switch
+  -> Connection
+  -> (PingSession -> IO a)
+  -> IO (Either PingError a)
+withPingSession sw conn action = do
+  opened <- openPingSession sw conn
+  case opened of
+    Left err -> pure (Left err)
+    Right sess -> (Right <$> action sess) `finally` closePingSession sess
+
+-- | Send a single Ping to a remote peer (initiator side).
+--
+-- Convenience wrapper: opens a ping session, pings once, and closes the
+-- stream. For repeated pings to the same peer, use 'withPingSession'
+-- to reuse one stream instead of opening one per call.
+sendPing :: Switch -> Connection -> IO (Either PingError PingResult)
+sendPing sw conn = either Left id <$> withPingSession sw conn ping
 
 -- | Register the Ping handler on the Switch.
 registerPingHandler :: Switch -> IO ()
@@ -106,6 +214,10 @@ registerPingHandler sw = atomically $ do
   protos <- readTVar (swProtocols sw)
   let handler conn stream = handlePing stream (connPeerId conn)
   writeTVar (swProtocols sw) (Map.insert pingProtocolId handler protos)
+
+-- | Close a stream, swallowing any exception (best-effort EOF signal).
+closeQuietly :: StreamIO -> IO ()
+closeQuietly stream = streamClose stream `catch` \(_ :: SomeException) -> pure ()
 
 -- | Read exactly n bytes from a StreamIO.
 readExact :: StreamIO -> Int -> IO ByteString
