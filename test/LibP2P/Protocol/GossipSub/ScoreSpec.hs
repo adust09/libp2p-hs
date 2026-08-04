@@ -172,7 +172,7 @@ spec = do
       it "returns 0 for all-zero counters" $ do
         let ps = mkPeerState (Map.singleton "t" defaultTopicPeerState)
             params = mkScoreParams "t" defaultTopicScoreParams
-        computeScore params ps emptyIPMap fixedTime `shouldBe` 0
+        computeScore params (mkPeerId 1) ps emptyIPMap fixedTime `shouldBe` 0
 
       it "computes positive score for first deliveries" $ do
         let tps = defaultTopicPeerState
@@ -185,7 +185,7 @@ spec = do
         -- P1 = min(5/1, 100) = 5, w1=0.01 => 0.05
         -- P2 = min(10, 100) = 10, w2=1.0 => 10
         -- Topic score = 1.0 * (0.05 + 10) = 10.05
-        let score = computeScore params ps emptyIPMap fixedTime
+        let score = computeScore params (mkPeerId 1) ps emptyIPMap fixedTime
         score `shouldSatisfy` (> 0)
         abs (score - 10.05) `shouldSatisfy` (< 0.01)
 
@@ -196,7 +196,7 @@ spec = do
             params = mkScoreParams "t" tsp
         -- P4 = 2^2 = 4, w4=-100 => -400
         -- Topic score = 1.0 * (-400) = -400
-        let score = computeScore params ps emptyIPMap fixedTime
+        let score = computeScore params (mkPeerId 1) ps emptyIPMap fixedTime
         score `shouldSatisfy` (< 0)
 
       it "applies TopicScoreCap to topic portion" $ do
@@ -205,8 +205,62 @@ spec = do
             tsp = defaultTopicScoreParams
             params = (mkScoreParams "t" tsp) { pspTopicScoreCap = 10 }
         -- P2 = 100, w2=1 => 100, but TopicCap=10
-        let score = computeScore params ps emptyIPMap fixedTime
+        let score = computeScore params (mkPeerId 1) ps emptyIPMap fixedTime
         score `shouldSatisfy` (<= 10)
+
+      -- Issue #156: P5 was omitted from computeScore entirely
+      it "includes the P5 application-specific score" $ do
+        let ps = mkPeerState Map.empty
+            params = defaultPeerScoreParams
+              { pspAppSpecificScore = \pid -> if pid == mkPeerId 1 then 42 else 0
+              , pspAppSpecificWeight = 2
+              }
+        computeScore params (mkPeerId 1) ps emptyIPMap fixedTime `shouldBe` 84
+        computeScore params (mkPeerId 2) ps emptyIPMap fixedTime `shouldBe` 0
+
+    -- Mesh membership marking (issue #156: tpsInMesh/tpsGraftTime were
+    -- assigned only in defaultTopicPeerState and never updated)
+    describe "mesh membership marking" $ do
+      it "markPeerInMesh starts the mesh clock" $ do
+        let ps = mkPeerState Map.empty
+            ps' = markPeerInMesh "t" fixedTime ps
+        case Map.lookup "t" (psTopicState ps') of
+          Just tps -> do
+            tpsInMesh tps `shouldBe` True
+            tpsGraftTime tps `shouldBe` Just fixedTime
+            tpsMeshTime tps `shouldBe` 0
+          Nothing -> expectationFailure "topic state not created"
+
+      it "unmarkPeerInMesh stops the clock but keeps counters" $ do
+        let tps0 = defaultTopicPeerState
+              { tpsInMesh = True
+              , tpsGraftTime = Just fixedTime
+              , tpsFirstMessageDeliveries = 7
+              }
+            ps = mkPeerState (Map.singleton "t" tps0)
+            ps' = unmarkPeerInMesh "t" ps
+        case Map.lookup "t" (psTopicState ps') of
+          Just tps -> do
+            tpsInMesh tps `shouldBe` False
+            tpsGraftTime tps `shouldBe` Nothing
+            tpsFirstMessageDeliveries tps `shouldBe` 7
+          Nothing -> expectationFailure "topic state lost"
+
+      it "refreshMeshTime accrues time since graft for in-mesh peers" $ do
+        let tps0 = defaultTopicPeerState
+              { tpsInMesh = True, tpsGraftTime = Just fixedTime }
+            ps = mkPeerState (Map.singleton "t" tps0)
+            ps' = refreshMeshTime (addUTCTime 30 fixedTime) ps
+        case Map.lookup "t" (psTopicState ps') of
+          Just tps -> tpsMeshTime tps `shouldBe` 30
+          Nothing  -> expectationFailure "topic state lost"
+
+      it "refreshMeshTime leaves non-mesh peers untouched" $ do
+        let ps = mkPeerState (Map.singleton "t" defaultTopicPeerState)
+            ps' = refreshMeshTime (addUTCTime 30 fixedTime) ps
+        case Map.lookup "t" (psTopicState ps') of
+          Just tps -> tpsMeshTime tps `shouldBe` 0
+          Nothing  -> expectationFailure "topic state lost"
 
     -- Decay
     describe "decayScores" $ do

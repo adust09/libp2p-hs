@@ -138,7 +138,7 @@ spec = do
       -- Create memory stream pair: remote side writes, handler reads
       (remoteStream, handlerStream) <- mkMemoryStreamPair
       -- Spawn handler in background (blocks on read loop)
-      _ <- async $ handleGossipSubStream node handlerStream remotePid
+      _ <- async $ handleGossipSubStream node handlerStream remotePid Nothing
       -- Send a subscription RPC from remote
       writeRPCMessage remoteStream (subscribeRPC "test-topic")
       -- Give handler time to process
@@ -162,7 +162,7 @@ spec = do
       addPeer (gsnRouter node) remotePid GossipSubPeer False now
       (remoteStream, handlerStream) <- mkMemoryStreamPair
       -- Spawn handler
-      _ <- async $ handleGossipSubStream node handlerStream remotePid
+      _ <- async $ handleGossipSubStream node handlerStream remotePid Nothing
       -- Send a publish RPC
       let msg = signedMessage remoteKp "pub-topic" "hello gossipsub"
       writeRPCMessage remoteStream (emptyRPC { rpcPublish = [msg] })
@@ -297,8 +297,8 @@ spec = do
       (streamAtoB, streamBfromA) <- mkMemoryStreamPair
       (streamBtoA, streamAfromB) <- mkMemoryStreamPair
       -- Spawn stream handlers
-      _ <- async $ handleGossipSubStream nodeB streamBfromA pidA
-      _ <- async $ handleGossipSubStream nodeA streamAfromB pidB
+      _ <- async $ handleGossipSubStream nodeB streamBfromA pidA Nothing
+      _ <- async $ handleGossipSubStream nodeA streamAfromB pidB Nothing
       -- Inject cached outbound streams for sendRPC
       atomically $ do
         writeTVar (gsnStreams nodeA) (Map.singleton pidB streamAtoB)
@@ -328,8 +328,8 @@ spec = do
       (streamAtoB, streamBfromA) <- mkMemoryStreamPair
       (streamBtoA, streamAfromB) <- mkMemoryStreamPair
       -- Spawn stream handlers (registers peers in each router)
-      _ <- async $ handleGossipSubStream nodeB streamBfromA pidA
-      _ <- async $ handleGossipSubStream nodeA streamAfromB pidB
+      _ <- async $ handleGossipSubStream nodeB streamBfromA pidA Nothing
+      _ <- async $ handleGossipSubStream nodeA streamAfromB pidB Nothing
       -- Inject cached outbound streams
       atomically $ do
         writeTVar (gsnStreams nodeA) (Map.singleton pidB streamAtoB)

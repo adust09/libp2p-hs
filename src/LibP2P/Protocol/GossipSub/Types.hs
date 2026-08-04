@@ -194,6 +194,8 @@ data GossipSubParams = GossipSubParams
   , paramSignaturePolicy    :: !SignaturePolicy  -- ^ Signing policy (default StrictSign)
   , paramMcacheLen          :: !Int              -- ^ Message cache windows (default 5)
   , paramMcacheGossip       :: !Int              -- ^ Gossip windows (default 3)
+  , paramPrunePeers         :: !Int              -- ^ PX peers included in PRUNE (default 16)
+  , paramIWantFollowupTime  :: !NominalDiffTime  -- ^ IWANT promise deadline (default 3s)
   }
 
 -- | Default message ID: concatenation of from and seqno fields.
@@ -223,6 +225,8 @@ defaultGossipSubParams = GossipSubParams
   , paramSignaturePolicy   = StrictSign
   , paramMcacheLen         = 5
   , paramMcacheGossip      = 3
+  , paramPrunePeers        = 16
+  , paramIWantFollowupTime = 3
   }
 
 -- Peer tracking
@@ -403,9 +407,17 @@ data GossipSubRouter = GossipSubRouter
   , gsBackoff     :: !(TVar (Map (PeerId, Topic) UTCTime))
     -- Scoring (Phase 9b)
   , gsScoreParams :: !PeerScoreParams
+    -- ^ Scoring parameters. A plain (immutable) field: configure it via
+    -- record update right after 'newRouter' — all mutable state lives in
+    -- shared TVars, so the updated record operates on the same router.
+    -- Topics without an entry in 'pspTopicParams' contribute no topic score.
   , gsThresholds  :: !ScoreThresholds
   , gsIPPeerCount :: !(TVar (Map ByteString (Set PeerId)))
     -- ^ IP address → peers sharing that IP (for P6)
+  , gsIWantPromises :: !(TVar (Map (PeerId, MessageId) UTCTime))
+    -- ^ IWANT promises: message IDs a peer advertised via IHAVE and we
+    -- requested, with the delivery deadline. A promise still unfulfilled
+    -- past its deadline is a P7 behavioural violation (gossipsub-v1.1.md).
     -- Message cache (Phase 9c)
   , gsMessageCache  :: !(TVar MessageCache)
     -- ^ Sliding-window message cache for IWANT and IHAVE
@@ -420,6 +432,10 @@ data GossipSubRouter = GossipSubRouter
     -- ^ Application message callback
   , gsValidators  :: !(TVar (Map Topic TopicValidator))
     -- ^ Per-topic application validators, applied before propagation
+  , gsOnPeerExchange :: !(TVar (Topic -> [PeerExchangeInfo] -> IO ()))
+    -- ^ Called with PX records from a PRUNE whose sender scores at or
+    -- above 'stAcceptPXThreshold'. The application decides how to act
+    -- (e.g. resolve addresses and dial); default is a no-op.
   }
 
 -- Defaults
