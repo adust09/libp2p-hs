@@ -328,20 +328,18 @@ spec = do
                 Nothing -> False) sent
         length pruneMsgs `shouldBe` 0
 
-      it "does not add the sender to the mesh for an unsubscribed topic" $ do
-        (router, _) <- mkTestRouter localPid
+      it "ignores a GRAFT for an unsubscribed topic entirely" $ do
+        (router, logRef) <- mkTestRouter localPid
         let sender = mkPeerId 1
         addPeer router sender GossipSubPeer False fixedTime
         handleGraft router sender [Graft "unknown-topic"]
         -- The sender must never enter a mesh for a topic we are not
-        -- subscribed to. Note: the reply behaviour is deliberately NOT
-        -- asserted here. The router currently answers with PRUNE, but
-        -- gossipsub-v1.1.md requires ignoring a GRAFT for an unknown topic
-        -- entirely (the PRUNE reply is a spam amplification vector). The
-        -- previous version of this test asserted the PRUNE reply as correct;
-        -- the reply fix is tracked in #157.
+        -- subscribed to, and per gossipsub-v1.1.md the GRAFT is ignored
+        -- entirely: replying with PRUNE (the v1.0 behaviour) is a spam
+        -- amplification vector (#157).
         mesh <- readTVarIO (gsMesh router)
         Map.findWithDefault Set.empty "unknown-topic" mesh `shouldBe` Set.empty
+        readIORef logRef `shouldReturn` []
 
       it "rejects graft during backoff (sends PRUNE with backoff)" $ do
         (router, logRef, timeRef) <- mkTestRouterWithTime localPid fixedTime
@@ -354,11 +352,13 @@ spec = do
         atomically $ modifyTVar' (gsBackoff router) $
           Map.insert (sender, "blocks") backoffExpiry
         handleGraft router sender [Graft "blocks"]
-        -- Should send PRUNE
+        -- Should send PRUNE carrying a fresh backoff (GRAFT flood
+        -- protection, gossipsub-v1.1.md; #157)
         sent <- readIORef logRef
         let pruneMsgs = filter (\(pid, rpc) ->
               pid == sender && case rpcControl rpc of
-                Just ctrl -> any (\p -> pruneTopic p == "blocks") (ctrlPrune ctrl)
+                Just ctrl -> any (\p -> pruneTopic p == "blocks"
+                                     && pruneBackoff p == Just 60) (ctrlPrune ctrl)
                 Nothing -> False) sent
         length pruneMsgs `shouldBe` 1
         -- Sender should NOT be in mesh
@@ -840,6 +840,212 @@ spec = do
           Just ps -> psBehaviorPenalty ps `shouldBe` 1
           Nothing -> expectationFailure "peer not found"
 
+      -- Issue #156: every counter feeding the score formula was write-free
+      it "GRAFT acceptance starts the P1 mesh clock" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "blocks")
+        handleGraft router sender [Graft "blocks"]
+        peers <- readTVarIO (gsPeers router)
+        case Map.lookup sender peers >>= Map.lookup "blocks" . psTopicState of
+          Just tps -> do
+            tpsInMesh tps `shouldBe` True
+            tpsGraftTime tps `shouldBe` Just fixedTime
+          Nothing -> expectationFailure "topic state not created on GRAFT"
+
+      it "first valid delivery increments P2 for the sender" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        kp <- newKeyPair
+        handleRPC router sender emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [1])] }
+        peers <- readTVarIO (gsPeers router)
+        case Map.lookup sender peers >>= Map.lookup "t" . psTopicState of
+          Just tps -> tpsFirstMessageDeliveries tps `shouldBe` 1
+          Nothing -> expectationFailure "no topic state recorded"
+
+      it "delivery from a mesh peer increments P3" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "t" (Set.singleton sender)
+        kp <- newKeyPair
+        handleRPC router sender emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [1])] }
+        peers <- readTVarIO (gsPeers router)
+        case Map.lookup sender peers >>= Map.lookup "t" . psTopicState of
+          Just tps -> tpsMeshMessageDeliveries tps `shouldBe` 1
+          Nothing -> expectationFailure "no topic state recorded"
+
+      it "duplicate delivery within the window counts P3 but not P2" $ do
+        (router, _) <- mkTestRouter localPid
+        let first  = mkPeerId 1
+            second = mkPeerId 2
+        addPeer router first GossipSubPeer False fixedTime
+        addPeer router second GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "t" (Set.fromList [first, second])
+        kp <- newKeyPair
+        let msg = signedMessage kp "t" (BS.pack [1])
+        handleRPC router first emptyRPC { rpcPublish = [msg] }
+        handleRPC router second emptyRPC { rpcPublish = [msg] }
+        peers <- readTVarIO (gsPeers router)
+        case Map.lookup second peers >>= Map.lookup "t" . psTopicState of
+          Just tps -> do
+            tpsFirstMessageDeliveries tps `shouldBe` 0
+            tpsMeshMessageDeliveries tps `shouldBe` 1
+          Nothing -> expectationFailure "no topic state recorded"
+
+      it "peerScore includes P5 (application-specific score)" $ do
+        (router, _) <- mkTestRouter localPid
+        let pid = mkPeerId 1
+            routerP5 = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const 42 }
+              }
+        addPeer routerP5 pid GossipSubPeer False fixedTime
+        peerScore routerP5 pid `shouldReturn` 42
+
+      it "setPeerIP feeds P6 IP colocation" $ do
+        (router, _) <- mkTestRouter localPid
+        let pids = map mkPeerId [1..4]
+            ip = BS.pack [10, 0, 0, 1]
+        mapM_ (\pid -> addPeer router pid GossipSubPeer False fixedTime) pids
+        mapM_ (\pid -> setPeerIP router pid ip) pids
+        -- Threshold is 3, so 4 peers on one IP give excess 1: P6 = 1,
+        -- weight -10 => score -10
+        mapM_ (\pid -> peerScore router pid `shouldReturn` (-10)) pids
+
+      it "removePeer clears the P6 IP colocation entry" $ do
+        (router, _) <- mkTestRouter localPid
+        let pid = mkPeerId 1
+            ip = BS.pack [10, 0, 0, 1]
+        addPeer router pid GossipSubPeer False fixedTime
+        setPeerIP router pid ip
+        removePeer router pid
+        ipMap <- readTVarIO (gsIPPeerCount router)
+        Map.member ip ipMap `shouldBe` False
+
+      it "graylisted peers have their RPCs ignored" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            routerGl = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const (-20000) }
+              }
+        addPeer routerGl sender GossipSubPeer False fixedTime
+        -- Below stGraylistThreshold (-10000): the subscription is dropped
+        handleRPC routerGl sender emptyRPC { rpcSubscriptions = [SubOpts True "t"] }
+        peers <- readTVarIO (gsPeers routerGl)
+        case Map.lookup sender peers of
+          Just ps -> psTopics ps `shouldBe` Set.empty
+          Nothing -> expectationFailure "peer not found"
+
+      it "flood publish skips peers below the publish threshold" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let good = mkPeerId 1
+            bad  = mkPeerId 2
+            routerTh = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = \pid -> if pid == bad then -2000 else 0 }
+              }
+        addSubscribedPeer routerTh good "blocks"
+        addSubscribedPeer routerTh bad "blocks"
+        kp <- newKeyPair
+        publish routerTh "blocks" (BS.pack [1]) (Just kp)
+        sent <- readIORef logRef
+        let publishedTo = map fst $ filter (\(_, rpc) -> not (null (rpcPublish rpc))) sent
+        publishedTo `shouldBe` [good]
+
+    describe "PRUNE peer exchange (#157)" $ do
+      it "leave sends PRUNE with PX records for other topic peers" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let meshPeer = mkPeerId 1
+            otherA = mkPeerId 2
+            otherB = mkPeerId 3
+        mapM_ (\pid -> addSubscribedPeer router pid "blocks") [meshPeer, otherA, otherB]
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "blocks" (Set.singleton meshPeer)
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "blocks")
+        writeIORef logRef []
+        leave router "blocks"
+        sent <- readIORef logRef
+        let pxSets = [ map pxPeerId (prunePeers p)
+                     | (pid, rpc) <- sent
+                     , pid == meshPeer
+                     , Just ctrl <- [rpcControl rpc]
+                     , p <- ctrlPrune ctrl
+                     , pruneTopic p == "blocks" ]
+        case pxSets of
+          [pxIds] -> do
+            let PeerId bytesA = otherA
+                PeerId bytesB = otherB
+            Set.fromList pxIds `shouldBe` Set.fromList [bytesA, bytesB]
+          _ -> expectationFailure "expected exactly one PRUNE with PX to the mesh peer"
+
+      it "honours PX from a sender above the acceptance threshold" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            routerPx = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const 200 }  -- >= stAcceptPXThreshold (100)
+              }
+        addPeer routerPx sender GossipSubPeer False fixedTime
+        receivedRef <- newIORef ([] :: [(Topic, [PeerExchangeInfo])])
+        atomically $ writeTVar (gsOnPeerExchange routerPx) $ \t px ->
+          modifyIORef' receivedRef (++ [(t, px)])
+        let px = [PeerExchangeInfo (BS.pack [9]) Nothing]
+        handlePrune routerPx sender [Prune "t" px (Just 60)]
+        readIORef receivedRef `shouldReturn` [("t", px)]
+
+      it "ignores PX from a sender below the acceptance threshold" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        receivedRef <- newIORef ([] :: [(Topic, [PeerExchangeInfo])])
+        atomically $ writeTVar (gsOnPeerExchange router) $ \t px ->
+          modifyIORef' receivedRef (++ [(t, px)])
+        -- Default score is 0, below stAcceptPXThreshold (100)
+        handlePrune router sender [Prune "t" [PeerExchangeInfo (BS.pack [9]) Nothing] (Just 60)]
+        readIORef receivedRef `shouldReturn` []
+
+    describe "IWANT promise tracking (#157/#156 P7)" $ do
+      it "records a promise when requesting from an IHAVE" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            mid = BS.pack [1, 2, 3]
+        addPeer router sender GossipSubPeer False fixedTime
+        handleIHave router sender [IHave "t" [mid]]
+        promises <- readTVarIO (gsIWantPromises router)
+        Map.member (sender, mid) promises `shouldBe` True
+
+      it "clears the promise when the message is delivered" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        kp <- newKeyPair
+        let msg = signedMessage kp "t" (BS.pack [1])
+            mid = defaultMessageId msg
+        handleIHave router sender [IHave "t" [mid]]
+        promises0 <- readTVarIO (gsIWantPromises router)
+        Map.member (sender, mid) promises0 `shouldBe` True
+        handleRPC router sender emptyRPC { rpcPublish = [msg] }
+        promises1 <- readTVarIO (gsIWantPromises router)
+        promises1 `shouldBe` Map.empty
+
+      it "ignores IHAVE from peers below the gossip threshold" $ do
+        (router, logRef) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            routerTh = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const (-200) }  -- < stGossipThreshold (-100)
+              }
+        addPeer routerTh sender GossipSubPeer False fixedTime
+        handleIHave routerTh sender [IHave "t" [BS.pack [1]]]
+        readIORef logRef `shouldReturn` []
+
+    describe "P3b mesh failure penalty" $ do
       it "handlePrune records P3b mesh failure" $ do
         (router, _) <- mkTestRouter localPid
         let sender = mkPeerId 1

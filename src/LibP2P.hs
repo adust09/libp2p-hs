@@ -73,6 +73,12 @@ module LibP2P
     -- * Ping protocol
   , registerPingHandler
   , sendPing
+  , PingSession
+  , openPingSession
+  , ping
+  , pingWithTimeout
+  , closePingSession
+  , withPingSession
   , PingResult (..)
   , PingError (..)
 
@@ -128,7 +134,18 @@ import LibP2P.Protocol.GossipSub.Handler
   )
 import LibP2P.Protocol.GossipSub.Types (GossipSubParams (..), defaultGossipSubParams)
 import LibP2P.Protocol.Identify (pushIdentify, registerIdentifyHandlers, requestIdentify)
-import LibP2P.Protocol.Ping (PingError (..), PingResult (..), registerPingHandler, sendPing)
+import LibP2P.Protocol.Ping
+  ( PingError (..)
+  , PingResult (..)
+  , PingSession
+  , closePingSession
+  , openPingSession
+  , ping
+  , pingWithTimeout
+  , registerPingHandler
+  , sendPing
+  , withPingSession
+  )
 import LibP2P.Switch.Connection (closeConnection, newStream)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (ConnectionGater (..), defaultConnectionGater, switchListen, switchListenAddrs)

@@ -13,6 +13,7 @@ import LibP2P.Crypto.PeerId (PeerId (..))
 import LibP2P.Protocol.GossipSub.Types
 import LibP2P.Protocol.GossipSub.Router (newRouter, addPeer, peerScore)
 import LibP2P.Protocol.GossipSub.MessageCache (newMessageCache, cachePut, cacheGetGossipIds)
+import LibP2P.Protocol.GossipSub.Score (markPeerInMesh)
 import LibP2P.Protocol.GossipSub.Heartbeat
 
 -- Test helpers
@@ -348,3 +349,121 @@ spec = do
         heartbeatOnce router
         count2 <- readTVarIO (gsHeartbeatCount router)
         count2 `shouldBe` 2
+
+    -- Issue #156: P1 mesh time was never accrued, so time-in-mesh never
+    -- contributed to any score.
+    describe "P1 mesh time accrual" $ do
+      it "accrues mesh time on heartbeat and yields a positive score" $ do
+        (router, _, timeRef) <- mkHeartbeatRouter localPid fixedTime
+        let tsp = defaultTopicScoreParams { tspMeshMessageDeliveriesThreshold = 0 }
+            routerP1 = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspTopicParams = Map.singleton "t" tsp } }
+            pid = mkPeerId 1
+        addMeshPeer routerP1 pid "t" fixedTime
+        atomically $ modifyTVar' (gsPeers routerP1) $
+          Map.adjust (markPeerInMesh "t" fixedTime) pid
+        writeIORef timeRef (addUTCTime 10 fixedTime)
+        heartbeatOnce routerP1
+        peers <- readTVarIO (gsPeers routerP1)
+        case Map.lookup pid peers >>= Map.lookup "t" . psTopicState of
+          Just tps -> tpsMeshTime tps `shouldBe` 10
+          Nothing -> expectationFailure "topic state not found"
+        score <- peerScore routerP1 pid
+        score `shouldSatisfy` (> 0)
+
+    -- Issue #156/#157: IWANT promises (P7) and gossip threshold.
+    describe "IWANT promise expiry (P7)" $ do
+      it "penalizes peers whose IWANT promise expired undelivered" $ do
+        (router, _, timeRef) <- mkHeartbeatRouter localPid fixedTime
+        let pid = mkPeerId 1
+        addPeer router pid GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsIWantPromises router) $
+          Map.insert (pid, BS.pack [1]) (addUTCTime 3 fixedTime)
+        writeIORef timeRef (addUTCTime 4 fixedTime)
+        heartbeatOnce router
+        peers <- readTVarIO (gsPeers router)
+        case Map.lookup pid peers of
+          Just ps -> psBehaviorPenalty ps `shouldSatisfy` (> 0)
+          Nothing -> expectationFailure "peer not found"
+        promises <- readTVarIO (gsIWantPromises router)
+        promises `shouldBe` Map.empty
+
+      it "does not penalize before the deadline" $ do
+        (router, _, _) <- mkHeartbeatRouter localPid fixedTime
+        let pid = mkPeerId 1
+        addPeer router pid GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsIWantPromises router) $
+          Map.insert (pid, BS.pack [1]) (addUTCTime 3 fixedTime)
+        heartbeatOnce router
+        peers <- readTVarIO (gsPeers router)
+        case Map.lookup pid peers of
+          Just ps -> psBehaviorPenalty ps `shouldBe` 0
+          Nothing -> expectationFailure "peer not found"
+
+    describe "Gossip threshold" $ do
+      it "emits no IHAVE to peers below the gossip threshold" $ do
+        (router, logRef, _) <- mkHeartbeatRouter localPid fixedTime
+        let badPeer = mkPeerId 10
+            routerTh = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = \pid ->
+                      if pid == badPeer then -200 else 0 } }
+        mapM_ (\pid -> addMeshPeer routerTh pid "t" fixedTime) (map mkPeerId [1..6])
+        addSubscribedPeer routerTh badPeer "t" fixedTime
+        let mid = BS.pack [42]
+            msg = PubSubMessage (Just (BS.pack [1])) (BS.pack [1]) (Just mid) "t" Nothing Nothing
+        atomically $ modifyTVar' (gsMessageCache routerTh) $ cachePut mid msg
+        heartbeatOnce routerTh
+        sent <- readIORef logRef
+        let ihaveTo = [ pid | (pid, rpc) <- sent
+                            , Just ctrl <- [rpcControl rpc]
+                            , not (null (ctrlIHave ctrl)) ]
+        badPeer `shouldSatisfy` (`notElem` ihaveTo)
+
+    -- Issue #156 (score-aware trim) and #157 (PX on PRUNE).
+    describe "Score-aware mesh trim" $ do
+      it "keeps the best D_score peers and PRUNEs with peer exchange" $ do
+        (router, logRef, _) <- mkHeartbeatRouter localPid fixedTime
+        let appScore pid = let PeerId bs = pid in fromIntegral (BS.head bs)
+            routerSc = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = appScore } }
+        mapM_ (\pid -> addMeshPeer routerSc pid "t" fixedTime) (map mkPeerId [1..15])
+        heartbeatOnce routerSc
+        mesh <- readTVarIO (gsMesh routerSc)
+        let kept = Map.findWithDefault Set.empty "t" mesh
+        Set.size kept `shouldBe` 6
+        -- D_score = 4: the four best-scoring peers survive the trim
+        mapM_ (\n -> Set.member (mkPeerId n) kept `shouldBe` True) [12..15 :: Int]
+        -- PRUNEs to removed peers carry PX records (#157)
+        sent <- readIORef logRef
+        let pxPrunes = [ p | (_, rpc) <- sent
+                           , Just ctrl <- [rpcControl rpc]
+                           , p <- ctrlPrune ctrl
+                           , not (null (prunePeers p)) ]
+        length pxPrunes `shouldSatisfy` (>= 1)
+
+      it "keeps at least D_out outbound peers when trimming" $ do
+        (router, _, _) <- mkHeartbeatRouter localPid fixedTime
+        let appScore pid = let PeerId bs = pid in fromIntegral (BS.head bs)
+            routerSc = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = appScore } }
+        -- Peers 1-2 are outbound with the lowest scores; 3-15 inbound
+        mapM_ (\n -> do
+                let pid = mkPeerId n
+                addPeer routerSc pid GossipSubPeer True fixedTime
+                atomically $ do
+                  modifyTVar' (gsPeers routerSc) $
+                    Map.adjust (\ps -> ps { psTopics = Set.singleton "t" }) pid
+                  modifyTVar' (gsMesh routerSc) $
+                    Map.insertWith Set.union "t" (Set.singleton pid))
+          [1, 2 :: Int]
+        mapM_ (\n -> addMeshPeer routerSc (mkPeerId n) "t" fixedTime) [3..15 :: Int]
+        heartbeatOnce routerSc
+        mesh <- readTVarIO (gsMesh routerSc)
+        let kept = Map.findWithDefault Set.empty "t" mesh
+        Set.size kept `shouldBe` 6
+        Set.member (mkPeerId 1) kept `shouldBe` True
+        Set.member (mkPeerId 2) kept `shouldBe` True

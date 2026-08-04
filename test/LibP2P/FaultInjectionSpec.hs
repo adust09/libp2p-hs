@@ -77,7 +77,7 @@ expectHealthyListener pid listenAddr =
     dialResult <- timeout 10000000 $ dial sw pid [listenAddr]
     case dialResult of
       Just (Right conn) -> do
-        pingResult <- timeout 5000000 $ sendPing conn
+        pingResult <- timeout 5000000 $ sendPing sw conn
         case pingResult of
           Just (Right (PingResult rtt)) -> rtt `shouldSatisfy` (> 0)
           other ->

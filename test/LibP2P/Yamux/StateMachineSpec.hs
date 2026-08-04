@@ -189,13 +189,13 @@ spec = do
         awaitTrue (ysessShutdown (hpSession hp))
 
   describe "GoAway from the peer" $ do
-    it "raw GoAway(0x01) prevents new outbound streams" $
+    it "raw GoAway(0x01) prevents new outbound streams and surfaces the code" $
       withHostilePeer RoleClient $ \hp -> do
         injectFrame hp (YamuxHeader 0 FrameGoAway noF 0 0x01) BS.empty
-        awaitTrue (ysessRemoteGoAway (hpSession hp))
+        awaitRemoteGoAway (hpSession hp) GoAwayProtocol
         result <- openStream (hpSession hp)
         case result of
-          Left err -> err `shouldBe` YamuxSessionShutdown
+          Left err -> err `shouldBe` YamuxGoAway GoAwayProtocol
           Right _ -> expectationFailure "openStream succeeded after remote GoAway"
 
   describe "Window accounting" $ do

@@ -23,6 +23,7 @@ import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
 import LibP2P.Noise.Handshake
   ( HandshakeResult (..)
+  , HandshakeState (..)
   , NoisePayload (..)
   , buildHandshakePayload
   , decodeNoisePayload
@@ -33,12 +34,16 @@ import LibP2P.Noise.Handshake
   , readHandshakeMsg
   , writeHandshakeMsg
   )
+import LibP2P.Noise.Session (NoiseSession, encryptMessage, mkNoiseSession)
 import LibP2P.Switch.Types (Direction (..))
 import LibP2P.Switch.Upgrade
-  ( performStreamHandshake
+  ( noiseSessionToStreamIO
+  , performStreamHandshake
+  , readExact
   , readFramedMessage
   , writeFramedMessage
   )
+import Data.IORef (newIORef)
 import Test.Hspec
 
 -- | Generate a test identity (PeerId, KeyPair).
@@ -62,7 +67,8 @@ runForeignResponder identityKP sigTarget stream = do
   (_p1, st1) <- either fail pure $ readHandshakeMsg st0 msg1
 
   -- Message 2: -> e, ee, s, es (identity payload, signature over sigTarget)
-  let payload = encodeNoisePayload $ buildHandshakePayload identityKP (sigTarget staticPub)
+  payload <- either fail pure $
+    encodeNoisePayload <$> buildHandshakePayload identityKP (sigTarget staticPub)
   (msg2, st2) <- either fail pure $ writeHandshakeMsg st1 payload
   writeFramedMessage stream msg2
 
@@ -91,7 +97,8 @@ runForeignInitiator identityKP sigTarget stream = do
   pk <- either fail pure $ decodePublicKey (npIdentityKey np)
 
   -- Message 3: -> s, se (identity payload, signature over sigTarget)
-  let payload = encodeNoisePayload $ buildHandshakePayload identityKP (sigTarget staticPub)
+  payload <- either fail pure $
+    encodeNoisePayload <$> buildHandshakePayload identityKP (sigTarget staticPub)
   (msg3, _stFinal) <- either fail pure $ writeHandshakeMsg st2 payload
   writeFramedMessage stream msg3
   pure (fromPublicKey pk, pk)
@@ -106,6 +113,22 @@ isSignatureRejection e = "identity signature verification failed" `isInfixOf` sh
 -- or a forged one (attacker without the identity private key).
 foreignStaticKey :: ByteString
 foreignStaticKey = BS.replicate 32 0x5A
+
+-- | An honest hand-rolled responder that completes the handshake and
+-- returns its transport-mode Noise session, so the test can craft
+-- arbitrary post-handshake transport messages on the foreign side.
+runForeignResponderSession :: KeyPair -> StreamIO -> IO NoiseSession
+runForeignResponderSession identityKP stream = do
+  (st0, staticPub) <- initHandshakeResponder identityKP
+  msg1 <- readFramedMessage stream
+  (_p1, st1) <- either fail pure $ readHandshakeMsg st0 msg1
+  payload <- either fail pure $
+    encodeNoisePayload <$> buildHandshakePayload identityKP staticPub
+  (msg2, st2) <- either fail pure $ writeHandshakeMsg st1 payload
+  writeFramedMessage stream msg2
+  msg3 <- readFramedMessage stream
+  (_p3, stFinal) <- either fail pure $ readHandshakeMsg st2 msg3
+  pure (mkNoiseSession (hsNoiseState stFinal))
 
 spec :: Spec
 spec = do
@@ -158,6 +181,36 @@ spec = do
         performStreamHandshake kpA Inbound streamA
           `shouldThrow` isSignatureRejection
 
+    it "empty transport messages between data frames do not kill the connection" $ do
+      -- A Noise transport message with an empty plaintext (frame carrying
+      -- only the 16-byte AEAD tag) is legal and used as a keepalive by
+      -- some implementations; a zero-length frame carries no message at
+      -- all. Both must yield zero application bytes, with reading
+      -- continuing at the next frame.
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (streamA, streamB) <- mkMemoryStreamPair
+      ((prodSess, _result), foreignSess) <-
+        concurrently
+          (performStreamHandshake kpA Outbound streamA)
+          (runForeignResponderSession kpB streamB)
+      -- Foreign peer sends: data, zero-length frame, tag-only frame, data.
+      (ct1, fs1) <- either fail pure $ encryptMessage foreignSess "hello"
+      (ctEmpty, fs2) <- either fail pure $ encryptMessage fs1 BS.empty
+      (ct2, _fs3) <- either fail pure $ encryptMessage fs2 "world"
+      BS.length ctEmpty `shouldBe` 16 -- AEAD tag only
+      writeFramedMessage streamB ct1
+      streamWrite streamB (BS.pack [0x00, 0x00]) -- zero-length frame
+      writeFramedMessage streamB ctEmpty
+      writeFramedMessage streamB ct2
+      -- Production side reads through the Noise-encrypted StreamIO.
+      sendRef <- newIORef prodSess
+      recvRef <- newIORef prodSess
+      bufRef <- newIORef BS.empty
+      let encryptedIO = noiseSessionToStreamIO sendRef recvRef bufRef streamA
+      got <- readExact encryptedIO 10
+      got `shouldBe` "helloworld"
+
     it "initiator rejects a responder that advertises another peer's identity key" $ do
       -- Eve presents Bob's public key but cannot produce Bob's signature
       -- over her own session's static key: she signs with her own key.
@@ -165,15 +218,15 @@ spec = do
       (_pidBob, kpBob) <- mkTestIdentity
       (_pidEve, kpEve) <- mkTestIdentity
       (streamA, streamB) <- mkMemoryStreamPair
-      let impersonate staticPub =
-            let honest = buildHandshakePayload kpEve staticPub
-                bobKey = npIdentityKey (buildHandshakePayload kpBob staticPub)
-             in honest { npIdentityKey = bobKey }
+      let impersonate staticPub = do
+            honest <- buildHandshakePayload kpEve staticPub
+            bobPayload <- buildHandshakePayload kpBob staticPub
+            Right honest {npIdentityKey = npIdentityKey bobPayload}
           eveResponder stream = do
             (st0, staticPub) <- initHandshakeResponder kpEve
             msg1 <- readFramedMessage stream
             (_p1, st1) <- either fail pure $ readHandshakeMsg st0 msg1
-            let payload = encodeNoisePayload (impersonate staticPub)
+            payload <- either fail pure $ encodeNoisePayload <$> impersonate staticPub
             (msg2, _st2) <- either fail pure $ writeHandshakeMsg st1 payload
             writeFramedMessage stream msg2
       withAsync (eveResponder streamB) $ \_ ->

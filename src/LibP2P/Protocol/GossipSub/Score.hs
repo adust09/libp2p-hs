@@ -28,6 +28,10 @@ module LibP2P.Protocol.GossipSub.Score
   , recordInvalidMessage
   , recordMeshFailure
   , addP7Penalty
+    -- * Mesh membership marking
+  , markPeerInMesh
+  , unmarkPeerInMesh
+  , refreshMeshTime
   ) where
 
 import Data.ByteString (ByteString)
@@ -96,8 +100,8 @@ computeP7 ps = psBehaviorPenalty ps * psBehaviorPenalty ps
 
 -- | Compute full peer score per the gossipsub v1.1 scoring formula.
 -- Takes explicit PeerId for the P5 application-specific callback.
-computeScore :: PeerScoreParams -> PeerState -> Map.Map ByteString (Set.Set PeerId) -> UTCTime -> Double
-computeScore params ps ipMap now =
+computeScore :: PeerScoreParams -> PeerId -> PeerState -> Map.Map ByteString (Set.Set PeerId) -> UTCTime -> Double
+computeScore params pid ps ipMap now =
   let -- Topic score: sum over topics
       topicScore = Map.foldlWithKey' (\acc topic tps ->
         case Map.lookup topic (pspTopicParams params) of
@@ -119,8 +123,8 @@ computeScore params ps ipMap now =
            then cap
            else topicScore
 
-      -- P5: not computed here (requires PeerId from router context).
-      -- Use computeScoreForPeer in Router for full P5 support.
+      -- P5: application-specific score
+      p5 = pspAppSpecificWeight params * pspAppSpecificScore params pid
 
       -- P6: IP colocation
       p6 = pspIPColocationFactorWeight params * computeP6 params ps ipMap
@@ -128,7 +132,7 @@ computeScore params ps ipMap now =
       -- P7: behavioral penalty
       p7 = pspBehaviorPenaltyWeight params * computeP7 ps
 
-  in cappedTopicScore + p6 + p7
+  in cappedTopicScore + p5 + p6 + p7
 
 -- Decay
 
@@ -196,3 +200,33 @@ recordMeshFailure tsp tps =
 -- | Increment P7 behavioral penalty counter by 1.
 addP7Penalty :: PeerState -> PeerState
 addP7Penalty ps = ps { psBehaviorPenalty = psBehaviorPenalty ps + 1 }
+
+-- Mesh membership marking
+
+-- | Mark a peer as being in the mesh for a topic (P1/P3 start counting).
+-- Resets the mesh clock: graft time is now, accrued mesh time is zero.
+markPeerInMesh :: Topic -> UTCTime -> PeerState -> PeerState
+markPeerInMesh topic now ps =
+  let tps = Map.findWithDefault defaultTopicPeerState topic (psTopicState ps)
+      tps' = tps { tpsInMesh = True, tpsGraftTime = Just now, tpsMeshTime = 0 }
+  in ps { psTopicState = Map.insert topic tps' (psTopicState ps) }
+
+-- | Mark a peer as no longer in the mesh for a topic. Counters are kept
+-- (they decay on heartbeat); only the mesh clock stops.
+unmarkPeerInMesh :: Topic -> PeerState -> PeerState
+unmarkPeerInMesh topic ps =
+  case Map.lookup topic (psTopicState ps) of
+    Nothing -> ps
+    Just tps ->
+      let tps' = tps { tpsInMesh = False, tpsGraftTime = Nothing }
+      in ps { psTopicState = Map.insert topic tps' (psTopicState ps) }
+
+-- | Refresh accrued mesh time (P1 input) from the graft timestamp.
+-- Run on each heartbeat before scores are consulted.
+refreshMeshTime :: UTCTime -> PeerState -> PeerState
+refreshMeshTime now ps =
+  ps { psTopicState = Map.map refresh (psTopicState ps) }
+  where
+    refresh tps = case (tpsInMesh tps, tpsGraftTime tps) of
+      (True, Just gt) -> tps { tpsMeshTime = diffUTCTime now gt }
+      _               -> tps

@@ -12,8 +12,15 @@ module LibP2P.Yamux.Stream
 import Control.Concurrent.STM
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.Map.Strict as Map
 import LibP2P.Yamux.Frame
 import LibP2P.Yamux.Types
+
+-- | Reclaim a dead stream's slot in the session map (STM so callers
+-- can combine it with the terminal state transition atomically).
+unregisterStream :: YamuxStream -> STM ()
+unregisterStream stream =
+  modifyTVar' (ysessStreams (ysSession stream)) (Map.delete (ysStreamId stream))
 
 -- | Write data to a stream. Blocks when send window is 0.
 -- Writable states: SYNSent (optimistic), Established, RemoteClose.
@@ -121,7 +128,9 @@ streamClose stream = do
         writeTVar (ysState stream) StreamLocalClose
         pure (Right ())
       StreamRemoteClose -> do
+        -- Both sides FIN'd: the stream is dead, reclaim its map slot
         writeTVar (ysState stream) StreamClosed
+        unregisterStream stream
         pure (Right ())
       StreamSYNSent -> do
         writeTVar (ysState stream) StreamLocalClose
@@ -151,7 +160,9 @@ streamClose stream = do
 -- | Reset the stream by sending RST flag.
 streamReset :: YamuxStream -> IO ()
 streamReset stream = do
-  atomically $ writeTVar (ysState stream) StreamReset
+  atomically $ do
+    writeTVar (ysState stream) StreamReset
+    unregisterStream stream
   -- Send RST frame
   let hdr =
         YamuxHeader

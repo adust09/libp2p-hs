@@ -85,11 +85,13 @@ decodeKeyMessage ctx bs = do
   (_, rest3) <- takeExpectedByte 0x12 rest2 "expected tag 0x12 for field 2"
   (dataLen, rest4) <- decodeUvarint rest3
   let len = fromIntegral dataLen :: Int
-  if BS.length rest4 < len
-    then Left $ ctx <> ": not enough bytes for key data"
-    else
-      let keyData = BS.take len rest4
-       in Right (kt, keyData)
+  case compare (BS.length rest4) len of
+    LT -> Left $ ctx <> ": not enough bytes for key data"
+    -- The peer-ids spec requires canonical serialization (Peer IDs are
+    -- derived from these bytes); trailing data would give one key several
+    -- byte representations, so reject it.
+    GT -> Left $ ctx <> ": trailing bytes after key data (non-canonical encoding)"
+    EQ -> Right (kt, rest4)
   where
     takeExpectedByte :: Word8 -> ByteString -> String -> Either String (Word8, ByteString)
     takeExpectedByte expected input msg

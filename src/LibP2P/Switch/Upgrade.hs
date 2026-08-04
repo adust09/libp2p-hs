@@ -158,7 +158,8 @@ performInitiatorHandshake identityKP stream = do
         else pure ()
 
   -- Message 3: → (initiator's identity payload)
-  let identPayload = encodeNoisePayload $ buildHandshakePayload identityKP noiseStaticPub
+  identPayload <- either (fail . ("initiator payload build: " <>)) pure $
+    encodeNoisePayload <$> buildHandshakePayload identityKP noiseStaticPub
   (msg3, hsStateFinal) <- either (fail . ("initiator msg3 write: " <>)) pure $
     writeHandshakeMsg hsState2 identPayload
   writeFramedMessage stream msg3
@@ -177,7 +178,8 @@ performResponderHandshake identityKP stream = do
     readHandshakeMsg hsState0 msg1
 
   -- Message 2: → (responder's identity payload)
-  let identPayload = encodeNoisePayload $ buildHandshakePayload identityKP noiseStaticPub
+  identPayload <- either (fail . ("responder payload build: " <>)) pure $
+    encodeNoisePayload <$> buildHandshakePayload identityKP noiseStaticPub
   (msg2, hsState2) <- either (fail . ("responder msg2 write: " <>)) pure $
     writeHandshakeMsg hsState1 identPayload
   writeFramedMessage stream msg2
@@ -239,28 +241,36 @@ encryptAndWrite sendRef rawIO plaintext =
           writeFramedMessage rawIO ct
 
 -- | Read and decrypt a byte from the Noise channel.
--- If the buffer has bytes, return the first. Otherwise, read a full Noise
--- frame from the raw stream, decrypt it, and buffer the result.
+-- If the buffer has bytes, return the first. Otherwise, read Noise
+-- frames from the raw stream until one decrypts to a non-empty
+-- plaintext, and buffer the result. A transport message with an empty
+-- plaintext (a frame carrying only the AEAD tag) is legal — some
+-- implementations send it as a keepalive — and a zero-length frame
+-- carries no Noise message at all; both yield zero application bytes,
+-- so reading continues at the next frame.
 decryptAndReadByte :: IORef NoiseSession -> IORef ByteString -> StreamIO -> IO Word8
 decryptAndReadByte recvRef bufRef rawIO = do
   buf <- readIORef bufRef
   if BS.null buf
-    then do
-      -- Read a full framed Noise message
+    then fillFromNextFrame
+    else popByte buf
+  where
+    popByte bs = do
+      writeIORef bufRef (BS.tail bs)
+      pure (BS.head bs)
+    fillFromNextFrame = do
       ct <- readFramedMessage rawIO
-      sess <- readIORef recvRef
-      case decryptMessage sess ct of
-        Left err -> fail $ "decryptAndReadByte: " <> err
-        Right (pt, sess') -> do
-          writeIORef recvRef sess'
-          if BS.null pt
-            then fail "decryptAndReadByte: empty plaintext"
-            else do
-              writeIORef bufRef (BS.tail pt)
-              pure (BS.head pt)
-    else do
-      writeIORef bufRef (BS.tail buf)
-      pure (BS.head buf)
+      if BS.null ct
+        then fillFromNextFrame -- zero-length frame: no message to decrypt
+        else do
+          sess <- readIORef recvRef
+          case decryptMessage sess ct of
+            Left err -> fail $ "decryptAndReadByte: " <> err
+            Right (pt, sess') -> do
+              writeIORef recvRef sess'
+              if BS.null pt
+                then fillFromNextFrame -- empty transport message (keepalive)
+                else popByte pt
 
 -- | Bounded window given to the send loop to flush the GoAway frame
 -- before the transport is closed underneath it.

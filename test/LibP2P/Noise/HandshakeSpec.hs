@@ -4,6 +4,7 @@ import qualified Data.ByteString as BS
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
+import LibP2P.Core.Varint (encodeUvarint)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Noise.Framing
 import LibP2P.Noise.Handshake
@@ -150,6 +151,62 @@ spec = do
       let payload = NoisePayload key sig
       decodeNoisePayload (encodeNoisePayload payload) `shouldBe` Right payload
 
+    it "decodes fields in reversed order (identity_sig before identity_key)" $ do
+      -- Protobuf does not constrain field order on the wire: a payload
+      -- serialized with field 2 before field 1 must decode identically.
+      let key = BS.replicate 36 0x11
+          sig = BS.replicate 64 0x22
+          reversed =
+            BS.singleton 0x12 <> encodeUvarint (fromIntegral (BS.length sig)) <> sig
+              <> BS.singleton 0x0a <> encodeUvarint (fromIntegral (BS.length key)) <> key
+      decodeNoisePayload reversed `shouldBe` Right (NoisePayload key sig)
+
+    it "skips an unknown trailing length-delimited field (extensions, field 4)" $ do
+      -- go-libp2p appends a NoiseExtensions message as field 4.
+      let key = BS.replicate 36 0x11
+          sig = BS.replicate 64 0x22
+          ext = BS.pack [0xDE, 0xAD, 0xBE, 0xEF]
+          encoded =
+            encodeNoisePayload (NoisePayload key sig)
+              <> BS.singleton 0x22 <> encodeUvarint (fromIntegral (BS.length ext)) <> ext
+      decodeNoisePayload encoded `shouldBe` Right (NoisePayload key sig)
+
+    it "skips an unknown high-numbered varint field between known fields" $ do
+      -- Field 2047, wire type 0: tag = 2047 << 3 = 16376 (multi-byte tag).
+      let key = BS.replicate 36 0x11
+          sig = BS.replicate 64 0x22
+          field1 = BS.singleton 0x0a <> encodeUvarint (fromIntegral (BS.length key)) <> key
+          field2 = BS.singleton 0x12 <> encodeUvarint (fromIntegral (BS.length sig)) <> sig
+          unknown = encodeUvarint 16376 <> encodeUvarint 300
+      decodeNoisePayload (field1 <> unknown <> field2)
+        `shouldBe` Right (NoisePayload key sig)
+
+    it "skips unknown fixed32 and fixed64 fields" $ do
+      let key = BS.replicate 36 0x11
+          sig = BS.replicate 64 0x22
+          field1 = BS.singleton 0x0a <> encodeUvarint (fromIntegral (BS.length key)) <> key
+          field2 = BS.singleton 0x12 <> encodeUvarint (fromIntegral (BS.length sig)) <> sig
+          -- Field 5, wire type 5 (fixed32): tag = 5 << 3 | 5 = 0x2D.
+          fixed32 = BS.singleton 0x2D <> BS.replicate 4 0xAB
+          -- Field 6, wire type 1 (fixed64): tag = 6 << 3 | 1 = 0x31.
+          fixed64 = BS.singleton 0x31 <> BS.replicate 8 0xCD
+      decodeNoisePayload (fixed32 <> field1 <> fixed64 <> field2)
+        `shouldBe` Right (NoisePayload key sig)
+
+    it "fails when identity_key (field 1) is missing" $ do
+      let sig = BS.replicate 64 0x22
+          onlySig = BS.singleton 0x12 <> encodeUvarint (fromIntegral (BS.length sig)) <> sig
+      decodeNoisePayload onlySig `shouldSatisfy` isLeft
+
+    it "fails when identity_sig (field 2) is missing" $ do
+      let key = BS.replicate 36 0x11
+          onlyKey = BS.singleton 0x0a <> encodeUvarint (fromIntegral (BS.length key)) <> key
+      decodeNoisePayload onlyKey `shouldSatisfy` isLeft
+
+    it "fails on a truncated length-delimited field" $ do
+      let truncated = BS.singleton 0x0a <> encodeUvarint 36 <> BS.replicate 10 0x11
+      decodeNoisePayload truncated `shouldSatisfy` isLeft
+
     it "fails on empty input" $
       decodeNoisePayload BS.empty `shouldSatisfy` isLeft
 
@@ -171,7 +228,8 @@ spec = do
       payload1 `shouldBe` BS.empty
 
       -- Message 2: Bob -> Alice (ephemeral + static key, identity payload)
-      let bobPayload = encodeNoisePayload $ buildHandshakePayload bobIdentity bobNoiseStaticPub
+      bobPayload <- either fail pure $
+        encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub
       (msg2, bobState2) <- either fail pure $ writeHandshakeMsg bobState1 bobPayload
       (payload2, aliceState2) <- either fail pure $ readHandshakeMsg aliceState1 msg2
 
@@ -183,7 +241,8 @@ spec = do
           remotePubKey `shouldSatisfy` isRight
 
       -- Message 3: Alice -> Bob (static key, identity payload)
-      let alicePayload = encodeNoisePayload $ buildHandshakePayload aliceIdentity aliceNoiseStaticPub
+      alicePayload <- either fail pure $
+        encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub
       (msg3, aliceSession) <- either fail pure $ writeHandshakeMsg aliceState2 alicePayload
       (payload3, bobSession) <- either fail pure $ readHandshakeMsg bobState2 msg3
 
@@ -228,7 +287,8 @@ spec = do
       -- Bob's payload signed over a DIFFERENT Noise static key (not the one in this session)
       -- Simulate: Bob pre-signed his identity for a different Noise session
       let bobOtherNoiseKey = BS.replicate 32 0xBB  -- arbitrary, not the actual session key
-      let replayedPayload = encodeNoisePayload $ buildHandshakePayload bobIdentity bobOtherNoiseKey
+      replayedPayload <- either fail pure $
+        encodeNoisePayload <$> buildHandshakePayload bobIdentity bobOtherNoiseKey
 
       -- Message 1 (normal)
       (msg1, aliceState1) <- either fail pure $ writeHandshakeMsg aliceInit BS.empty
@@ -262,7 +322,8 @@ spec = do
       (msg1, aliceState1) <- either fail pure $ writeHandshakeMsg aliceInit BS.empty
       (_payload1, bobState1) <- either fail pure $ readHandshakeMsg bobInit msg1
 
-      let bobPayload = encodeNoisePayload $ buildHandshakePayload bobIdentity bobNoiseStaticPub
+      bobPayload <- either fail pure $
+        encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub
       (msg2, _bobState2) <- either fail pure $ writeHandshakeMsg bobState1 bobPayload
       (payload2, aliceState2) <- either fail pure $ readHandshakeMsg aliceState1 msg2
 
