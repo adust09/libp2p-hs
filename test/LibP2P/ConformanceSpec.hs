@@ -112,9 +112,11 @@ spec = do
       (stream, getWritten) <- mkScriptedStream mssWrongHeader
       result <- negotiateInitiator stream ["/noise"]
       result `shouldBe` NoProtocol
-      -- It must not go on to propose a protocol to an incompatible peer.
+      -- The first proposal is pipelined with the header (spec SHOULD),
+      -- so it is already on the wire when the mismatch is detected; the
+      -- initiator must abort there and propose nothing further.
       written <- getWritten
-      written `shouldBe` mssHeader
+      written `shouldBe` (mssHeader <> mssNoise)
 
     it "responder verifies the initiator's multistream header and stays silent on a mismatch" $ do
       (stream, getWritten) <- mkScriptedStream (mssWrongHeader <> mssNoise)

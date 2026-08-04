@@ -152,26 +152,47 @@ writeMessage :: StreamIO -> Text -> IO ()
 writeMessage stream msg = streamWrite stream (encodeMessage msg)
 
 -- | Negotiate as the Initiator.
--- Sends header, then tries each protocol in order until one is accepted.
+--
+-- Pipelines the multistream header and the first protocol proposal in a
+-- single write before reading anything, as the multistream-select spec
+-- recommends ("the initiator SHOULD pipeline the multistream protocol
+-- id and the desired protocol id in the same packet"): this saves one
+-- round trip per negotiation. It then reads the header echo and the
+-- reply to the optimistic proposal; on @na@ it falls back to proposing
+-- the remaining protocols sequentially.
 negotiateInitiator :: StreamIO -> [ProtocolId] -> IO NegotiationResult
-negotiateInitiator stream protocols = do
+negotiateInitiator stream [] = do
+  -- Nothing to propose: announce the header only (as before pipelining)
+  -- and fail the negotiation after checking the peer's echo.
   writeMessage stream multistreamHeader
   result <- readMessage stream
   case result of
     Left _ -> pure NoProtocol
+    Right _ -> pure NoProtocol
+negotiateInitiator stream (firstProto : rest) = do
+  streamWrite stream (encodeMessage multistreamHeader <> encodeMessage firstProto)
+  headerReply <- readMessage stream
+  case headerReply of
+    Left _ -> pure NoProtocol
     Right header
       | header /= multistreamHeader -> pure NoProtocol
-      | otherwise -> tryProtocols protocols
+      | otherwise -> awaitReply firstProto (tryProtocols rest)
   where
     tryProtocols [] = pure NoProtocol
-    tryProtocols (proto : rest) = do
+    tryProtocols (proto : remaining) = do
       writeMessage stream proto
+      awaitReply proto (tryProtocols remaining)
+
+    -- Read the responder's answer to an already-sent proposal: an echo
+    -- accepts it, @na@ runs the fallback, anything else is a protocol
+    -- violation.
+    awaitReply proto onNa = do
       result <- readMessage stream
       case result of
         Left _ -> pure NoProtocol
         Right response
           | response == proto -> pure (Accepted proto)
-          | response == naMessage -> tryProtocols rest
+          | response == naMessage -> onNa
           | otherwise -> pure NoProtocol
 
 -- | Negotiate as the Responder.

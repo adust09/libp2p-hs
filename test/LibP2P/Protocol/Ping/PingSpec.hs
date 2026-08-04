@@ -438,9 +438,11 @@ spec = do
             wait responder
             readIORef writesRef
       chunks1 <- runRecordedPing
-      -- The initiator writes exactly three chunks: the multistream header,
-      -- the protocol proposal, and the ping payload (most recent first).
-      length chunks1 `shouldBe` 3
+      -- The initiator writes exactly two chunks: the pipelined
+      -- multistream header + protocol proposal (one write, per the
+      -- multistream-select SHOULD), and the ping payload (most recent
+      -- first).
+      length chunks1 `shouldBe` 2
       let payload1 = head chunks1
       -- ping.md: the payload is 32 raw bytes — no varint prefix, no
       -- framing. A length-prefixed write would be 33+ bytes here.
