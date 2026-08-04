@@ -393,6 +393,47 @@ spec = do
         mesh <- readTVarIO (gsMesh router)
         Set.member sender (Map.findWithDefault Set.empty "blocks" mesh) `shouldBe` False
 
+      it "extends the backoff when a peer GRAFTs during the backoff window" $ do
+        -- gossipsub-v1.1.md GRAFT flood protection: re-GRAFTing inside the
+        -- backoff window restarts the full backoff, it does not merely
+        -- keep the old (shorter) expiry (#157).
+        (router, _, _) <- mkTestRouterWithTime localPid fixedTime
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "blocks")
+        -- Backoff about to expire in 10s
+        atomically $ modifyTVar' (gsBackoff router) $
+          Map.insert (sender, "blocks") (addUTCTime 10 fixedTime)
+        handleGraft router sender [Graft "blocks"]
+        backoff <- readTVarIO (gsBackoff router)
+        -- Restarted at the full paramPruneBackoff (60s) from now
+        Map.lookup (sender, "blocks") backoff
+          `shouldBe` Just (addUTCTime 60 fixedTime)
+
+      it "rejects a negative-score peer's GRAFT with a fresh backoff penalty" $ do
+        -- The rejection is not just a PRUNE reply: it starts a backoff so
+        -- the peer cannot immediately re-GRAFT or be re-selected by the
+        -- heartbeat fill (gossipsub-v1.1.md score-gated GRAFT).
+        (router, logRef) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            routerNeg = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const (-1) } }
+        addPeer routerNeg sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsSubscriptions routerNeg) (Set.insert "blocks")
+        handleGraft routerNeg sender [Graft "blocks"]
+        mesh <- readTVarIO (gsMesh routerNeg)
+        Set.member sender (Map.findWithDefault Set.empty "blocks" mesh) `shouldBe` False
+        backoff <- readTVarIO (gsBackoff routerNeg)
+        Map.lookup (sender, "blocks") backoff
+          `shouldBe` Just (addUTCTime 60 fixedTime)
+        -- The PRUNE reply carries no PX: peer exchange is withheld from
+        -- peers below threshold (eclipse-attack hardening, #157/#156)
+        sent <- readIORef logRef
+        case prunesTo sender sent of
+          [p] -> prunePeers p `shouldBe` []
+          _   -> expectationFailure "expected exactly one PRUNE reply"
+
     describe "handlePrune" $ do
       it "removes peer from mesh" $ do
         (router, _) <- mkTestRouter localPid
@@ -774,8 +815,10 @@ spec = do
         handleRPC router sender emptyRPC { rpcPublish = [forged] }
         invalidCount router sender "t" `shouldReturn` 1
 
+    -- gossipsub-v1.1.md "Extended Validators": Accept propagates, Reject
+    -- drops with a P4 penalty, Ignore drops without penalising the source.
     describe "topic validators" $ do
-      it "drops a message the topic validator rejects" $ do
+      it "drops a message the topic validator rejects and charges P4" $ do
         (router, logRef) <- mkTestRouter localPid
         let sender = mkPeerId 1
             meshPeer = mkPeerId 2
@@ -785,12 +828,33 @@ spec = do
         deliveredRef <- newIORef (0 :: Int)
         atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
           modifyIORef' deliveredRef (+ 1)
-        registerValidator router "t" (\_ _ -> pure False)
+        registerValidator router "t" (\_ _ -> pure ValidationReject)
         kp <- newKeyPair
         handleRPC router sender emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [1])] }
         readIORef deliveredRef `shouldReturn` 0
         readIORef logRef `shouldReturn` []
         invalidCount router sender "t" `shouldReturn` 1
+
+      it "neither delivers nor forwards on Ignore, without a P4 penalty" $ do
+        -- The Accept/Reject/Ignore distinction is the point of extended
+        -- validators (gossipsub-v1.1.md): an application that cannot
+        -- validate a message right now must be able to drop it without
+        -- punishing the peer that relayed it.
+        (router, logRef) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            meshPeer = mkPeerId 2
+        addPeer router sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsMesh router) $
+          Map.insert "t" (Set.fromList [sender, meshPeer])
+        deliveredRef <- newIORef (0 :: Int)
+        atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
+          modifyIORef' deliveredRef (+ 1)
+        registerValidator router "t" (\_ _ -> pure ValidationIgnore)
+        kp <- newKeyPair
+        handleRPC router sender emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [1])] }
+        readIORef deliveredRef `shouldReturn` 0
+        readIORef logRef `shouldReturn` []
+        invalidCount router sender "t" `shouldReturn` 0
 
       it "propagates a message the topic validator accepts" $ do
         (router, _) <- mkTestRouter localPid
@@ -799,10 +863,40 @@ spec = do
         deliveredRef <- newIORef (0 :: Int)
         atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
           modifyIORef' deliveredRef (+ 1)
-        registerValidator router "t" (\_ _ -> pure True)
+        registerValidator router "t" (\_ _ -> pure ValidationAccept)
         kp <- newKeyPair
         handleRPC router sender emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [1])] }
         readIORef deliveredRef `shouldReturn` 1
+
+      it "applies validators per topic" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        deliveredRef <- newIORef ([] :: [Topic])
+        atomically $ writeTVar (gsOnMessage router) $ \topic _ ->
+          modifyIORef' deliveredRef (++ [topic])
+        registerValidator router "vetoed" (\_ _ -> pure ValidationReject)
+        -- Distinct keys give distinct message ids (from <> seqno), so the
+        -- second message is not swallowed by dedup
+        kp1 <- newKeyPair
+        kp2 <- newKeyPair
+        handleRPC router sender emptyRPC
+          { rpcPublish = [signedMessage kp1 "vetoed" (BS.pack [1])] }
+        handleRPC router sender emptyRPC
+          { rpcPublish = [signedMessage kp2 "open" (BS.pack [2])] }
+        readIORef deliveredRef `shouldReturn` ["open"]
+
+      it "receives the propagation source and the message" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+        addPeer router sender GossipSubPeer False fixedTime
+        seenRef <- newIORef ([] :: [(PeerId, ByteString)])
+        registerValidator router "t" $ \src msg -> do
+          modifyIORef' seenRef (++ [(src, msgData msg)])
+          pure ValidationAccept
+        kp <- newKeyPair
+        handleRPC router sender emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [7])] }
+        readIORef seenRef `shouldReturn` [(sender, BS.pack [7])]
 
       it "unregisterValidator restores unvalidated propagation" $ do
         (router, _) <- mkTestRouter localPid
@@ -811,7 +905,7 @@ spec = do
         deliveredRef <- newIORef (0 :: Int)
         atomically $ writeTVar (gsOnMessage router) $ \_ _ ->
           modifyIORef' deliveredRef (+ 1)
-        registerValidator router "t" (\_ _ -> pure False)
+        registerValidator router "t" (\_ _ -> pure ValidationReject)
         unregisterValidator router "t"
         kp <- newKeyPair
         handleRPC router sender emptyRPC { rpcPublish = [signedMessage kp "t" (BS.pack [1])] }
@@ -983,6 +1077,32 @@ spec = do
         case Map.lookup sender peers of
           Just ps -> psTopics ps `shouldBe` Set.empty
           Nothing -> expectationFailure "peer not found"
+
+      it "ignores a graylisted peer's GRAFT and publishes entirely" $ do
+        -- gossipsub-v1.1.md graylist: below stGraylistThreshold the whole
+        -- RPC is ignored — control messages included, with no PRUNE reply
+        -- and no message processing.
+        (router, logRef) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            routerGl = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const (-20000) } }
+        addPeer routerGl sender GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsSubscriptions routerGl) (Set.insert "blocks")
+        deliveredRef <- newIORef (0 :: Int)
+        atomically $ writeTVar (gsOnMessage routerGl) $ \_ _ ->
+          modifyIORef' deliveredRef (+ 1)
+        kp <- newKeyPair
+        handleRPC routerGl sender emptyRPC
+          { rpcPublish = [signedMessage kp "blocks" (BS.pack [1])]
+          , rpcControl = Just emptyControlMessage { ctrlGraft = [Graft "blocks"] }
+          }
+        mesh <- readTVarIO (gsMesh routerGl)
+        Map.findWithDefault Set.empty "blocks" mesh `shouldBe` Set.empty
+        readIORef deliveredRef `shouldReturn` 0
+        readIORef logRef `shouldReturn` []
+        seen <- readTVarIO (gsSeen routerGl)
+        Map.size seen `shouldBe` 0
 
       it "flood publish skips peers below the publish threshold" $ do
         (router, logRef) <- mkTestRouter localPid
@@ -1224,6 +1344,26 @@ spec = do
         sent <- readIORef logRef
         let served = concat [ rpcPublish rpc | (pid, rpc) <- sent, pid == sender ]
         length served `shouldBe` 2
+
+      it "a hostile peer exhausting its IHAVE budget does not starve other peers" $ do
+        -- The flood-protection budgets are per peer: an attacker spamming
+        -- IHAVE batches must not consume the honest peers' allowance.
+        (router, logRef) <- mkTestRouterWithParams
+          defaultGossipSubParams { paramMaxIHaveMessages = 2 } localPid
+        let hostile = mkPeerId 1
+            honest  = mkPeerId 2
+        addPeer router hostile GossipSubPeer False fixedTime
+        addPeer router honest GossipSubPeer False fixedTime
+        -- Hostile volume: 20 batches, 18 over budget
+        mapM_ (\n -> handleIHave router hostile [IHave "t" [BS.pack [n]]]) [1..20]
+        sent0 <- readIORef logRef
+        length (iwantsSent sent0) `shouldBe` 2
+        writeIORef logRef []
+        -- The honest peer's advertisement is still answered
+        handleIHave router honest [IHave "t" [BS.pack [99]]]
+        sent1 <- readIORef logRef
+        map fst sent1 `shouldBe` [honest]
+        iwantsSent sent1 `shouldBe` [[BS.pack [99]]]
 
     -- Issue #157 remainder: direct (explicit) peering agreements,
     -- gossipsub-v1.1.md: direct peers always exchange messages and are
