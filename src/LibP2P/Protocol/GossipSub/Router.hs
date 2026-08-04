@@ -10,6 +10,7 @@ module LibP2P.Protocol.GossipSub.Router
   , addPeer
   , removePeer
   , setPeerIP
+  , setSignedPeerRecord
     -- * Topic subscription
   , join
   , leave
@@ -48,6 +49,7 @@ import Data.Word (Word64)
 import Crypto.Random (getRandomBytes)
 import List.Shuffle (sampleIO)
 import LibP2P.Crypto.PeerId (PeerId, peerIdBytes)
+import LibP2P.Crypto.PeerRecord (PeerRecord (..), openPeerRecordEnvelope)
 import LibP2P.Crypto.Key (KeyPair (..), sign)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Protocol.GossipSub.Types
@@ -88,6 +90,7 @@ newRouter params localPid sendRPC getTime = do
   iaskedCounts <- newTVarIO Map.empty
   iwantServed <- newTVarIO Map.empty
   onPX     <- newTVarIO (\_ _ -> pure ())
+  signedRecords <- newTVarIO Map.empty
   pure GossipSubRouter
     { gsParams         = params
     , gsLocalPeerId    = localPid
@@ -112,6 +115,7 @@ newRouter params localPid sendRPC getTime = do
     , gsOnMessage      = onMsg
     , gsValidators     = validators
     , gsOnPeerExchange = onPX
+    , gsSignedPeerRecords = signedRecords
     }
 
 -- Topic validation
@@ -159,6 +163,7 @@ removePeer router pid = atomically $ do
     Nothing -> pure ()
   modifyTVar' (gsPeers router) (Map.delete pid)
   modifyTVar' (gsMesh router) (Map.map (Set.delete pid))
+  modifyTVar' (gsSignedPeerRecords router) (Map.delete pid)
   modifyTVar' (gsFanout router) (Map.map (Set.delete pid))
   modifyTVar' (gsIWantPromises router) $
     Map.filterWithKey (\(p, _) _ -> p /= pid)
@@ -684,11 +689,27 @@ handleOnePrune router sender now prune = do
   -- Honour peer exchange, but only from peers whose score clears the
   -- PX acceptance threshold (gossipsub-v1.1.md: PX from low-scoring
   -- peers is an eclipse-attack vector)
+  -- Any attached signed peer record must verify (RFC 0003 envelope
+  -- opens and names the advertised peer) — a record that fails drops
+  -- its whole PX entry, matching go-libp2p's pxConnect. Entries without
+  -- a record are passed through unchanged.
   unless (null (prunePeers prune)) $ do
     score <- peerScore router sender
     when (score >= stAcceptPXThreshold (gsThresholds router)) $ do
-      onPX <- readTVarIO (gsOnPeerExchange router)
-      onPX topic (prunePeers prune)
+      let verified = filter validPXRecord (prunePeers prune)
+      unless (null verified) $ do
+        onPX <- readTVarIO (gsOnPeerExchange router)
+        onPX topic verified
+
+-- | A PX entry is acceptable if it carries no signed record, or a
+-- record whose envelope verifies and whose subject is the advertised
+-- peer id.
+validPXRecord :: PeerExchangeInfo -> Bool
+validPXRecord pxi = case pxSignedPeerRecord pxi of
+  Nothing -> True
+  Just envBytes -> case openPeerRecordEnvelope envBytes of
+    Right (_, record) -> prPeerId record == pxPeerId pxi
+    Left _ -> False
 
 -- | Handle IHAVE: request unseen messages via IWANT.
 --
@@ -808,14 +829,24 @@ peerScore router pid = do
 
 -- Peer exchange
 
+-- | Store the encoded signed peer record (RFC 0003 envelope bytes) for
+-- a peer, typically obtained via identify. It is attached to PX entries
+-- advertising that peer in outgoing PRUNEs (gossipsub-v1.1.md). Cleared
+-- by 'removePeer'.
+setSignedPeerRecord :: GossipSubRouter -> PeerId -> ByteString -> IO ()
+setSignedPeerRecord router pid recBytes = atomically $
+  modifyTVar' (gsSignedPeerRecords router) (Map.insert pid recBytes)
+
 -- | Select peer-exchange records for a PRUNE: up to 'paramPrunePeers'
 -- random peers subscribed to the topic with non-negative score,
 -- excluding the pruned peer itself (gossipsub-v1.1.md peer exchange).
+-- Peers whose signed peer record we hold get it attached.
 selectPXPeers :: GossipSubRouter -> Topic -> PeerId -> IO [PeerExchangeInfo]
 selectPXPeers router topic excluded = do
   now <- gsGetTime router
   peers <- readTVarIO (gsPeers router)
   ipMap <- readTVarIO (gsIPPeerCount router)
+  signedRecords <- readTVarIO (gsSignedPeerRecords router)
   let candidates =
         [ pid | (pid, ps) <- Map.toList peers
               , pid /= excluded
@@ -824,7 +855,8 @@ selectPXPeers router topic excluded = do
               , computeScore (gsScoreParams router) pid ps ipMap now >= 0 ]
   chosen <- sampleIO
     (min (paramPrunePeers (gsParams router)) (length candidates)) candidates
-  pure [ PeerExchangeInfo (peerIdBytes pid) Nothing | pid <- chosen ]
+  pure [ PeerExchangeInfo (peerIdBytes pid) (Map.lookup pid signedRecords)
+       | pid <- chosen ]
 
 -- Helper: construct a GRAFT RPC
 graftRPC :: Topic -> RPC

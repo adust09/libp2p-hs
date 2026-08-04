@@ -18,7 +18,9 @@ import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair (..), publicKey, sign)
-import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey)
+import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey, peerIdBytes)
+import LibP2P.Crypto.PeerRecord (PeerRecord (..), sealPeerRecord)
+import LibP2P.Crypto.SignedEnvelope (encodeSignedEnvelope)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
@@ -44,6 +46,7 @@ import LibP2P.Protocol.GossipSub.Message
   ( readRPCMessage
   , writeRPCMessage
   )
+import LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
 import LibP2P.Protocol.GossipSub.Router (addPeer)
 import LibP2P.Protocol.GossipSub.Validation (signingBytes)
 import LibP2P.Protocol.GossipSub.Types
@@ -148,6 +151,33 @@ spec = do
       -- Verify peer is registered in router
       peers <- atomically $ readTVar (gsPeers (gsnRouter node))
       Map.member remotePid peers `shouldBe` True
+
+    it "feeds the peer's identify signed peer record into the router (#230)" $ do
+      (sw, _localPid) <- mkTestSwitch
+      node <- newGossipSubNode sw testParams
+      (remotePid, remoteKp) <- mkTestIdentity
+      -- Identify already stored a signed peer record for this peer
+      Right env <- pure (sealPeerRecord remoteKp
+        (PeerRecord (peerIdBytes remotePid) 1 []))
+      let envBytes = encodeSignedEnvelope env
+          storedInfo = IdentifyInfo
+            { idProtocolVersion  = Nothing
+            , idAgentVersion     = Nothing
+            , idPublicKey        = Nothing
+            , idListenAddrs      = []
+            , idObservedAddr     = Nothing
+            , idProtocols        = []
+            , idSignedPeerRecord = Just envBytes
+            }
+      atomically $ do
+        store <- readTVar (swPeerStore sw)
+        writeTVar (swPeerStore sw) (Map.insert remotePid storedInfo store)
+      (remoteStream, handlerStream) <- mkMemoryStreamPair
+      _ <- async $ handleGossipSubStream node handlerStream remotePid GossipSubPeer Nothing
+      writeRPCMessage remoteStream (subscribeRPC "test-topic")
+      threadDelay 200000
+      recs <- atomically $ readTVar (gsSignedPeerRecords (gsnRouter node))
+      Map.lookup remotePid recs `shouldBe` Just envBytes
 
     it "processes publish RPCs and delivers to onMessage callback" $ do
       (sw, _localPid) <- mkTestSwitch

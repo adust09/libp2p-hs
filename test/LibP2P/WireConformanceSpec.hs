@@ -169,6 +169,7 @@ spec = do
                 Just (BS.pack [0x04, 0x7f, 0x00, 0x00, 0x01, 0x06, 0x30, 0x39])
                 -- /ip4/127.0.0.1/tcp/12345
             , idProtocols       = ["/ipfs/id/1.0.0", "/ipfs/ping/1.0.0"]
+            , idSignedPeerRecord = Nothing
             }
           expected = BS.concat
             [ BS.singleton 0x57  -- varint frame length: 87-byte protobuf

@@ -13,7 +13,9 @@ import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Control.Exception (try)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair (..), sign)
-import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey)
+import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey, peerIdBytes)
+import LibP2P.Crypto.PeerRecord (PeerRecord (..), sealPeerRecord)
+import LibP2P.Crypto.SignedEnvelope (encodeSignedEnvelope)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Protocol.GossipSub.Types
 import LibP2P.Protocol.GossipSub.Router
@@ -1568,3 +1570,84 @@ spec = do
         handleIHave router fsPeer [IHave "t" [BS.pack [1]]]
         sent <- readIORef logRef
         iwantsSent sent `shouldBe` []
+
+    describe "PX signed peer records (#230)" $ do
+      it "selectPXPeers attaches the stored signed peer record" $ do
+        (router, _) <- mkTestRouter localPid
+        kp <- newKeyPair
+        let pxPeer = fromPublicKey (kpPublic kp)
+        addSubscribedPeer router pxPeer "blocks"
+        Right env <- pure (sealPeerRecord kp
+          (PeerRecord (peerIdBytes pxPeer) 1
+            [BS.pack [0x04, 0x7f, 0x00, 0x00, 0x01, 0x06, 0x0f, 0xa1]]))
+        let envBytes = encodeSignedEnvelope env
+        setSignedPeerRecord router pxPeer envBytes
+        px <- selectPXPeers router "blocks" (mkPeerId 9)
+        map pxPeerId px `shouldBe` [peerIdBytes pxPeer]
+        map pxSignedPeerRecord px `shouldBe` [Just envBytes]
+
+      it "selectPXPeers omits the record for peers without a stored one" $ do
+        (router, _) <- mkTestRouter localPid
+        let pxPeer = mkPeerId 1
+        addSubscribedPeer router pxPeer "blocks"
+        px <- selectPXPeers router "blocks" (mkPeerId 9)
+        map pxSignedPeerRecord px `shouldBe` [Nothing]
+
+      it "removePeer forgets the stored signed peer record" $ do
+        (router, _) <- mkTestRouter localPid
+        let pxPeer = mkPeerId 1
+        addSubscribedPeer router pxPeer "blocks"
+        setSignedPeerRecord router pxPeer (BS.pack [1, 2, 3])
+        removePeer router pxPeer
+        recs <- readTVarIO (gsSignedPeerRecords router)
+        Map.member pxPeer recs `shouldBe` False
+
+      it "handlePrune drops PX entries whose signed record fails verification" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            routerPx = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const 200 }  -- >= stAcceptPXThreshold (100)
+              }
+        addPeer routerPx sender GossipSubPeer False fixedTime
+        receivedRef <- newIORef ([] :: [(Topic, [PeerExchangeInfo])])
+        atomically $ writeTVar (gsOnPeerExchange routerPx) $ \t px ->
+          modifyIORef' receivedRef (++ [(t, px)])
+        kpGood <- newKeyPair
+        kpEvil <- newKeyPair
+        let goodPid = fromPublicKey (kpPublic kpGood)
+            evilPid = fromPublicKey (kpPublic kpEvil)
+        Right goodEnv <- pure (sealPeerRecord kpGood
+          (PeerRecord (peerIdBytes goodPid) 1 []))
+        -- Forged: signed by kpEvil over a record claiming goodPid's identity
+        Right forgedEnv <- pure (sealPeerRecord kpEvil
+          (PeerRecord (peerIdBytes goodPid) 1 []))
+        let validEntry    = PeerExchangeInfo (peerIdBytes goodPid)
+                              (Just (encodeSignedEnvelope goodEnv))
+            forgedEntry   = PeerExchangeInfo (peerIdBytes evilPid)
+                              (Just (encodeSignedEnvelope forgedEnv))
+            -- Valid envelope attached to an entry claiming a different peer
+            mismatchEntry = PeerExchangeInfo (BS.pack [9])
+                              (Just (encodeSignedEnvelope goodEnv))
+            garbageEntry  = PeerExchangeInfo (BS.pack [8])
+                              (Just (BS.pack [0x01, 0x02, 0x03]))
+            unsignedEntry = PeerExchangeInfo (BS.pack [7]) Nothing
+        handlePrune routerPx sender
+          [Prune "t" [validEntry, forgedEntry, mismatchEntry, garbageEntry, unsignedEntry]
+                 (Just 60)]
+        readIORef receivedRef `shouldReturn` [("t", [validEntry, unsignedEntry])]
+
+      it "handlePrune passes nothing to the PX callback when every record is forged" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            routerPx = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const 200 }
+              }
+        addPeer routerPx sender GossipSubPeer False fixedTime
+        receivedRef <- newIORef ([] :: [(Topic, [PeerExchangeInfo])])
+        atomically $ writeTVar (gsOnPeerExchange routerPx) $ \t px ->
+          modifyIORef' receivedRef (++ [(t, px)])
+        handlePrune routerPx sender
+          [Prune "t" [PeerExchangeInfo (BS.pack [9]) (Just (BS.pack [0xFF]))] (Just 60)]
+        readIORef receivedRef `shouldReturn` []

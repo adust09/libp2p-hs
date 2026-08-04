@@ -36,9 +36,16 @@ import Control.Exception (SomeException, catch)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
-import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
+import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes)
+import LibP2P.Crypto.PeerRecord
+  ( PeerRecord (..)
+  , openPeerRecordEnvelope
+  , sealPeerRecord
+  , timestampSeq
+  )
 import LibP2P.Crypto.Protobuf (decodePublicKey, encodePublicKey)
 import LibP2P.Crypto.Key (kpPublic)
+import LibP2P.Crypto.SignedEnvelope (SignedEnvelope (..), encodeSignedEnvelope)
 import LibP2P.Multiaddr.Codec (encodeProtocols)
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.MultistreamSelect.Negotiation
@@ -93,7 +100,7 @@ requestIdentify conn = do
   result <- negotiateInitiator stream [identifyProtocolId]
   case result of
     Accepted _ ->
-      fmap (validatePublicKey (connPeerId conn))
+      fmap (validateIdentify (connPeerId conn))
         <$> readFramedIdentify stream maxIdentifySize
     NoProtocol -> pure (Left "remote does not support identify")
 
@@ -112,12 +119,18 @@ handleIdentifyPush sw conn stream = do
   case infoOrErr of
     Left _ -> pure ()
     Right rawInfo -> do
-      let info = validatePublicKey (connPeerId conn) rawInfo
+      let info = validateIdentify (connPeerId conn) rawInfo
       atomically $ do
         store <- readTVar (swPeerStore sw)
         let merged = maybe info (`mergeIdentify` info)
                        (Map.lookup (connPeerId conn) store)
         writeTVar (swPeerStore sw) (Map.insert (connPeerId conn) merged store)
+
+-- | Validate the identity-bound fields of a received Identify message
+-- against the peer id authenticated by the security handshake.
+validateIdentify :: PeerId -> IdentifyInfo -> IdentifyInfo
+validateIdentify remotePeer =
+  validateSignedPeerRecord remotePeer . validatePublicKey remotePeer
 
 -- | Enforce the identify spec's key/peer-id binding: the publicKey
 -- field must derive the sender's peer id, which the security handshake
@@ -136,6 +149,25 @@ validatePublicKey remotePeer info = case idPublicKey info of
     Right pk | fromPublicKey pk == remotePeer -> info
     _ -> info { idPublicKey = Nothing }
 
+-- | Verify a received signedPeerRecord (RFC 0003) against the
+-- authenticated peer id: the envelope must open (valid signature,
+-- payload type, key/record binding) and its signing key must derive
+-- the peer id the security handshake authenticated.
+--
+-- A verified record's addresses are authoritative and replace the
+-- unsigned listenAddrs (go-libp2p's certified addr book takes signed
+-- addresses over unsigned ones). A record that fails verification is
+-- dropped, keeping the unsigned listenAddrs as the fallback for peers
+-- whose record we cannot trust.
+validateSignedPeerRecord :: PeerId -> IdentifyInfo -> IdentifyInfo
+validateSignedPeerRecord remotePeer info = case idSignedPeerRecord info of
+  Nothing -> info
+  Just envBytes -> case openPeerRecordEnvelope envBytes of
+    Right (env, record)
+      | fromPublicKey (sePublicKey env) == remotePeer ->
+          info { idListenAddrs = prAddresses record }
+    _ -> info { idSignedPeerRecord = Nothing }
+
 -- | Merge a received (possibly partial) Identify update into the
 -- previously known info for a peer.
 --
@@ -153,6 +185,7 @@ mergeIdentify known update = IdentifyInfo
   , idListenAddrs     = replaceUnlessEmpty (idListenAddrs known) (idListenAddrs update)
   , idObservedAddr    = idObservedAddr update <|> idObservedAddr known
   , idProtocols       = replaceUnlessEmpty (idProtocols known) (idProtocols update)
+  , idSignedPeerRecord = idSignedPeerRecord update <|> idSignedPeerRecord known
   }
   where
     replaceUnlessEmpty old [] = old
@@ -181,20 +214,34 @@ pushIdentify sw = do
           streamClose stream
         NoProtocol -> streamClose stream
 
--- | Build our local IdentifyInfo from Switch state.
+-- | Build our local IdentifyInfo from Switch state, including a signed
+-- peer record (RFC 0003) over our listen addresses, sealed with the
+-- identity key.
 buildLocalIdentify :: Switch -> Maybe Connection -> IO IdentifyInfo
 buildLocalIdentify sw mConn = do
   (protocols, listenAddrs) <- atomically $ do
     protos <- Map.keys <$> readTVar (swProtocols sw)
     listeners <- readTVar (swListeners sw)
     pure (protos, map alAddress listeners)
+  seqNo <- timestampSeq
+  let addrBytes = map (\(Multiaddr ps) -> encodeProtocols ps) listenAddrs
+      record = PeerRecord
+        { prPeerId    = peerIdBytes (swLocalPeerId sw)
+        , prSeq       = seqNo
+        , prAddresses = addrBytes
+        }
+      -- Sealing our own record with our own identity key cannot fail;
+      -- if it somehow does, the optional field is omitted.
+      signedRecord = either (const Nothing) (Just . encodeSignedEnvelope)
+                       (sealPeerRecord (swIdentityKey sw) record)
   pure IdentifyInfo
     { idProtocolVersion = Just "ipfs/0.1.0"
     , idAgentVersion    = Just "libp2p-hs/0.1.0"
     , idPublicKey       = Just (encodePublicKey (kpPublic (swIdentityKey sw)))
-    , idListenAddrs     = map (\(Multiaddr ps) -> encodeProtocols ps) listenAddrs
+    , idListenAddrs     = addrBytes
     , idObservedAddr    = (\(Multiaddr ps) -> encodeProtocols ps) . connRemoteAddr <$> mConn
     , idProtocols       = protocols
+    , idSignedPeerRecord = signedRecord
     }
 
 -- | Register Identify protocol handlers on the Switch.

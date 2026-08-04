@@ -14,6 +14,7 @@ fullInfo = IdentifyInfo
                           BS.pack [4, 10, 0, 0, 1, 6, 0x0F, 0xA1]]
   , idObservedAddr    = Just (BS.pack [4, 192, 168, 1, 1, 6, 0x1F, 0x90])
   , idProtocols       = ["/ipfs/id/1.0.0", "/ipfs/ping/1.0.0", "/noise"]
+  , idSignedPeerRecord = Just (BS.pack [0x0A, 0x02, 0x08, 0x01])
   }
 
 spec :: Spec
@@ -37,12 +38,13 @@ spec = do
         , idListenAddrs     = []
         , idObservedAddr    = Nothing
         , idProtocols       = []
+        , idSignedPeerRecord = Nothing
         }
 
     it "decode handles repeated listenAddrs correctly" $ do
       let info = IdentifyInfo Nothing Nothing Nothing
                    [BS.pack [1, 2], BS.pack [3, 4], BS.pack [5, 6]]
-                   Nothing []
+                   Nothing [] Nothing
           encoded = encodeIdentify info
           decoded = decodeIdentify encoded
       case decoded of
@@ -51,7 +53,7 @@ spec = do
 
     it "decode handles repeated protocols correctly" $ do
       let info = IdentifyInfo Nothing Nothing Nothing [] Nothing
-                   ["/noise", "/yamux/1.0.0", "/ipfs/id/1.0.0"]
+                   ["/noise", "/yamux/1.0.0", "/ipfs/id/1.0.0"] Nothing
           encoded = encodeIdentify info
           decoded = decodeIdentify encoded
       case decoded of
@@ -63,7 +65,7 @@ spec = do
       -- protocols = 3, observedAddr = 4, protocolVersion = 5,
       -- agentVersion = 6 — all length-delimited (wire type 2), so the
       -- first tag byte of a single-field message is (field << 3) | 2.
-      let empty = IdentifyInfo Nothing Nothing Nothing [] Nothing []
+      let empty = IdentifyInfo Nothing Nothing Nothing [] Nothing [] Nothing
           firstByte info = BS.head (encodeIdentify info)
       firstByte empty { idPublicKey = Just (BS.pack [1]) }   `shouldBe` 0x0a
       firstByte empty { idListenAddrs = [BS.pack [1]] }      `shouldBe` 0x12
@@ -71,6 +73,8 @@ spec = do
       firstByte empty { idObservedAddr = Just (BS.pack [1]) } `shouldBe` 0x22
       firstByte empty { idProtocolVersion = Just "v" }       `shouldBe` 0x2a
       firstByte empty { idAgentVersion = Just "v" }          `shouldBe` 0x32
+      -- signedPeerRecord = 8 (identify.proto, go-libp2p): tag (8 << 3) | 2
+      firstByte empty { idSignedPeerRecord = Just (BS.pack [1]) } `shouldBe` 0x42
 
     it "decodes a go-libp2p-shaped message (hand-written golden vector)" $ do
       -- Hand-constructed per the spec protobuf, deliberately NOT produced
@@ -99,7 +103,7 @@ spec = do
 
     it "decode skips unknown fields" $ do
       -- Encode known fields, then append unknown field bytes
-      let info = IdentifyInfo (Just "ipfs/0.1.0") Nothing Nothing [] Nothing []
+      let info = IdentifyInfo (Just "ipfs/0.1.0") Nothing Nothing [] Nothing [] Nothing
           encoded = encodeIdentify info
           -- Append unknown field 99 (wire type 0 = varint, tag = 99<<3|0 = 0x318)
           -- This is a varint-encoded tag + value: field 99, varint 42
@@ -110,7 +114,24 @@ spec = do
         Left err -> expectationFailure $ "Decode failed with unknown field: " ++ show err
 
     it "encode omits Nothing fields" $ do
-      let info = IdentifyInfo Nothing Nothing Nothing [] Nothing []
+      let info = IdentifyInfo Nothing Nothing Nothing [] Nothing [] Nothing
           encoded = encodeIdentify info
       -- Empty message should encode to empty bytes (no fields set)
       encoded `shouldBe` BS.empty
+
+    it "round-trips signedPeerRecord at the byte level (field 8)" $ do
+      -- Single-field message: tag 0x42 = (8 << 3) | 2, then length, then bytes
+      let recBytes = BS.pack [0xDE, 0xAD, 0xBE, 0xEF]
+          info = IdentifyInfo Nothing Nothing Nothing [] Nothing [] (Just recBytes)
+          encoded = encodeIdentify info
+      encoded `shouldBe` BS.pack [0x42, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]
+      case decodeIdentify encoded of
+        Right result -> idSignedPeerRecord result `shouldBe` Just recBytes
+        Left err -> expectationFailure $ "Decode failed: " ++ show err
+
+    it "decodes a message without signedPeerRecord to Nothing" $ do
+      let info = IdentifyInfo Nothing Nothing Nothing [addr] Nothing [] Nothing
+          addr = BS.pack [1, 2]
+      case decodeIdentify (encodeIdentify info) of
+        Right result -> idSignedPeerRecord result `shouldBe` Nothing
+        Left err -> expectationFailure $ "Decode failed: " ++ show err
