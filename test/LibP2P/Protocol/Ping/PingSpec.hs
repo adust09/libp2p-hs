@@ -1,6 +1,6 @@
 module LibP2P.Protocol.Ping.PingSpec (spec) where
 
-import Control.Concurrent.Async (async, cancel, wait)
+import Control.Concurrent.Async (async, cancel, forConcurrently, wait)
 import Control.Concurrent.STM
   ( TMVar
   , TQueue
@@ -253,6 +253,34 @@ spec = do
       opens `shouldBe` 1
       closed <- readIORef closedRef
       closed `shouldBe` True
+      done <- timeout 1000000 (wait responder)
+      done `shouldBe` Just ()
+
+    it "10 concurrent pings on one session serialize onto the single stream and all succeed" $ do
+      -- ping.md: the dialing peer MUST NOT keep more than one outbound
+      -- ping stream per peer. Concurrent callers must queue on the
+      -- session's one stream, one exchange at a time — without
+      -- serialization their 32-byte payloads interleave on the wire and
+      -- the echoes no longer match.
+      (streamA, _closeA, streamB) <- mkClosableStreamPair
+      opensRef <- newIORef (0 :: Int)
+      sw <- mkTestSwitch
+      conn <- mkPingConnection (countingOpen opensRef streamA)
+      responder <- async $ pingResponder streamB
+      result <- withPingSession sw conn $ \sess ->
+        forConcurrently [1 .. 10 :: Int] $ \_ -> ping sess
+      case result of
+        Left err -> expectationFailure $ "ping session failed to open: " ++ show err
+        Right results -> do
+          length results `shouldBe` 10
+          mapM_
+            (\r -> case r of
+               Right (PingResult rtt) -> rtt `shouldSatisfy` (>= 0)
+               Left err -> expectationFailure $ "concurrent ping failed: " ++ show err)
+            results
+      opens <- readIORef opensRef
+      opens `shouldBe` 1
+      -- withPingSession closed the stream, so the responder exits on EOF.
       done <- timeout 1000000 (wait responder)
       done `shouldBe` Just ()
 
