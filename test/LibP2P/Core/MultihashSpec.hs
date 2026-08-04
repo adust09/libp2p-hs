@@ -3,6 +3,7 @@ module LibP2P.Core.MultihashSpec (spec) where
 import qualified Data.ByteString as BS
 import Data.Word (Word8)
 import LibP2P.Core.Multihash
+import LibP2P.Core.Varint (encodeUvarint)
 import Test.Hspec
 import Test.QuickCheck
 
@@ -29,10 +30,20 @@ spec = do
       -- 0x00 + 0x03 + original data
       result `shouldBe` BS.pack [0x00, 0x03, 0x01, 0x02, 0x03]
 
-    it "SHA-256 of empty input produces valid multihash" $ do
-      let result = encodeMultihash SHA256 BS.empty
-      BS.take 2 result `shouldBe` BS.pack [0x12, 0x20]
-      BS.length result `shouldBe` 34
+    it "encodes SHA-256 of empty input to the known vector" $ do
+      -- SHA-256("") = e3b0c442 98fc1c14 9afbf4c8 996fb924 27ae41e4 649b934c a495991b 7852b855
+      let expectedDigest = BS.pack
+            [ 0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14
+            , 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24
+            , 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c
+            , 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55
+            ]
+      encodeMultihash SHA256 BS.empty `shouldBe` BS.pack [0x12, 0x20] <> expectedDigest
+
+    it "encodes a 200-byte identity digest with a 2-byte length varint" $ do
+      let input = BS.replicate 200 0x42
+      -- varint(200) = 0xc8 0x01
+      encodeMultihash Identity input `shouldBe` BS.pack [0x00, 0xc8, 0x01] <> input
 
   describe "decodeMultihash" $ do
     it "decodes identity multihash" $ do
@@ -55,6 +66,22 @@ spec = do
       -- Claims 5 bytes but only 2 available
       let encoded = BS.pack [0x00, 0x05, 0xAA, 0xBB]
       decodeMultihash encoded `shouldSatisfy` isLeft
+
+    it "rejects a multihash claiming a digest length larger than the input" $ do
+      -- Declared length 2^63-1 with zero digest bytes: must not decode
+      -- as an empty digest via Int truncation.
+      let encoded = BS.pack [0x00] <> encodeUvarint (2 ^ (63 :: Int) - 1)
+      decodeMultihash encoded `shouldSatisfy` isLeft
+      validateMultihash encoded `shouldSatisfy` isLeft
+
+    it "never succeeds when the declared length exceeds the available bytes" $
+      property $
+        forAll (chooseInt (0, 200)) $ \avail ->
+          forAll (chooseInt (avail + 1, avail + 300)) $ \declared ->
+            let mh = BS.pack [0x00]
+                    <> encodeUvarint (fromIntegral declared)
+                    <> BS.replicate avail 0xAA
+             in isLeft (decodeMultihash mh) && isLeft (validateMultihash mh)
 
   describe "round-trip property" $ do
     it "decode(encode(Identity, data)) == (Identity, data)" $
@@ -89,6 +116,11 @@ spec = do
     it "rejects Identity multihash with digest > 42 bytes" $ do
       let mh = BS.pack [0x00, 0x2B] <> BS.replicate 43 0x42  -- 43 bytes
       validateMultihash mh `shouldSatisfy` isLeft
+
+    it "accepts Identity multihash with digest of exactly 42 bytes" $ do
+      let digest = BS.replicate 42 0x42
+      let mh = BS.pack [0x00, 0x2A] <> digest
+      validateMultihash mh `shouldBe` Right (Identity, digest)
 
     it "rejects multihash with trailing bytes" $ do
       -- Valid SHA-256 multihash + extra byte

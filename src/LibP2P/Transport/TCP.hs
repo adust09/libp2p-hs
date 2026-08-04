@@ -27,37 +27,49 @@ newTCPTransport = pure $ Transport
   , transportCanDial = canDialTCP
   }
 
--- | Check if a multiaddr is a TCP address (/ip4/.../tcp/... or /ip6/.../tcp/...).
+-- | Drop a trailing /p2p/<peer-id> component if present. Identify- and
+-- DHT-learned addresses carry the peer ID suffix; the TCP transport
+-- connects to the transport portion only.
+stripP2P :: Multiaddr -> Multiaddr
+stripP2P (Multiaddr ps) = case reverse ps of
+  (P2P _ : rest) -> Multiaddr (reverse rest)
+  _ -> Multiaddr ps
+
+-- | Check if a multiaddr is a TCP address (/ip4/.../tcp/... or
+-- /ip6/.../tcp/...), optionally with a trailing /p2p/<peer-id> component.
 canDialTCP :: Multiaddr -> Bool
-canDialTCP (Multiaddr [IP4 _, TCP _]) = True
-canDialTCP (Multiaddr [IP6 _, TCP _]) = True
-canDialTCP _ = False
+canDialTCP addr = case stripP2P addr of
+  Multiaddr [IP4 _, TCP _] -> True
+  Multiaddr [IP6 _, TCP _] -> True
+  _ -> False
 
 -- | Extract (HostName, ServiceName) from a TCP multiaddr.
+-- A trailing /p2p/<peer-id> component is ignored.
 multiaddrToHostPort :: Multiaddr -> Either String (String, String)
-multiaddrToHostPort (Multiaddr [IP4 w, TCP port]) =
-  Right (renderIPv4 w, show port)
-multiaddrToHostPort (Multiaddr [IP6 bs, TCP port]) =
-  Right (renderIPv6 bs, show port)
-multiaddrToHostPort _ =
-  Left "multiaddrToHostPort: expected /ip4/.../tcp/... or /ip6/.../tcp/..."
+multiaddrToHostPort addr = case stripP2P addr of
+  Multiaddr [IP4 w, TCP port] -> Right (renderIPv4 w, show port)
+  Multiaddr [IP6 bs, TCP port] -> Right (renderIPv6 bs, show port)
+  _ -> Left "multiaddrToHostPort: expected /ip4/.../tcp/... or /ip6/.../tcp/..."
 
 -- | Dial a TCP address by directly constructing a SockAddr from the Multiaddr.
+-- A trailing /p2p/<peer-id> component is stripped before connecting; the
+-- original (unstripped) multiaddr is kept as the connection's remote address.
 tcpDial :: Multiaddr -> IO RawConnection
-tcpDial addr@(Multiaddr [IP4 w, TCP port]) = do
-  let hostAddr = NS.tupleToHostAddress (octet 3 w, octet 2 w, octet 1 w, octet 0 w)
-      sockAddr = NS.SockAddrInet (fromIntegral port) hostAddr
-  sock <- NS.socket NS.AF_INET NS.Stream NS.defaultProtocol
-  NS.connect sock sockAddr
-  mkRawConnection sock addr
-tcpDial addr@(Multiaddr [IP6 bs, TCP port]) = do
-  let ipv6 = bytesToIPv6 bs
-      hostAddr6 = toHostAddress6 ipv6
-      sockAddr = NS.SockAddrInet6 (fromIntegral port) 0 hostAddr6 0
-  sock <- NS.socket NS.AF_INET6 NS.Stream NS.defaultProtocol
-  NS.connect sock sockAddr
-  mkRawConnection sock addr
-tcpDial _ = fail "tcpDial: unsupported multiaddr"
+tcpDial addr = case stripP2P addr of
+  Multiaddr [IP4 w, TCP port] -> do
+    let hostAddr = NS.tupleToHostAddress (octet 3 w, octet 2 w, octet 1 w, octet 0 w)
+        sockAddr = NS.SockAddrInet (fromIntegral port) hostAddr
+    sock <- NS.socket NS.AF_INET NS.Stream NS.defaultProtocol
+    NS.connect sock sockAddr
+    mkRawConnection sock addr
+  Multiaddr [IP6 bs, TCP port] -> do
+    let ipv6 = bytesToIPv6 bs
+        hostAddr6 = toHostAddress6 ipv6
+        sockAddr = NS.SockAddrInet6 (fromIntegral port) 0 hostAddr6 0
+    sock <- NS.socket NS.AF_INET6 NS.Stream NS.defaultProtocol
+    NS.connect sock sockAddr
+    mkRawConnection sock addr
+  _ -> fail "tcpDial: unsupported multiaddr"
 
 -- | Create a RawConnection from a connected socket.
 mkRawConnection :: NS.Socket -> Multiaddr -> IO RawConnection
