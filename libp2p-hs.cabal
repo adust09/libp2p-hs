@@ -194,6 +194,8 @@ test-suite libp2p-hs-test
     LibP2P.IntegrationSpec
     LibP2P.FaultInjectionSpec
     LibP2P.WireConformanceSpec
+    LibP2P.ConformanceSpec
+    LibP2P.SoakSpec
   build-depends:
     base       >= 4.18 && < 5,
     bytestring >= 0.10 && < 0.13,
