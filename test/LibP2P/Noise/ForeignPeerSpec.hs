@@ -13,13 +13,14 @@
 module LibP2P.Noise.ForeignPeerSpec (spec) where
 
 import Control.Concurrent.Async (concurrently, withAsync)
-import Control.Exception (IOException)
+import Control.Exception (IOException, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.List (isInfixOf)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair (..), PublicKey)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
+import LibP2P.EofStream (mkEofStreamPair)
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
 import LibP2P.Noise.Handshake
   ( HandshakeResult (..)
@@ -44,7 +45,22 @@ import LibP2P.Switch.Upgrade
   , writeFramedMessage
   )
 import Data.IORef (newIORef)
+import System.Timeout (timeout)
 import Test.Hspec
+
+-- | Assert that an IO action fails with an 'IOException' within the
+-- given number of microseconds — neither hanging nor succeeding. The
+-- EOF failure mode being guarded against is a hang, so a plain
+-- 'shouldThrow' would be insufficient.
+shouldFailCleanlyWithin :: Int -> IO a -> Expectation
+shouldFailCleanlyWithin us action = do
+  result <- timeout us (try action)
+  case result of
+    Just (Left (_ :: IOException)) -> pure ()
+    Just (Right _) ->
+      expectationFailure "expected a clean failure, but the action succeeded"
+    Nothing ->
+      expectationFailure "expected a clean failure, but the action hung"
 
 -- | Generate a test identity (PeerId, KeyPair).
 mkTestIdentity :: IO (PeerId, KeyPair)
@@ -232,3 +248,79 @@ spec = do
       withAsync (eveResponder streamB) $ \_ ->
         performStreamHandshake kpA Outbound streamA
           `shouldThrow` isSignatureRejection
+
+  describe "Peer disconnect during the handshake (EOF harness)" $ do
+    -- Deterministic, in-process counterparts of the real-TCP disconnect
+    -- tests in FaultInjectionSpec (which assert whole-node survival
+    -- over sockets): here the assertion is that each handshake phase
+    -- fails cleanly — an IOException, not a hang and not a bogus
+    -- success — when the peer vanishes. The EOF-capable pair makes the
+    -- disconnect expressible in process; 'mkMemoryStreamPair' cannot
+    -- model it (reads on an empty queue block forever).
+    it "initiator fails cleanly when the peer disconnects before msg2" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (streamA, streamB) <- mkEofStreamPair
+      -- The peer hangs up immediately: msg1 is written into the open
+      -- direction, but the reply direction is already at EOF.
+      streamClose streamB
+      shouldFailCleanlyWithin 2000000 $
+        performStreamHandshake kpA Outbound streamA
+
+    it "initiator fails cleanly when the peer disconnects mid-frame of msg2" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (streamA, streamB) <- mkEofStreamPair
+      -- A frame header declaring 96 bytes, 10 bytes of payload, then
+      -- EOF: the disconnect lands inside 'readFramedMessage'.
+      streamWrite streamB (BS.pack [0x00, 0x60] <> BS.replicate 10 0xAA)
+      streamClose streamB
+      shouldFailCleanlyWithin 2000000 $
+        performStreamHandshake kpA Outbound streamA
+
+    it "responder fails cleanly when the peer disconnects before msg1" $ do
+      (_pidB, kpB) <- mkTestIdentity
+      (streamA, streamB) <- mkEofStreamPair
+      streamClose streamA
+      shouldFailCleanlyWithin 2000000 $
+        performStreamHandshake kpB Inbound streamB
+
+    it "responder fails cleanly when the peer disconnects after msg1, before msg3" $ do
+      -- A well-formed foreign initiator sends a real msg1 and then
+      -- hangs up: the responder consumes msg1, sends msg2 into the
+      -- still-open direction, and must fail cleanly awaiting msg3.
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (streamA, streamB) <- mkEofStreamPair
+      (st0, _staticPub) <- initHandshakeInitiator kpA
+      (msg1, _st1) <- either fail pure $ writeHandshakeMsg st0 BS.empty
+      writeFramedMessage streamA msg1
+      streamClose streamA
+      shouldFailCleanlyWithin 2000000 $
+        performStreamHandshake kpB Inbound streamB
+
+    it "established connection: EOF mid-encrypted-frame is a clean error, not a partial read" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (streamA, streamB) <- mkEofStreamPair
+      ((prodSess, _result), foreignSess) <-
+        concurrently
+          (performStreamHandshake kpA Outbound streamA)
+          (runForeignResponderSession kpB streamB)
+      -- Foreign peer sends one complete frame, then a frame whose
+      -- header declares the full ciphertext length but whose body is
+      -- cut off by the disconnect.
+      (ct1, fs1) <- either fail pure $ encryptMessage foreignSess "hello"
+      (ct2, _fs2) <- either fail pure $ encryptMessage fs1 "world!"
+      writeFramedMessage streamB ct1
+      streamWrite streamB
+        (BS.pack [0x00, fromIntegral (BS.length ct2)] <> BS.take 5 ct2)
+      streamClose streamB
+      sendRef <- newIORef prodSess
+      recvRef <- newIORef prodSess
+      bufRef <- newIORef BS.empty
+      let encryptedIO = noiseSessionToStreamIO sendRef recvRef bufRef streamA
+      -- The complete frame decrypts normally ...
+      got <- readExact encryptedIO 5
+      got `shouldBe` "hello"
+      -- ... and the truncated one surfaces as a clean error: no hang,
+      -- and no partially-read or corrupted plaintext handed to the app.
+      shouldFailCleanlyWithin 2000000 $ readExact encryptedIO 6

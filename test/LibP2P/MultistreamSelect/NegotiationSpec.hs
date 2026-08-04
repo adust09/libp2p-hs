@@ -6,8 +6,10 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (atomicModifyIORef', newIORef)
 import Data.Word (Word8)
+import LibP2P.EofStream (mkEofStreamPair)
 import LibP2P.MultistreamSelect.Negotiation
 import LibP2P.MultistreamSelect.Wire
+import System.IO.Error (isEOFError)
 import System.Timeout (timeout)
 import Test.Hspec
 
@@ -164,6 +166,78 @@ spec = do
     it "aborts an unterminated varint prefix after the 9-byte spec limit" $ do
       (streamA, streamB) <- mkMemoryStreamPair
       streamWrite streamA (BS.pack (replicate 64 0x80))
+      result <- timeout 1000000 (negotiateResponder streamB ["/noise"])
+      result `shouldBe` Just NoProtocol
+
+  describe "EOF-capable stream harness" $ do
+    it "delivers buffered bytes before signaling EOF" $ do
+      (streamA, streamB) <- mkEofStreamPair
+      streamWrite streamA (BS.pack [0x61, 0x62, 0x63])
+      streamClose streamA
+      -- The three bytes written before the close are still readable ...
+      readRawBytes streamB 3 `shouldReturn` BS.pack [0x61, 0x62, 0x63]
+      -- ... and only then does the reader see EOF.
+      streamReadByte streamB `shouldThrow` isEOFError
+
+    it "read on a closed empty stream throws EOF immediately" $ do
+      (streamA, streamB) <- mkEofStreamPair
+      streamClose streamA
+      result <- timeout 1000000 (streamReadByte streamB `shouldThrow` isEOFError)
+      result `shouldBe` Just ()
+
+    it "write into a direction the writer closed fails" $ do
+      (streamA, _streamB) <- mkEofStreamPair
+      streamClose streamA
+      streamWrite streamA (BS.pack [0x00]) `shouldThrow` isEOFError
+
+  describe "Negotiation - peer disconnect (EOF harness)" $ do
+    -- Deterministic, in-process counterparts of the real-TCP disconnect
+    -- tests in FaultInjectionSpec: that suite asserts whole-node
+    -- survival over sockets; these assert the exact negotiation result
+    -- a disconnect must produce. All wrapped in 'timeout' because the
+    -- failure mode being guarded against is a hang.
+    it "initiator returns NoProtocol when the peer disconnects before replying" $ do
+      (streamA, streamB) <- mkEofStreamPair
+      streamClose streamB
+      result <- timeout 1000000 (negotiateInitiator streamA ["/noise"])
+      result `shouldBe` Just NoProtocol
+
+    it "initiator returns NoProtocol when the peer disconnects after the header, before answering the proposal" $ do
+      (streamA, streamB) <- mkEofStreamPair
+      -- Hand-rolled peer: echo the header, then hang up before the
+      -- initiator's protocol line is answered.
+      streamWrite streamB multistreamHeaderBytes
+      streamClose streamB
+      result <- timeout 1000000 (negotiateInitiator streamA ["/noise"])
+      result `shouldBe` Just NoProtocol
+
+    it "responder returns NoProtocol when the peer disconnects before sending anything" $ do
+      (streamA, streamB) <- mkEofStreamPair
+      streamClose streamA
+      result <- timeout 1000000 (negotiateResponder streamB ["/noise"])
+      result `shouldBe` Just NoProtocol
+
+    it "responder returns NoProtocol when the peer disconnects after the header, before proposing" $ do
+      (streamA, streamB) <- mkEofStreamPair
+      streamWrite streamA multistreamHeaderBytes
+      streamClose streamA
+      result <- timeout 1000000 (negotiateResponder streamB ["/noise"])
+      result `shouldBe` Just NoProtocol
+
+    it "responder returns NoProtocol on a truncated varint at EOF" $ do
+      (streamA, streamB) <- mkEofStreamPair
+      -- A single continuation byte, then the peer vanishes: EOF lands
+      -- inside the varint read loop.
+      streamWrite streamA (BS.singleton 0x80)
+      streamClose streamA
+      result <- timeout 1000000 (negotiateResponder streamB ["/noise"])
+      result `shouldBe` Just NoProtocol
+
+    it "responder returns NoProtocol on EOF in the middle of a protocol line" $ do
+      (streamA, streamB) <- mkEofStreamPair
+      -- Declared length 7, but only 3 payload bytes arrive before EOF.
+      streamWrite streamA (BS.pack [0x07, 0x2f, 0x6e, 0x6f])
+      streamClose streamA
       result <- timeout 1000000 (negotiateResponder streamB ["/noise"])
       result `shouldBe` Just NoProtocol
 

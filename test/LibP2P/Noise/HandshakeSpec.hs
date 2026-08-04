@@ -210,6 +210,19 @@ spec = do
     it "fails on empty input" $
       decodeNoisePayload BS.empty `shouldSatisfy` isLeft
 
+    it "fails on a truncated tag (a lone field-1 tag byte)" $
+      -- A tag byte with nothing after it: neither a length nor a payload.
+      decodeNoisePayload (BS.singleton 0x0a) `shouldSatisfy` isLeft
+
+    it "buildHandshakePayload returns Left when the private key is malformed" $ do
+      -- A malformed identity key must surface as Left from pure code,
+      -- not abort the process (issue #166, item 3).
+      Right kp <- generateKeyPair
+      let badKP = kp {kpPrivate = PrivateKey Ed25519 (BS.replicate 10 0x00)}
+      case buildHandshakePayload badKP (BS.replicate 32 0xAA) of
+        Left err -> err `shouldContain` "buildHandshakePayload"
+        Right _ -> expectationFailure "expected Left for a malformed private key"
+
   describe "Noise XX handshake" $ do
     it "completes 3-message handshake between initiator and responder" $ do
       -- Generate identity key pairs for both peers

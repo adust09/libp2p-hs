@@ -127,8 +127,15 @@ readMessage stream = do
 -- The read loop is bounded at 'maxVarintBytes' (9 bytes per the
 -- unsigned-varint spec) so a peer streaming continuation bytes (0x80)
 -- cannot keep us reading and accumulating forever.
+--
+-- Like 'readExactBounded', I/O failures (stream reset, EOF from a peer
+-- that disconnected mid-negotiation) are returned as 'Left', so the
+-- negotiation functions report them as 'NoProtocol' instead of leaking
+-- an exception.
 readVarint :: StreamIO -> IO (Either String ByteString)
-readVarint stream = go 0 []
+readVarint stream =
+  go 0 [] `catch` \(e :: IOException) ->
+    pure (Left ("readVarint: read failed: " <> show e))
   where
     go :: Int -> [Word8] -> IO (Either String ByteString)
     go n acc
