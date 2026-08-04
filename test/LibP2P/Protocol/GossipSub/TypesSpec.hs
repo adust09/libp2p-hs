@@ -49,16 +49,40 @@ spec = do
               }
         defaultMessageId msg `shouldBe` BS.pack [1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 42]
 
-      it "returns empty when both from and seqno are absent" $ do
+      -- Anonymous (StrictNoSign) messages carry neither from nor seqno; a
+      -- shared empty id would collapse seen-cache dedup, the mcache and
+      -- IHAVE/IWANT tracking (#217), so the id must be content-addressed.
+      it "falls back to SHA-256 of topic and data when from and seqno are absent" $ do
         let msg = PubSubMessage
               { msgFrom      = Nothing
-              , msgData      = BS.empty
+              , msgData      = BS.pack [1, 2, 3]
               , msgSeqNo     = Nothing
               , msgTopic     = "test"
               , msgSignature = Nothing
               , msgKey       = Nothing
               }
-        defaultMessageId msg `shouldBe` BS.empty
+        -- sha256(0x74657374 <> 0x010203), digest computed independently
+        defaultMessageId msg `shouldBe` BS.pack
+          [ 0xce, 0xd4, 0x9a, 0x0a, 0x8c, 0x5c, 0x38, 0xa2
+          , 0x38, 0xb6, 0x0b, 0xf3, 0x35, 0x87, 0xcf, 0x58
+          , 0x73, 0x8f, 0x16, 0xdc, 0x6c, 0x4f, 0xf9, 0xbd
+          , 0x2b, 0x75, 0x95, 0x51, 0xe9, 0xfa, 0xe3, 0x47 ]
+
+      it "derives distinct ids for distinct anonymous messages" $ do
+        let anon topic payload = PubSubMessage
+              { msgFrom      = Nothing
+              , msgData      = payload
+              , msgSeqNo     = Nothing
+              , msgTopic     = topic
+              , msgSignature = Nothing
+              , msgKey       = Nothing
+              }
+        defaultMessageId (anon "t" (BS.pack [1]))
+          `shouldNotBe` defaultMessageId (anon "t" (BS.pack [2]))
+        defaultMessageId (anon "t1" (BS.pack [1]))
+          `shouldNotBe` defaultMessageId (anon "t2" (BS.pack [1]))
+        defaultMessageId (anon "t" (BS.pack [1]))
+          `shouldBe` defaultMessageId (anon "t" (BS.pack [1]))
 
     describe "emptyRPC" $ do
       it "has no subscriptions, messages, or control" $ do
