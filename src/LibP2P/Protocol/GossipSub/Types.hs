@@ -500,7 +500,13 @@ data GossipSubRouter = GossipSubRouter
   , gsOnPeerExchange :: !(TVar (Topic -> [PeerExchangeInfo] -> IO ()))
     -- ^ Called with PX records from a PRUNE whose sender scores at or
     -- above 'stAcceptPXThreshold'. The application decides how to act
-    -- (e.g. resolve addresses and dial); default is a no-op.
+    -- (e.g. resolve addresses and dial); default is a no-op. Entries
+    -- carrying a signed peer record that fails verification are dropped
+    -- before the callback runs (gossipsub-v1.1.md, RFC 0003).
+  , gsSignedPeerRecords :: !(TVar (Map PeerId ByteString))
+    -- ^ Encoded RFC 0003 peer-record envelopes per peer, typically fed
+    -- from identify. Attached to PX entries in outgoing PRUNEs so the
+    -- receiver can verify the advertised addresses.
   }
 
 -- Defaults

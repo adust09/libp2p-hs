@@ -63,7 +63,9 @@ import LibP2P.Protocol.GossipSub.Router
   , publish
   , removePeer
   , setPeerIP
+  , setSignedPeerRecord
   )
+import LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
 import qualified Data.Set as Set
 import LibP2P.Protocol.GossipSub.Types
   ( GossipSubParams
@@ -214,6 +216,7 @@ handleGossipSubStream node stream pid proto mIP = do
   now <- getCurrentTime
   addPeer (gsnRouter node) pid proto False now
   mapM_ (setPeerIP (gsnRouter node) pid) mIP
+  syncSignedPeerRecord node pid
   -- Read loop
   readLoop
   -- Cleanup on disconnect
@@ -227,6 +230,16 @@ handleGossipSubStream node stream pid proto mIP = do
         Right rpc -> do
           handleRPC (gsnRouter node) pid rpc
           readLoop
+
+-- | Feed the peer's signed peer record (obtained via identify, already
+-- verified against the authenticated peer id on receipt) from the
+-- Switch's peer store into the router, so PRUNE-with-PX can attach it
+-- when advertising this peer (#230).
+syncSignedPeerRecord :: GossipSubNode -> PeerId -> IO ()
+syncSignedPeerRecord node pid = do
+  store <- atomically $ readTVar (swPeerStore (gsnSwitch node))
+  mapM_ (setSignedPeerRecord (gsnRouter node) pid)
+    (Map.lookup pid store >>= idSignedPeerRecord)
 
 -- | Start the GossipSub node: register stream handler, notifier, and start heartbeat.
 startGossipSub :: GossipSubNode -> IO ()
@@ -263,6 +276,7 @@ onNewConnection node conn = do
       now <- getCurrentTime
       addPeer (gsnRouter node) pid proto True now
       mapM_ (setPeerIP (gsnRouter node) pid) (remoteIPBytes conn)
+      syncSignedPeerRecord node pid
       -- Send current subscriptions to the new peer
       sendCurrentSubscriptions node stream
       -- Start read loop on this stream to receive RPCs from the peer

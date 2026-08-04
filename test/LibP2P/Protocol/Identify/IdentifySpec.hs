@@ -22,7 +22,13 @@ import Data.List (sort)
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (kpPublic)
-import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey)
+import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey, peerIdBytes)
+import LibP2P.Crypto.PeerRecord
+  ( PeerRecord (..)
+  , openPeerRecordEnvelope
+  , sealPeerRecord
+  )
+import LibP2P.Crypto.SignedEnvelope (encodeSignedEnvelope)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import LibP2P.Multiaddr (Multiaddr (..))
@@ -123,6 +129,7 @@ emptyInfo = IdentifyInfo
   , idListenAddrs     = []
   , idObservedAddr    = Nothing
   , idProtocols       = []
+  , idSignedPeerRecord = Nothing
   }
 
 -- | Build an outbound Connection whose muxer hands out the given
@@ -287,6 +294,7 @@ spec = do
             , idListenAddrs     = []
             , idObservedAddr    = Nothing
             , idProtocols       = ["/test/proto"]
+            , idSignedPeerRecord = Nothing
             }
       -- Write varint-length-prefixed message then signal EOF
       let encoded = encodeIdentify testInfo
@@ -317,6 +325,7 @@ spec = do
             , idListenAddrs     = [encodeProtocols [IP4 0x7f000001, TCP 4001]]
             , idObservedAddr    = Nothing
             , idProtocols       = ["/ipfs/id/1.0.0", "/ipfs/ping/1.0.0"]
+            , idSignedPeerRecord = Nothing
             }
       atomically $ do
         store <- readTVar (swPeerStore sw)
@@ -330,6 +339,7 @@ spec = do
             , idListenAddrs     = newAddrs
             , idObservedAddr    = Nothing
             , idProtocols       = []
+            , idSignedPeerRecord = Nothing
             }
       (streamA, streamB) <- mkClosableStreamPair
       streamWrite streamA (frame (encodeIdentify partialPush))
@@ -501,6 +511,7 @@ spec = do
             , idListenAddrs     = [encodeProtocols [IP4 0x7f000001, TCP 4001]]
             , idObservedAddr    = Nothing
             , idProtocols       = ["/old/1.0.0", "/old/2.0.0"]
+            , idSignedPeerRecord = Nothing
             }
           update = IdentifyInfo
             { idProtocolVersion = Just "ipfs/0.2.0"
@@ -509,6 +520,7 @@ spec = do
             , idListenAddrs     = [encodeProtocols [IP4 0x7f000001, TCP 9999]]
             , idObservedAddr    = Just (encodeProtocols [IP4 0x7f000001, TCP 5555])
             , idProtocols       = ["/new/1.0.0"]
+            , idSignedPeerRecord = Nothing
             }
       -- Every field of the result comes from the update; in particular
       -- idProtocols is exactly the update's one-element list, not a
@@ -523,6 +535,7 @@ spec = do
             , idListenAddrs     = [encodeProtocols [IP4 0x7f000001, TCP 4001]]
             , idObservedAddr    = Just (encodeProtocols [IP4 0x7f000001, TCP 5555])
             , idProtocols       = ["/ipfs/id/1.0.0"]
+            , idSignedPeerRecord = Nothing
             }
       mergeIdentify known emptyInfo `shouldBe` known
 
@@ -539,6 +552,7 @@ spec = do
             , idListenAddrs     = [encodeProtocols [IP4 0x7f000001, TCP 4001]]
             , idObservedAddr    = Nothing
             , idProtocols       = ["/ipfs/id/1.0.0", "/ipfs/ping/1.0.0"]
+            , idSignedPeerRecord = Nothing
             }
       atomically $ do
         store <- readTVar (swPeerStore sw)
@@ -560,6 +574,7 @@ spec = do
             , idListenAddrs     = []
             , idObservedAddr    = Nothing
             , idProtocols       = ["/framed/1.0.0"]
+            , idSignedPeerRecord = Nothing
             }
       streamWrite streamA (frame (encodeIdentify testInfo))
       result <- readFramedIdentify streamB maxIdentifySize
@@ -574,6 +589,7 @@ spec = do
             , idListenAddrs     = [BS.pack [4, 7, 0, 0, 0, 1]]
             , idObservedAddr    = Nothing
             , idProtocols       = ["/a/1.0.0", "/b/1.0.0"]
+            , idSignedPeerRecord = Nothing
             }
       streamWrite streamA (encodeFramedIdentify testInfo)
       result <- readFramedIdentify streamB maxIdentifySize
@@ -722,3 +738,107 @@ spec = do
       protos <- atomically $ readTVar (swProtocols sw)
       Map.member identifyProtocolId protos `shouldBe` True
       Map.member identifyPushProtocolId protos `shouldBe` True
+
+  describe "Identify signedPeerRecord (RFC 0003, #230)" $ do
+    it "buildLocalIdentify seals a verifiable peer record over our listen addrs" $ do
+      sw <- mkTestSwitch
+      info <- buildLocalIdentify sw Nothing
+      case idSignedPeerRecord info of
+        Nothing -> expectationFailure "expected a signedPeerRecord in local identify"
+        Just envBytes -> case openPeerRecordEnvelope envBytes of
+          Left err -> expectationFailure $ "record failed to verify: " ++ err
+          Right (_, record) -> do
+            prPeerId record `shouldBe` peerIdBytes (swLocalPeerId sw)
+            prAddresses record `shouldBe` idListenAddrs info
+
+    it "handleIdentifyPush prefers verified signed-record addresses over listenAddrs" $ do
+      sw <- mkTestSwitch
+      Right remoteKp <- generateKeyPair
+      let remotePid = fromPublicKey (kpPublic remoteKp)
+          signedAddr   = encodeProtocols [IP4 0x7f000001, TCP 4001]
+          unsignedAddr = encodeProtocols [IP4 0x7f000001, TCP 9999]
+          record = PeerRecord
+            { prPeerId    = peerIdBytes remotePid
+            , prSeq       = 1
+            , prAddresses = [signedAddr]
+            }
+      Right env <- pure (sealPeerRecord remoteKp record)
+      let pushInfo = emptyInfo
+            { idListenAddrs      = [unsignedAddr]
+            , idSignedPeerRecord = Just (encodeSignedEnvelope env)
+            }
+      (streamA, streamB) <- mkClosableStreamPair
+      streamWrite streamA (frame (encodeIdentify pushInfo))
+      streamClose streamA
+      conn <- mkTestConnection remotePid (Multiaddr [IP4 0x7f000001, TCP 4001])
+      handleIdentifyPush sw conn streamB
+      store <- atomically $ readTVar (swPeerStore sw)
+      case Map.lookup remotePid store of
+        Nothing -> expectationFailure "Expected peer in store"
+        Just stored -> do
+          idListenAddrs stored `shouldBe` [signedAddr]
+          idSignedPeerRecord stored `shouldBe` Just (encodeSignedEnvelope env)
+
+    it "handleIdentifyPush drops a record not signed by the authenticated peer" $ do
+      -- A valid envelope signed by some other identity is a forged
+      -- routing record for this connection: the envelope key must match
+      -- the peer id authenticated by the security handshake.
+      sw <- mkTestSwitch
+      Right remoteKp   <- generateKeyPair
+      Right attackerKp <- generateKeyPair
+      let remotePid   = fromPublicKey (kpPublic remoteKp)
+          attackerPid = fromPublicKey (kpPublic attackerKp)
+          unsignedAddr = encodeProtocols [IP4 0x7f000001, TCP 9999]
+          forgedRecord = PeerRecord
+            { prPeerId    = peerIdBytes attackerPid
+            , prSeq       = 1
+            , prAddresses = [encodeProtocols [IP4 0x0a000001, TCP 4001]]
+            }
+      Right env <- pure (sealPeerRecord attackerKp forgedRecord)
+      let pushInfo = emptyInfo
+            { idListenAddrs      = [unsignedAddr]
+            , idSignedPeerRecord = Just (encodeSignedEnvelope env)
+            }
+      (streamA, streamB) <- mkClosableStreamPair
+      streamWrite streamA (frame (encodeIdentify pushInfo))
+      streamClose streamA
+      conn <- mkTestConnection remotePid (Multiaddr [IP4 0x7f000001, TCP 4001])
+      handleIdentifyPush sw conn streamB
+      store <- atomically $ readTVar (swPeerStore sw)
+      case Map.lookup remotePid store of
+        Nothing -> expectationFailure "Expected peer in store"
+        Just stored -> do
+          -- Unsigned fallback addresses are kept, forged record dropped
+          idListenAddrs stored `shouldBe` [unsignedAddr]
+          idSignedPeerRecord stored `shouldBe` Nothing
+
+    it "requestIdentify prefers verified signed-record addresses in the response" $ do
+      Right remoteKp <- generateKeyPair
+      let remotePid = fromPublicKey (kpPublic remoteKp)
+          signedAddr   = encodeProtocols [IP4 0x7f000001, TCP 4001]
+          unsignedAddr = encodeProtocols [IP4 0x7f000001, TCP 9999]
+          record = PeerRecord
+            { prPeerId    = peerIdBytes remotePid
+            , prSeq       = 1
+            , prAddresses = [signedAddr]
+            }
+      Right env <- pure (sealPeerRecord remoteKp record)
+      let responseInfo = emptyInfo
+            { idListenAddrs      = [unsignedAddr]
+            , idSignedPeerRecord = Just (encodeSignedEnvelope env)
+            }
+      (streamA, streamB) <- mkClosableStreamPair
+      conn <- mkPushConnection remotePid (Multiaddr [IP4 0x7f000001, TCP 4001])
+                (pure streamA)
+      remote <- async $ do
+        negResult <- negotiateResponder streamB [identifyProtocolId]
+        negResult `shouldBe` Accepted identifyProtocolId
+        streamWrite streamB (encodeFramedIdentify responseInfo)
+        streamClose streamB
+      result <- requestIdentify conn
+      wait remote
+      case result of
+        Left err -> expectationFailure $ "requestIdentify failed: " ++ err
+        Right info -> do
+          idListenAddrs info `shouldBe` [signedAddr]
+          idSignedPeerRecord info `shouldBe` Just (encodeSignedEnvelope env)
