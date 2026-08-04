@@ -12,7 +12,7 @@ import Control.Exception (SomeException, try)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair, publicKey)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import LibP2P.Multiaddr (Multiaddr (..))
+import LibP2P.Multiaddr (Multiaddr (..), fromBytes, fromText, toBytes, toText)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.Switch.ConnPool (lookupConn)
 import LibP2P.Switch.Dial (dial)
@@ -60,6 +60,19 @@ spec = do
       case addrs of
         [Multiaddr [IP4 0x7f000001, TCP port]] -> port `shouldSatisfy` (> 0)
         _ -> expectationFailure $ "unexpected address: " ++ show addrs
+      switchClose sw
+
+    it "reported listen address round-trips through the text and binary codecs" $ do
+      -- Integration: the multiaddr the Switch reports after binding must
+      -- survive parse/render unchanged, so peers can dial exactly what
+      -- identify advertises.
+      (sw, _pid, _kp) <- mkTestSwitch
+      addrs <- switchListen sw defaultConnectionGater [loopbackAddr]
+      case addrs of
+        [addr] -> do
+          fromText (toText addr) `shouldBe` Right addr
+          fromBytes (toBytes addr) `shouldBe` Right addr
+        _ -> expectationFailure $ "unexpected addresses: " ++ show addrs
       switchClose sw
 
     it "binds on multiple addresses and returns all resolved addresses" $ do
