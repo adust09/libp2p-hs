@@ -45,7 +45,7 @@ import Proto3.Wire.Encode (MessageBuilder)
 import qualified Proto3.Wire.Encode as Encode
 import Proto3.Wire.Types (FieldNumber (..))
 import LibP2P.Core.Varint (encodeUvarint, decodeUvarint)
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
+import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), readExactBounded)
 
 -- | AutoNAT protocol identifier.
 autoNATProtocolId :: Text
@@ -253,14 +253,12 @@ readAutoNATMessage stream maxSize = do
       if msgLen > maxSize
         then pure (Left $ "AutoNAT message too large: " ++ show msgLen ++ " > " ++ show maxSize)
         else do
-          payload <- readExact stream msgLen
-          case decodeAutoNATMessage payload of
-            Left err -> pure (Left $ "AutoNAT protobuf decode error: " ++ show err)
-            Right msg -> pure (Right msg)
-
--- | Read exactly n bytes from a stream.
-readExact :: StreamIO -> Int -> IO ByteString
-readExact stream n = BS.pack <$> mapM (const (streamReadByte stream)) [1 .. n]
+          payloadOrErr <- readExactBounded stream maxSize msgLen
+          case payloadOrErr of
+            Left err -> pure (Left $ "AutoNAT read error: " ++ err)
+            Right payload -> case decodeAutoNATMessage payload of
+              Left err -> pure (Left $ "AutoNAT protobuf decode error: " ++ show err)
+              Right msg -> pure (Right msg)
 
 -- | Read unsigned varint bytes from a stream (up to 10 bytes).
 readVarintBytes :: StreamIO -> IO ByteString

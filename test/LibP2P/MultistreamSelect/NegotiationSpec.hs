@@ -4,6 +4,8 @@ import Control.Concurrent.Async (concurrently, withAsync)
 import Control.Monad (replicateM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.IORef (atomicModifyIORef', newIORef)
+import Data.Word (Word8)
 import LibP2P.MultistreamSelect.Negotiation
 import LibP2P.MultistreamSelect.Wire
 import System.Timeout (timeout)
@@ -164,6 +166,68 @@ spec = do
       streamWrite streamA (BS.pack (replicate 64 0x80))
       result <- timeout 1000000 (negotiateResponder streamB ["/noise"])
       result `shouldBe` Just NoProtocol
+
+  describe "readExactBounded" $ do
+    it "reads exactly n bytes when n is within the bound" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      let payload = BS.pack [1 .. 10]
+      streamWrite streamA payload
+      result <- readExactBounded streamB 1024 10
+      result `shouldBe` Right payload
+
+    it "reads zero bytes as the empty string without touching the stream" $ do
+      (_, streamB) <- mkMemoryStreamPair
+      result <- readExactBounded streamB 1024 0
+      result `shouldBe` Right BS.empty
+
+    it "accepts n equal to the maximum" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      let payload = BS.replicate 16 0xab
+      streamWrite streamA payload
+      result <- readExactBounded streamB 16 16
+      result `shouldBe` Right payload
+
+    it "rejects n above the maximum before reading any byte" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      streamWrite streamA (BS.pack [1, 2, 3])
+      result <- readExactBounded streamB 16 17
+      result `shouldSatisfy` isLeft
+      -- No byte was consumed: the buffered bytes are still readable.
+      after' <- readExactBounded streamB 16 3
+      after' `shouldBe` Right (BS.pack [1, 2, 3])
+
+    it "rejects a negative length" $ do
+      (_, streamB) <- mkMemoryStreamPair
+      result <- readExactBounded streamB 16 (-1)
+      result `shouldSatisfy` isLeft
+
+    it "returns Left instead of throwing when the stream fails mid-read" $ do
+      -- A stream that yields 5 bytes and then fails (EOF).
+      remaining <- newIORef (5 :: Int)
+      let failingStream = StreamIO
+            { streamWrite = \_ -> pure ()
+            , streamReadByte = do
+                left <- atomicModifyIORef' remaining (\k -> (k - 1, k))
+                if left > 0
+                  then pure (0x2a :: Word8)
+                  else fail "connection reset"
+            , streamClose = pure ()
+            }
+      result <- readExactBounded failingStream 1024 10
+      case result of
+        Left err -> err `shouldContain` "read failed"
+        Right bs -> expectationFailure ("expected Left, got " ++ show bs)
+
+    it "assembles reads larger than one chunk correctly" $ do
+      -- 70000 bytes spans three 32 KiB chunks; the reassembled bytes
+      -- must be identical and in order.
+      (streamA, streamB) <- mkMemoryStreamPair
+      let payload = BS.pack (map fromIntegral [(0 :: Int) .. 69999])
+      -- The in-memory pair is backed by an unbounded queue, so the
+      -- whole payload can be written before reading it back.
+      streamWrite streamA payload
+      result <- readExactBounded streamB 131072 70000
+      result `shouldBe` Right payload
 
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True

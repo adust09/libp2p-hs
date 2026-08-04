@@ -27,7 +27,7 @@ module LibP2P.Switch.Upgrade
 import Control.Concurrent.Async (async, cancel, race, waitCatch)
 import Control.Concurrent.STM (atomically, isEmptyTQueue, newTVarIO, retry)
 import Control.Exception (SomeException, catch)
-import Control.Monad (replicateM, unless)
+import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -46,6 +46,7 @@ import LibP2P.MultistreamSelect.Negotiation
   , StreamIO (..)
   , negotiateInitiator
   , negotiateResponder
+  , readExactBounded
   )
 import LibP2P.Noise.Framing (chunkPlaintext, encodeFrame)
 import LibP2P.Noise.Handshake
@@ -79,24 +80,15 @@ import qualified LibP2P.Noise.Handshake as HS
 
 -- | Read exactly n bytes from a StreamIO.
 --
--- Defence in depth against remote memory exhaustion: the request size is
--- bounded by maxStreamWindowSize (callers must validate lengths against
--- flow control before reading), and bytes are packed in fixed-size chunks
--- so memory use is proportional to the chunk size, not to n.
+-- Exception-style wrapper over 'readExactBounded' for the Noise frame
+-- reader and the yamux read callback, which expect failures as
+-- exceptions. Defence in depth against remote memory exhaustion: the
+-- request size is bounded by maxStreamWindowSize (callers must validate
+-- lengths against flow control before reading).
 readExact :: StreamIO -> Int -> IO ByteString
-readExact stream n
-  | n <= 0 = pure BS.empty
-  | n > fromIntegral maxStreamWindowSize =
-      fail ("readExact: requested size exceeds bound: " <> show n)
-  | otherwise = BS.concat <$> go n
-  where
-    chunkSize = 32768 :: Int
-    go 0 = pure []
-    go remaining = do
-      let m = min chunkSize remaining
-      chunk <- BS.pack <$> replicateM m (streamReadByte stream)
-      rest <- go (remaining - m)
-      pure (chunk : rest)
+readExact stream n =
+  either fail pure
+    =<< readExactBounded stream (fromIntegral maxStreamWindowSize) n
 
 -- | Read a 2-byte-BE-length-prefixed Noise frame from a StreamIO.
 readFramedMessage :: StreamIO -> IO ByteString

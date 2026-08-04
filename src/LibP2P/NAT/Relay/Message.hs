@@ -55,7 +55,7 @@ import qualified Proto3.Wire.Encode as Encode
 import Proto3.Wire.Encode (MessageBuilder)
 import Proto3.Wire.Types (FieldNumber (..))
 import LibP2P.Core.Varint (encodeUvarint, decodeUvarint)
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
+import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), readExactBounded)
 
 -- | Hop protocol identifier.
 hopProtocolId :: Text
@@ -336,13 +336,12 @@ readFramedWith decoder label stream maxSize = do
       if msgLen > maxSize
         then pure (Left $ label ++ " message too large: " ++ show msgLen)
         else do
-          payload <- readExact stream msgLen
-          case decoder payload of
-            Left err -> pure (Left $ label ++ " protobuf decode error: " ++ show err)
-            Right msg -> pure (Right msg)
-
-readExact :: StreamIO -> Int -> IO ByteString
-readExact stream n = BS.pack <$> mapM (const (streamReadByte stream)) [1 .. n]
+          payloadOrErr <- readExactBounded stream maxSize msgLen
+          case payloadOrErr of
+            Left err -> pure (Left $ label ++ " read error: " ++ err)
+            Right payload -> case decoder payload of
+              Left err -> pure (Left $ label ++ " protobuf decode error: " ++ show err)
+              Right msg -> pure (Right msg)
 
 readVarintBytes :: StreamIO -> IO ByteString
 readVarintBytes stream = go [] (0 :: Int)
