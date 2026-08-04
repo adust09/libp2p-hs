@@ -8,6 +8,7 @@ module LibP2P.Multiaddr.Codec
 
 import Data.Bits (shiftL, shiftR, (.&.))
 import Data.ByteString (ByteString)
+import Data.Char (isDigit)
 import qualified Data.ByteString as BS
 import Data.IP (IPv6, fromHostAddress6, toHostAddress6)
 import Data.Text (Text)
@@ -154,12 +155,20 @@ protocolsToText = T.concat . map renderOne
     renderBase58 = TE.decodeUtf8 . B58.encode
 
 -- | Parse human-readable text form to a list of protocols.
+--
+-- Strict per the multiaddr spec and go-multiaddr behaviour: the input
+-- must be non-empty, must begin with @/@, and must not contain empty
+-- components (so a bare @/@, doubled slashes, and trailing slashes are
+-- all rejected).
 textToProtocols :: Text -> Either String [Protocol]
 textToProtocols input
-  | T.null input = Right []
+  | T.null input = Left "textToProtocols: empty multiaddr"
+  | T.head input /= '/' = Left "textToProtocols: multiaddr must begin with /"
   | otherwise =
-      let parts = filter (not . T.null) $ T.splitOn "/" input
-       in parseParts parts
+      let parts = T.splitOn "/" (T.drop 1 input)
+       in if any T.null parts
+            then Left "textToProtocols: empty component in multiaddr"
+            else parseParts parts
   where
     parseParts :: [Text] -> Either String [Protocol]
     parseParts [] = Right []
@@ -217,16 +226,25 @@ textToProtocols input
       more <- parseParts rest
       Right (proto : more)
 
+    -- Strict dotted-decimal: exactly four octets, digits only (no sign,
+    -- hex, or whitespace), no leading zeros, each in 0..255. Matches
+    -- go-multiaddr, which rejects e.g. "010.0.0.1" and "-1.0.0.1".
     parseIPv4 :: Text -> Either String Word32
-    parseIPv4 t = case map (readMaybe . T.unpack) (T.splitOn "." t) of
-      [Just a, Just b, Just c, Just d]
-        | all (\x -> x <= (255 :: Int)) [a, b, c, d] ->
-            Right $
-              (fromIntegral a `shiftL` 24)
-                + (fromIntegral b `shiftL` 16)
-                + (fromIntegral c `shiftL` 8)
-                + fromIntegral d
+    parseIPv4 t = case mapM parseOctet (T.splitOn "." t) of
+      Just [a, b, c, d] ->
+        Right $
+          (fromIntegral a `shiftL` 24)
+            + (fromIntegral b `shiftL` 16)
+            + (fromIntegral c `shiftL` 8)
+            + fromIntegral d
       _ -> Left $ "textToProtocols: invalid IPv4 address: " <> T.unpack t
+
+    parseOctet :: Text -> Maybe Integer
+    parseOctet o
+      | T.length o > 1 && T.head o == '0' = Nothing -- no leading zeros
+      | otherwise = do
+          n <- parseDecimal o
+          if n <= 255 then Just n else Nothing
 
     -- | Parse IPv6 text (e.g. "::1", "fe80::1") to 16-byte ByteString.
     parseIPv6 :: Text -> Either String ByteString
@@ -235,11 +253,22 @@ textToProtocols input
         Just ipv6 -> Right (ipv6ToBytes ipv6)
         Nothing -> Left $ "textToProtocols: invalid IPv6 address: " <> T.unpack t
 
+    -- Strict decimal port: digits only (no sign, hex, or whitespace),
+    -- in 0..65535. Leading zeros are accepted, matching go-multiaddr's
+    -- strconv.ParseUint behaviour.
     parsePort :: Text -> Either String Word16
-    parsePort t = case readMaybe (T.unpack t) of
+    parsePort t = case parseDecimal t of
       Just n
-        | n >= (0 :: Int) && n <= 65535 -> Right (fromIntegral n)
+        | n <= 65535 -> Right (fromIntegral n)
       _ -> Left $ "textToProtocols: invalid port: " <> T.unpack t
+
+    -- Non-negative decimal, digits only. Parsed via Integer so absurdly
+    -- long digit strings cannot wrap around a fixed-width type.
+    parseDecimal :: Text -> Maybe Integer
+    parseDecimal t
+      | T.null t = Nothing
+      | not (T.all isDigit t) = Nothing
+      | otherwise = readMaybe (T.unpack t)
 
     -- | Parse a peer ID from text, accepting both base58btc and CIDv1 formats.
     -- Validates the decoded bytes as a well-formed multihash.
