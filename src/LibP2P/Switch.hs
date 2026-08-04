@@ -13,15 +13,17 @@ module LibP2P.Switch
   , switchClose
   ) where
 
-import Control.Concurrent.Async (cancel)
+import Control.Concurrent.Async (async, cancel)
 import Control.Concurrent.STM (atomically, newBroadcastTChanIO, newTVarIO, readTVar, writeTVar)
 import Control.Exception (SomeException, catch)
+import Control.Monad (void)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.Key (KeyPair)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId)
+import LibP2P.Protocol.Identify (pushIdentify)
 import LibP2P.Switch.Connection (closeAllConnections)
 import LibP2P.Switch.ResourceManager (DefaultLimits (..), defaultPeerLimits, defaultSystemLimits, newResourceManager)
 import LibP2P.Switch.Types (ActiveListener (..), StreamHandler, Switch (..))
@@ -76,16 +78,24 @@ selectTransport sw addr = atomically $ do
 
 -- | Register a protocol stream handler.
 -- Overwrites any existing handler for the same protocol ID.
+-- The changed protocol set is pushed to connected peers via
+-- identify push (specs/identify) in the background.
 setStreamHandler :: Switch -> ProtocolId -> StreamHandler -> IO ()
-setStreamHandler sw proto handler = atomically $
-  do protos <- readTVar (swProtocols sw)
-     writeTVar (swProtocols sw) (Map.insert proto handler protos)
+setStreamHandler sw proto handler = do
+  atomically $ do
+    protos <- readTVar (swProtocols sw)
+    writeTVar (swProtocols sw) (Map.insert proto handler protos)
+  void $ async (pushIdentify sw)
 
 -- | Remove a protocol stream handler.
+-- The changed protocol set is pushed to connected peers via
+-- identify push (specs/identify) in the background.
 removeStreamHandler :: Switch -> ProtocolId -> IO ()
-removeStreamHandler sw proto = atomically $
-  do protos <- readTVar (swProtocols sw)
-     writeTVar (swProtocols sw) (Map.delete proto protos)
+removeStreamHandler sw proto = do
+  atomically $ do
+    protos <- readTVar (swProtocols sw)
+    writeTVar (swProtocols sw) (Map.delete proto protos)
+  void $ async (pushIdentify sw)
 
 -- | Look up a registered stream handler by protocol ID.
 lookupStreamHandler :: Switch -> ProtocolId -> IO (Maybe StreamHandler)

@@ -19,6 +19,8 @@ module LibP2P.Protocol.Identify
   , handleIdentify
   , requestIdentify
   , handleIdentifyPush
+  , pushIdentify
+  , mergeIdentify
     -- * Building local info
   , buildLocalIdentify
     -- * Registration
@@ -28,6 +30,7 @@ module LibP2P.Protocol.Identify
   , readFramedIdentify
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent.STM (atomically, readTVar, writeTVar)
 import Control.Exception (SomeException, catch)
 import qualified Data.ByteString as BS
@@ -49,6 +52,7 @@ import LibP2P.Protocol.Identify.Message
   , encodeIdentify
   , maxIdentifySize
   )
+import LibP2P.Switch.ConnPool (allConns)
 import LibP2P.Switch.Types
   ( ActiveListener (..)
   , Connection (..)
@@ -92,6 +96,10 @@ requestIdentify conn = do
 -- Reads the pushed varint-length-prefixed IdentifyInfo from the remote
 -- peer. The length prefix is the message boundary — identify push has
 -- no stream-close boundary to fall back on.
+--
+-- The pushed info is merged into the existing peer entry via
+-- 'mergeIdentify': pushes may be partial updates, so fields absent
+-- from the message must not erase what we already know.
 handleIdentifyPush :: Switch -> Connection -> StreamIO -> IO ()
 handleIdentifyPush sw conn stream = do
   infoOrErr <- readFramedIdentify stream maxIdentifySize
@@ -99,7 +107,54 @@ handleIdentifyPush sw conn stream = do
     Left _ -> pure ()
     Right info -> atomically $ do
       store <- readTVar (swPeerStore sw)
-      writeTVar (swPeerStore sw) (Map.insert (connPeerId conn) info store)
+      let merged = maybe info (`mergeIdentify` info)
+                     (Map.lookup (connPeerId conn) store)
+      writeTVar (swPeerStore sw) (Map.insert (connPeerId conn) merged store)
+
+-- | Merge a received (possibly partial) Identify update into the
+-- previously known info for a peer.
+--
+-- Per specs/identify: "missing fields should be ignored, as peers may
+-- choose to send partial updates containing only the fields whose
+-- values have changed." Optional fields keep the known value when the
+-- update omits them; repeated fields (protobuf cannot distinguish
+-- absent from empty) keep the known list when the update's is empty
+-- and are replaced wholesale otherwise, matching go-libp2p.
+mergeIdentify :: IdentifyInfo -> IdentifyInfo -> IdentifyInfo
+mergeIdentify known update = IdentifyInfo
+  { idProtocolVersion = idProtocolVersion update <|> idProtocolVersion known
+  , idAgentVersion    = idAgentVersion update <|> idAgentVersion known
+  , idPublicKey       = idPublicKey update <|> idPublicKey known
+  , idListenAddrs     = replaceUnlessEmpty (idListenAddrs known) (idListenAddrs update)
+  , idObservedAddr    = idObservedAddr update <|> idObservedAddr known
+  , idProtocols       = replaceUnlessEmpty (idProtocols known) (idProtocols update)
+  }
+  where
+    replaceUnlessEmpty old [] = old
+    replaceUnlessEmpty _ new  = new
+
+-- | Push our current IdentifyInfo to every connected peer (sender side
+-- of /ipfs/id/push/1.0.0).
+--
+-- Per specs/identify: open a stream to each remote peer, negotiate the
+-- push protocol id, send one Identify message and close the stream.
+-- Call this whenever local state advertised via identify changes
+-- (listen addresses, registered protocols). Failures on individual
+-- peers (e.g. push protocol not supported) are ignored.
+pushIdentify :: Switch -> IO ()
+pushIdentify sw = do
+  conns <- atomically $ allConns (swConnPool sw)
+  mapM_ (\conn -> pushToConn conn `catch` \(_ :: SomeException) -> pure ()) conns
+  where
+    pushToConn conn = do
+      stream <- muxOpenStream (connSession conn)
+      result <- negotiateInitiator stream [identifyPushProtocolId]
+      case result of
+        Accepted _ -> do
+          info <- buildLocalIdentify sw (Just conn)
+          streamWrite stream (encodeFramedIdentify info)
+          streamClose stream
+        NoProtocol -> streamClose stream
 
 -- | Build our local IdentifyInfo from Switch state.
 buildLocalIdentify :: Switch -> Maybe Connection -> IO IdentifyInfo

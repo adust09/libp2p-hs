@@ -68,6 +68,7 @@ module LibP2P
     -- * Identify protocol
   , registerIdentifyHandlers
   , requestIdentify
+  , pushIdentify
 
     -- * Ping protocol
   , registerPingHandler
@@ -132,7 +133,7 @@ import LibP2P.Protocol.GossipSub.Handler
   , stopGossipSub
   )
 import LibP2P.Protocol.GossipSub.Types (GossipSubParams (..), defaultGossipSubParams)
-import LibP2P.Protocol.Identify (registerIdentifyHandlers, requestIdentify)
+import LibP2P.Protocol.Identify (pushIdentify, registerIdentifyHandlers, requestIdentify)
 import LibP2P.Protocol.Ping
   ( PingError (..)
   , PingResult (..)

@@ -13,10 +13,11 @@ import Control.Concurrent.STM
   , readTVar
   , tryReadTMVar
   , writeTQueue
+  , writeTVar
   )
 import Control.Exception (SomeException, catch, throwIO)
 import qualified Data.ByteString as BS
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
@@ -27,7 +28,11 @@ import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Codec (encodeProtocols)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
+import LibP2P.MultistreamSelect.Negotiation
+  ( NegotiationResult (..)
+  , StreamIO (..)
+  , negotiateResponder
+  )
 import LibP2P.Protocol.Identify
 import LibP2P.Protocol.Identify.Message (IdentifyInfo (..), decodeIdentify, encodeIdentify, maxIdentifySize)
 import LibP2P.Switch (newSwitch, setStreamHandler)
@@ -256,6 +261,51 @@ spec = do
           idProtocolVersion storedInfo `shouldBe` Just "test/1.0"
           idAgentVersion storedInfo `shouldBe` Just "test-agent/0.1"
 
+    it "handleIdentifyPush merges a partial update instead of replacing the entry" $ do
+      -- specs/identify: "missing fields should be ignored, as peers may
+      -- choose to send partial updates". go-libp2p sends address-only
+      -- pushes; they must not wipe the publicKey/protocols/agentVersion
+      -- we already know.
+      sw <- mkTestSwitch
+      let remotePeerId = PeerId "merge-peer"
+          knownInfo = IdentifyInfo
+            { idProtocolVersion = Just "ipfs/0.1.0"
+            , idAgentVersion    = Just "go-libp2p/0.36.0"
+            , idPublicKey       = Just (BS.pack [1, 2, 3])
+            , idListenAddrs     = [encodeProtocols [IP4 0x7f000001, TCP 4001]]
+            , idObservedAddr    = Nothing
+            , idProtocols       = ["/ipfs/id/1.0.0", "/ipfs/ping/1.0.0"]
+            }
+      atomically $ do
+        store <- readTVar (swPeerStore sw)
+        writeTVar (swPeerStore sw) (Map.insert remotePeerId knownInfo store)
+      -- Address-only push: every other field is absent
+      let newAddrs = [encodeProtocols [IP4 0x7f000001, TCP 9999]]
+          partialPush = IdentifyInfo
+            { idProtocolVersion = Nothing
+            , idAgentVersion    = Nothing
+            , idPublicKey       = Nothing
+            , idListenAddrs     = newAddrs
+            , idObservedAddr    = Nothing
+            , idProtocols       = []
+            }
+      (streamA, streamB) <- mkClosableStreamPair
+      streamWrite streamA (frame (encodeIdentify partialPush))
+      streamClose streamA
+      conn <- mkTestConnection remotePeerId (Multiaddr [IP4 0x7f000001, TCP 4001])
+      handleIdentifyPush sw conn streamB
+      store <- atomically $ readTVar (swPeerStore sw)
+      case Map.lookup remotePeerId store of
+        Nothing -> expectationFailure "Expected peer in store"
+        Just merged -> do
+          -- Fields carried by the push are updated
+          idListenAddrs merged `shouldBe` newAddrs
+          -- Fields absent from the push keep their known values
+          idPublicKey merged `shouldBe` Just (BS.pack [1, 2, 3])
+          idProtocols merged `shouldBe` ["/ipfs/id/1.0.0", "/ipfs/ping/1.0.0"]
+          idAgentVersion merged `shouldBe` Just "go-libp2p/0.36.0"
+          idProtocolVersion merged `shouldBe` Just "ipfs/0.1.0"
+
     it "readFramedIdentify parses a varint-length-prefixed message" $ do
       (streamA, streamB) <- mkClosableStreamPair
       let testInfo = IdentifyInfo
@@ -304,6 +354,65 @@ spec = do
       case result of
         Left err -> err `shouldSatisfy` (not . null)
         Right _  -> expectationFailure "expected oversized message to be rejected"
+
+    it "pushIdentify sends a framed identify message on the push protocol to connected peers" $ do
+      -- specs/identify: the push variant opens a stream to each remote
+      -- peer using /ipfs/id/push/1.0.0, sends one Identify message and
+      -- closes the stream.
+      --
+      -- The switch is built without setStreamHandler: that API itself
+      -- fires a background push, which would race with this test's
+      -- single mock stream. Protocols are registered directly instead.
+      Right kp <- generateKeyPair
+      sw <- newSwitch (fromPublicKey (kpPublic kp)) kp
+      let noopHandler _ _ = pure ()
+      atomically $ do
+        protos <- readTVar (swProtocols sw)
+        writeTVar (swProtocols sw)
+          (Map.insert "/test/1.0.0" noopHandler
+            (Map.insert "/test/2.0.0" noopHandler protos))
+      (streamA, streamB) <- mkClosableStreamPair
+      openCountRef <- newIORef (0 :: Int)
+      stateVar <- newTVarIO ConnOpen
+      let remotePid  = PeerId "push-target"
+          remoteAddr = Multiaddr [IP4 0x7f000001, TCP 45678]
+          conn = Connection
+            { connPeerId     = remotePid
+            , connDirection  = Outbound
+            , connLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
+            , connRemoteAddr = remoteAddr
+            , connSecurity   = "/noise"
+            , connMuxer      = "/yamux/1.0.0"
+            , connSession    = MuxerSession
+                { muxOpenStream   = do
+                    modifyIORef' openCountRef (+ 1)
+                    pure streamA
+                , muxAcceptStream = fail "not used in this test"
+                , muxClose        = pure ()
+                }
+            , connState      = stateVar
+            }
+      atomically $ do
+        pool <- readTVar (swConnPool sw)
+        writeTVar (swConnPool sw) (Map.insert remotePid [conn] pool)
+      -- Remote side: accept the push protocol negotiation, then read
+      -- one varint-length-prefixed identify message.
+      remote <- async $ do
+        negResult <- negotiateResponder streamB [identifyPushProtocolId]
+        infoOrErr <- readFramedIdentify streamB maxIdentifySize
+        pure (negResult, infoOrErr)
+      pushIdentify sw
+      (negResult, infoOrErr) <- wait remote
+      negResult `shouldBe` Accepted identifyPushProtocolId
+      case infoOrErr of
+        Left err -> expectationFailure $ "push message decode failed: " ++ err
+        Right info -> do
+          sort (idProtocols info) `shouldBe` ["/test/1.0.0", "/test/2.0.0"]
+          idObservedAddr info `shouldBe` Just (encodeProtocols [IP4 0x7f000001, TCP 45678])
+          idPublicKey info `shouldBe` Just (encodePublicKey (kpPublic (swIdentityKey sw)))
+      -- Exactly one push stream was opened on the connection
+      opens <- readIORef openCountRef
+      opens `shouldBe` 1
 
     it "registerIdentifyHandlers registers both protocol handlers" $ do
       sw <- mkTestSwitch
