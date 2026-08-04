@@ -230,6 +230,24 @@ spec = do
           Just (Right info) ->
             idObservedAddr info `shouldBe` Just (toBytes (connLocalAddr conn))
 
+    it "switchListen pushes the new listen address to already-connected peers" $ do
+      -- specs/identify push: when local state advertised via identify
+      -- changes (here: listen addresses), connected peers are updated
+      -- proactively over /ipfs/id/push/1.0.0 — B's peer store must gain
+      -- A's new address without B ever calling requestIdentify.
+      withConnectedPair $ \(swA, pidA) (swB, _pidB) _conn -> do
+        newAddrs <- switchListen swA defaultConnectionGater [loopbackAddr]
+        let expected = toBytes (head newAddrs)
+        seen <- timeout 5000000 $ atomically $ do
+          store <- readTVar (swPeerStore swB)
+          case Map.lookup pidA store of
+            Just info | expected `elem` idListenAddrs info -> pure ()
+            _ -> retry
+        case seen of
+          Just () -> pure ()
+          Nothing -> expectationFailure
+            "B never received A's pushed listen address"
+
   describe "Multi-protocol" $ do
     it "successive pings reuse a single outbound stream over the same connection" $ do
       -- Regression for #163. specs/ping/ping.md: "The dialing peer MUST
