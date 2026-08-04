@@ -7,11 +7,12 @@ module LibP2P.NAT.RegistrationSpec (spec) where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import qualified Data.ByteString as BS
 import Data.Maybe (isJust)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair, publicKey)
 import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey, peerIdBytes)
-import LibP2P.Multiaddr (Multiaddr (..), toBytes)
+import LibP2P.Multiaddr (Multiaddr (..), fromBytes, toBytes)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
@@ -38,11 +39,12 @@ import LibP2P.NAT.DCUtR.Message
   , readHolePunchMessage
   , writeHolePunchMessage
   )
-import LibP2P.NAT.Relay.Client (makeReservation)
+import LibP2P.NAT.Relay.Client (connectViaRelay, makeReservation)
 import LibP2P.NAT.Relay.Message
   ( HopMessage (..)
   , RelayPeer (..)
   , RelayStatus (..)
+  , Reservation (..)
   , StopMessage (..)
   , StopMessageType (..)
   , hopProtocolId
@@ -199,3 +201,67 @@ spec = do
             hpType resp `shouldBe` HPConnect
             -- The handler advertises B's listen addresses
             hpObsAddrs resp `shouldSatisfy` (not . null)
+
+  describe "multi-host relay circuit" $ do
+    it "bridges reserve → connect → application data across three in-process hosts" $ do
+      -- Three real switches over TCP: relay R serves hop/stop, target A
+      -- reserves on R, source B connects to A through R, and application
+      -- data crosses the bridged circuit in both directions. Hole punching
+      -- against real NATs is out of reach in-process and is covered by the
+      -- interop work (issue #131).
+      (pidR, kpR) <- mkTestIdentity
+      swR <- newSwitch pidR kpR
+      addTransport swR =<< newTCPTransport
+      _ <- registerNATHandlers swR defaultNATConfig
+      addrsR <- switchListen swR defaultConnectionGater [loopbackAddr]
+      -- Target A: consumes the relayed stream (3 bytes in, 2 bytes reply)
+      relayedMVar <- newEmptyMVar
+      (pidA, kpA) <- mkTestIdentity
+      swA <- newSwitch pidA kpA
+      addTransport swA =<< newTCPTransport
+      let configA = defaultNATConfig
+            { ncOnRelayedStream = \src _mLimit stream -> do
+                payload <- mapM (\_ -> streamReadByte stream) [1..3 :: Int]
+                streamWrite stream (BS.pack [9, 8])
+                putMVar relayedMVar (src, payload)
+            }
+      _ <- registerNATHandlers swA configA
+      -- Source B
+      (pidB, kpB) <- mkTestIdentity
+      swB <- newSwitch pidB kpB
+      addTransport swB =<< newTCPTransport
+      result <- timeout 20000000 $ do
+        -- A dials R and reserves
+        connAR <- dial swA pidR [head addrsR] >>= either (fail . show) pure
+        hopA <- openProtoStream swA connAR hopProtocolId
+        rsv <- makeReservation hopA >>= either fail pure
+        hopStatus rsv `shouldBe` Just RelayOK
+        -- The reservation advertises R's addresses, each ending in /p2p/<R>
+        case hopReservation rsv of
+          Nothing -> expectationFailure "expected reservation in RESERVE response"
+          Just r -> do
+            rsvAddrs r `shouldSatisfy` (not . null)
+            mapM_
+              (\addrBytes -> case fromBytes addrBytes of
+                Right (Multiaddr ps) -> last ps `shouldBe` P2P (peerIdBytes pidR)
+                Left err -> expectationFailure $ "undecodable reservation addr: " ++ err)
+              (rsvAddrs r)
+        -- B dials R and connects to A through the circuit
+        connBR <- dial swB pidR [head addrsR] >>= either (fail . show) pure
+        hopB <- openProtoStream swB connBR hopProtocolId
+        connResp <- connectViaRelay hopB pidA >>= either fail pure
+        hopStatus connResp `shouldBe` Just RelayOK
+        -- Application data B → A through the bridged circuit
+        streamWrite hopB (BS.pack [1, 2, 3])
+        (src, payload) <- takeMVar relayedMVar
+        src `shouldBe` pidB
+        payload `shouldBe` [1, 2, 3]
+        -- and A → B back through the same circuit
+        reply <- mapM (\_ -> streamReadByte hopB) [1..2 :: Int]
+        reply `shouldBe` [9, 8]
+      switchClose swA
+      switchClose swB
+      switchClose swR
+      case result of
+        Nothing -> expectationFailure "multi-host relay circuit timed out"
+        Just () -> pure ()

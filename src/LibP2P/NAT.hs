@@ -22,8 +22,9 @@ module LibP2P.NAT
 
 import Control.Concurrent.STM (atomically)
 import Control.Exception (SomeException, catch, try)
-import LibP2P.Crypto.PeerId (PeerId)
-import LibP2P.Multiaddr (Multiaddr)
+import LibP2P.Crypto.PeerId (PeerId, peerIdBytes)
+import LibP2P.Multiaddr (Multiaddr (..), encapsulate)
+import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
@@ -34,7 +35,8 @@ import LibP2P.NAT.AutoNAT.Message (autoNATProtocolId)
 import LibP2P.NAT.DCUtR (DCUtRConfig (..), handleDCUtR)
 import LibP2P.NAT.DCUtR.Message (dcutrProtocolId)
 import LibP2P.NAT.Relay
-  ( RelayConfig
+  ( HopContext (..)
+  , RelayConfig
   , RelayState
   , defaultRelayConfig
   , handleConnect
@@ -152,10 +154,12 @@ registerRelayHopHandler sw relayState =
     case result of
       Left _ -> pure ()
       Right msg -> case hopType msg of
-        Just HopReserve ->
-          handleReserve relayState stream (connPeerId conn)
-        Just HopConnect ->
-          handleConnect relayState stream (connPeerId conn) msg (openStopStream sw)
+        Just HopReserve -> do
+          ctx <- switchHopContext sw conn
+          handleReserve relayState ctx stream (connPeerId conn)
+        Just HopConnect -> do
+          ctx <- switchHopContext sw conn
+          handleConnect relayState ctx stream (connPeerId conn) msg (openStopStream sw)
         _ -> writeHopMessage stream HopMessage
           { hopType = Just HopStatus
           , hopPeer = Nothing
@@ -163,6 +167,21 @@ registerRelayHopHandler sw relayState =
           , hopLimit = Nothing
           , hopStatus = Just UnexpectedMessage
           }
+
+-- | Build the per-request hop context from the Switch: the relay's own
+-- identity (signs reservation vouchers), its listen addresses with the
+-- @/p2p/\<relay\>@ suffix the circuit-v2 spec requires for reservation
+-- addrs, and the address the requesting connection arrived over.
+switchHopContext :: Switch -> Connection -> IO HopContext
+switchHopContext sw conn = do
+  addrs <- switchListenAddrs sw
+  let relayP2P = Multiaddr [P2P (peerIdBytes (swLocalPeerId sw))]
+  pure HopContext
+    { hcRelayId    = swLocalPeerId sw
+    , hcRelayKey   = swIdentityKey sw
+    , hcRelayAddrs = map (`encapsulate` relayP2P) addrs
+    , hcRemoteAddr = connRemoteAddr conn
+    }
 
 -- | Open a stop-protocol stream to the circuit target over an existing
 -- connection. Returns Nothing when the target is not connected or the

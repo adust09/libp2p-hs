@@ -239,3 +239,11 @@ spec = do
           encoded = encodeStopMessage msg
           decoded = decodeStopMessage encoded
       decoded `shouldBe` Right msg
+
+    it "Voucher payload encode → decode round-trip" $ do
+      let voucher = Voucher
+            { vRelay = BS.pack [0x00, 0x02, 0xAA, 0xBB]
+            , vPeer = BS.pack [0x00, 0x02, 0x11, 0x22]
+            , vExpiration = 1700003600
+            }
+      decodeVoucher (encodeVoucher voucher) `shouldBe` Right voucher

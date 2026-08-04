@@ -11,6 +11,7 @@
 -- Peer fields: id(1), addrs(2)
 -- Reservation fields: expire(1), addrs(2), voucher(3)
 -- Limit fields: duration(1), data(2)
+-- Voucher fields: relay(1), peer(2), expiration(3)
 module LibP2P.NAT.Relay.Message
   ( -- * Types
     HopMessageType (..)
@@ -21,6 +22,7 @@ module LibP2P.NAT.Relay.Message
   , RelayLimit (..)
   , HopMessage (..)
   , StopMessage (..)
+  , Voucher (..)
     -- * Status conversion
   , relayStatusToWord
   , wordToRelayStatus
@@ -38,6 +40,9 @@ module LibP2P.NAT.Relay.Message
   , decodeStopFramed
   , writeStopMessage
   , readStopMessage
+    -- * Voucher encode/decode
+  , encodeVoucher
+  , decodeVoucher
     -- * Constants
   , maxRelayMessageSize
   , hopProtocolId
@@ -148,6 +153,14 @@ data StopMessage = StopMessage
   , stopPeer   :: !(Maybe RelayPeer)        -- ^ field 2
   , stopLimit  :: !(Maybe RelayLimit)       -- ^ field 3
   , stopStatus :: !(Maybe RelayStatus)      -- ^ field 4
+  } deriving (Show, Eq)
+
+-- | Reservation voucher payload (circuit-v2 voucher.proto). Carried inside
+-- a signed envelope in the 'rsvVoucher' field.
+data Voucher = Voucher
+  { vRelay      :: !ByteString  -- ^ field 1: relay peer ID bytes
+  , vPeer       :: !ByteString  -- ^ field 2: reserving peer ID bytes
+  , vExpiration :: !Word64      -- ^ field 3: reservation expiration (Unix UTC)
   } deriving (Show, Eq)
 
 -- Encoding helpers
@@ -272,6 +285,23 @@ relayLimitParser :: Parser RawMessage RelayLimit
 relayLimitParser = RelayLimit
   <$> at (optional Decode.uint32) (FieldNumber 1)
   <*> at (optional Decode.uint64) (FieldNumber 2)
+
+-- | Encode a reservation voucher payload to protobuf.
+encodeVoucher :: Voucher -> ByteString
+encodeVoucher v = BL.toStrict $ Encode.toLazyByteString $
+     Encode.byteString (FieldNumber 1) (vRelay v)
+  <> Encode.byteString (FieldNumber 2) (vPeer v)
+  <> Encode.uint64 (FieldNumber 3) (vExpiration v)
+
+-- | Decode a reservation voucher payload from protobuf.
+decodeVoucher :: ByteString -> Either ParseError Voucher
+decodeVoucher = parse voucherParser
+
+voucherParser :: Parser RawMessage Voucher
+voucherParser = Voucher
+  <$> at (one Decode.byteString BS.empty) (FieldNumber 1)
+  <*> at (one Decode.byteString BS.empty) (FieldNumber 2)
+  <*> at (one Decode.uint64 0) (FieldNumber 3)
 
 -- Wire framing (same pattern as DHT/AutoNAT)
 

@@ -11,7 +11,11 @@ import LibP2P.NAT.Relay.Message
 import LibP2P.NAT.Relay
 import LibP2P.NAT.Relay.Client
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import LibP2P.Crypto.PeerId (PeerId (..))
+import LibP2P.Multiaddr (Multiaddr (..))
+import LibP2P.Multiaddr.Protocol (Protocol (..))
+import LibP2P.Crypto.Ed25519 (generateKeyPair)
+import LibP2P.Crypto.Key (publicKey)
+import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey, peerIdBytes)
 
 -- | Create an in-memory stream pair for testing.
 mkStreamPair :: IO (StreamIO, StreamIO)
@@ -35,6 +39,19 @@ testPeerId = PeerId (BS.pack [0x00, 0x24, 0x08, 0x01, 0x12, 0x20, 0xAA, 0xBB, 0x
 
 targetPeerId :: PeerId
 targetPeerId = PeerId (BS.pack [0x00, 0x24, 0x08, 0x01, 0x12, 0x20, 0x11, 0x22, 0x33, 0x44])
+
+-- | Hop context for a request arriving over a direct (non-relayed)
+-- connection, with a fresh relay identity and one public relay address.
+mkHopContext :: IO HopContext
+mkHopContext = do
+  Right kp <- generateKeyPair
+  let relayId = fromPublicKey (publicKey kp)
+  pure HopContext
+    { hcRelayId    = relayId
+    , hcRelayKey   = kp
+    , hcRelayAddrs = [Multiaddr [IP4 0xCB007105, TCP 4001, P2P (peerIdBytes relayId)]]
+    , hcRemoteAddr = Multiaddr [IP4 0xC0A80102, TCP 51234]
+    }
 
 spec :: Spec
 spec = do
@@ -190,6 +207,7 @@ spec = do
       --   A accepts the stop CONNECT via handleStop
       --   Application data flows both ways through the bridged circuit
       relayState <- newRelayState defaultRelayConfig
+      ctx <- mkHopContext
       let reserver = testPeerId    -- A: the peer holding the reservation
           source = targetPeerId    -- B: the peer connecting through the relay
       -- Step 1: A reserves on the relay
@@ -198,7 +216,7 @@ spec = do
             req <- readHopMessage relayAHop maxRelayMessageSize
             case req of
               Right msg | hopType msg == Just HopReserve ->
-                handleReserve relayState relayAHop reserver
+                handleReserve relayState ctx relayAHop reserver
               _ -> expectationFailure "relay expected a RESERVE request"
       withAsync relayReserveSide $ \reserveAsync -> do
         rsvResult <- makeReservation aHop
@@ -215,7 +233,7 @@ spec = do
             req <- readHopMessage relayBHop maxRelayMessageSize
             case req of
               Right msg | hopType msg == Just HopConnect ->
-                handleConnect relayState relayBHop source msg
+                handleConnect relayState ctx relayBHop source msg
                   (\pid -> pure (if pid == reserver then Just relayStop else Nothing))
               _ -> expectationFailure "relay expected a CONNECT request"
       withAsync relayConnectSide $ \_connectAsync ->

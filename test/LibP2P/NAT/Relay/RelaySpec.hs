@@ -15,7 +15,10 @@ import LibP2P.NAT.Relay
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import LibP2P.Multiaddr (Multiaddr (..), toBytes, fromBytes)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
-import LibP2P.Crypto.PeerId (PeerId (..))
+import LibP2P.Crypto.Ed25519 (generateKeyPair)
+import LibP2P.Crypto.Key (publicKey)
+import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey, peerIdBytes)
+import LibP2P.Crypto.SignedEnvelope (decodeSignedEnvelope, sePayload, sePayloadType, verifyEnvelope)
 
 -- | Create an in-memory stream pair for testing.
 mkStreamPair :: IO (StreamIO, StreamIO)
@@ -40,6 +43,26 @@ testPeerId = PeerId (BS.pack [0x00, 0x24, 0x08, 0x01, 0x12, 0x20, 0xAA, 0xBB, 0x
 targetPeerId :: PeerId
 targetPeerId = PeerId (BS.pack [0x00, 0x24, 0x08, 0x01, 0x12, 0x20, 0x11, 0x22, 0x33, 0x44])
 
+-- | Hop context for a request arriving over a direct (non-relayed)
+-- connection, with a fresh relay identity and one public relay address.
+mkHopContext :: IO HopContext
+mkHopContext = do
+  Right kp <- generateKeyPair
+  let relayId = fromPublicKey (publicKey kp)
+  pure HopContext
+    { hcRelayId    = relayId
+    , hcRelayKey   = kp
+    , hcRelayAddrs = [Multiaddr [IP4 0xCB007105, TCP 4001, P2P (peerIdBytes relayId)]]
+    , hcRemoteAddr = Multiaddr [IP4 0xC0A80102, TCP 51234]
+    }
+
+-- | The same context but with the request arriving over a relayed connection.
+overRelayed :: HopContext -> HopContext
+overRelayed ctx = ctx
+  { hcRemoteAddr = Multiaddr
+      [IP4 0xCB007105, TCP 4001, P2P (BS.pack [0x00, 0x02, 0xAA, 0xBB]), P2PCircuit]
+  }
+
 spec :: Spec
 spec = do
   describe "Relay server handleReserve" $ do
@@ -54,7 +77,8 @@ spec = do
         , hopLimit = Nothing
         , hopStatus = Nothing
         }
-      handleReserve relayState serverStream testPeerId
+      ctx <- mkHopContext
+      handleReserve relayState ctx serverStream testPeerId
       -- Read response
       result <- readHopMessage clientStream maxRelayMessageSize
       case result of
@@ -78,7 +102,8 @@ spec = do
         , hopStatus = Nothing
         }
       now <- getPOSIXTime
-      handleReserve relayState serverStream testPeerId
+      ctx <- mkHopContext
+      handleReserve relayState ctx serverStream testPeerId
       result <- readHopMessage clientStream maxRelayMessageSize
       let nowSecs = floor now :: Word64
           duration = rcReservationDuration defaultRelayConfig
@@ -110,7 +135,8 @@ spec = do
         , hopLimit = Nothing
         , hopStatus = Nothing
         }
-      handleReserve relayState serverStream testPeerId
+      ctx <- mkHopContext
+      handleReserve relayState ctx serverStream testPeerId
       result <- readHopMessage clientStream maxRelayMessageSize
       case result of
         Right resp -> do
@@ -125,7 +151,134 @@ spec = do
       reservations <- readTVarIO (rsReservations relayState)
       Map.member testPeerId reservations `shouldBe` False
 
+    it "should allow a peer to refresh its own reservation when the relay is at capacity" $ do
+      let config = defaultRelayConfig { rcMaxReservations = 1 }
+      relayState <- newRelayState config
+      ctx <- mkHopContext
+      -- First reservation fills the relay to capacity
+      (clientStream1, serverStream1) <- mkStreamPair
+      handleReserve relayState ctx serverStream1 testPeerId
+      first <- readHopMessage clientStream1 maxRelayMessageSize
+      case first of
+        Right resp -> hopStatus resp `shouldBe` Just RelayOK
+        Left err -> expectationFailure $ "Read failed: " ++ err
+      firstExpire <- do
+        reservations <- readTVarIO (rsReservations relayState)
+        case Map.lookup testPeerId reservations of
+          Just ar -> pure (arExpiration ar)
+          Nothing -> fail "expected stored reservation"
+      -- A refresh from the same peer is not a new reservation: it must
+      -- succeed even though Map.size == rcMaxReservations.
+      (clientStream2, serverStream2) <- mkStreamPair
+      handleReserve relayState ctx serverStream2 testPeerId
+      refreshed <- readHopMessage clientStream2 maxRelayMessageSize
+      case refreshed of
+        Right resp -> do
+          hopStatus resp `shouldBe` Just RelayOK
+          (hopReservation resp >>= rsvExpire) `shouldSatisfy` (/= Nothing)
+        Left err -> expectationFailure $ "Read failed: " ++ err
+      -- Still exactly one reservation, with a refreshed (not earlier) expiry
+      reservations <- readTVarIO (rsReservations relayState)
+      Map.size reservations `shouldBe` 1
+      case Map.lookup testPeerId reservations of
+        Just ar -> arExpiration ar `shouldSatisfy` (>= firstExpire)
+        Nothing -> expectationFailure "expected stored reservation after refresh"
+      -- A different peer must still be refused at capacity
+      (clientStream3, serverStream3) <- mkStreamPair
+      handleReserve relayState ctx serverStream3 targetPeerId
+      other <- readHopMessage clientStream3 maxRelayMessageSize
+      case other of
+        Right resp -> hopStatus resp `shouldBe` Just ReservationRefused
+        Left err -> expectationFailure $ "Read failed: " ++ err
+
+    it "should populate the reservation with the relay's public addresses" $ do
+      relayState <- newRelayState defaultRelayConfig
+      ctx <- mkHopContext
+      (clientStream, serverStream) <- mkStreamPair
+      handleReserve relayState ctx serverStream testPeerId
+      result <- readHopMessage clientStream maxRelayMessageSize
+      case result of
+        Right resp -> case hopReservation resp of
+          Just rsv -> do
+            -- circuit-v2: addrs contains the relay's public addresses
+            -- (including /p2p/<relay>, without a trailing /p2p-circuit)
+            rsvAddrs rsv `shouldBe` map toBytes (hcRelayAddrs ctx)
+            rsvAddrs rsv `shouldSatisfy` (not . null)
+          Nothing -> expectationFailure "Expected reservation in response"
+        Left err -> expectationFailure $ "Read failed: " ++ err
+
+    it "should attach a voucher that verifies as a relay-signed envelope over the reservation" $ do
+      relayState <- newRelayState defaultRelayConfig
+      ctx <- mkHopContext
+      (clientStream, serverStream) <- mkStreamPair
+      handleReserve relayState ctx serverStream testPeerId
+      result <- readHopMessage clientStream maxRelayMessageSize
+      voucherBytes <- case result of
+        Right resp -> case hopReservation resp >>= rsvVoucher of
+          Just vb -> pure vb
+          Nothing -> fail "Expected voucher in reservation"
+        Left err -> fail $ "Read failed: " ++ err
+      -- The voucher is an RFC 0002 signed envelope under the relay-rsvp domain
+      case decodeSignedEnvelope voucherBytes of
+        Left err -> expectationFailure $ "Voucher envelope decode failed: " ++ err
+        Right env -> do
+          sePayloadType env `shouldBe` relayRsvpPayloadType
+          verifyEnvelope env relayRsvpDomain `shouldBe` True
+          -- The signed payload identifies relay, reserving peer and expiry
+          case decodeVoucher (sePayload env) of
+            Left err -> expectationFailure $ "Voucher payload decode failed: " ++ show err
+            Right voucher -> do
+              vRelay voucher `shouldBe` peerIdBytes (hcRelayId ctx)
+              vPeer voucher `shouldBe` peerIdBytes testPeerId
+              vExpiration voucher `shouldSatisfy` (> 0)
+
+    it "should refuse a RESERVE arriving over an already-relayed connection with PERMISSION_DENIED" $ do
+      relayState <- newRelayState defaultRelayConfig
+      ctx <- overRelayed <$> mkHopContext
+      (clientStream, serverStream) <- mkStreamPair
+      handleReserve relayState ctx serverStream testPeerId
+      result <- readHopMessage clientStream maxRelayMessageSize
+      case result of
+        Right resp -> do
+          hopStatus resp `shouldBe` Just PermissionDenied
+          hopReservation resp `shouldBe` Nothing
+        Left err -> expectationFailure $ "Read failed: " ++ err
+      -- No reservation may be stored for the refused peer
+      reservations <- readTVarIO (rsReservations relayState)
+      Map.member testPeerId reservations `shouldBe` False
+
   describe "Relay server handleConnect" $ do
+    it "should refuse a CONNECT arriving over an already-relayed connection with PERMISSION_DENIED" $ do
+      relayState <- newRelayState defaultRelayConfig
+      -- Even with a valid target reservation, relay chains are refused
+      now <- getPOSIXTime
+      let valid = ActiveReservation
+            { arPeerId = targetPeerId
+            , arExpiration = floor now + 3600
+            }
+      atomically $ modifyTVar' (rsReservations relayState) (Map.insert targetPeerId valid)
+      ctx <- overRelayed <$> mkHopContext
+      (clientStream, serverStream) <- mkStreamPair
+      let connectReq = HopMessage
+            { hopType = Just HopConnect
+            , hopPeer = Just RelayPeer
+                { rpId = let PeerId bs = targetPeerId in bs
+                , rpAddrs = []
+                }
+            , hopReservation = Nothing
+            , hopLimit = Nothing
+            , hopStatus = Nothing
+            }
+      writeHopMessage clientStream connectReq
+      handleConnect relayState ctx serverStream testPeerId connectReq (\_pid -> pure Nothing)
+      result <- readHopMessage clientStream maxRelayMessageSize
+      case result of
+        Right resp -> hopStatus resp `shouldBe` Just PermissionDenied
+        Left err -> expectationFailure $ "Read failed: " ++ err
+      -- The refused CONNECT must not consume circuit slots
+      counts <- readTVarIO (rsCircuitCounts relayState)
+      counts `shouldBe` Map.empty
+
     it "should reject CONNECT with NO_RESERVATION when the target reservation has expired" $ do
       relayState <- newRelayState defaultRelayConfig
       -- Insert an already-expired reservation for the target
@@ -147,7 +300,8 @@ spec = do
             , hopStatus = Nothing
             }
       writeHopMessage clientStream connectReq
-      handleConnect relayState serverStream testPeerId connectReq (\_pid -> pure Nothing)
+      ctx <- mkHopContext
+      handleConnect relayState ctx serverStream testPeerId connectReq (\_pid -> pure Nothing)
       result <- readHopMessage clientStream maxRelayMessageSize
       case result of
         Right resp -> hopStatus resp `shouldBe` Just NoReservation
@@ -178,7 +332,8 @@ spec = do
             , hopStatus = Nothing
             }
       writeHopMessage clientStream connectReq
-      handleConnect relayState serverStream testPeerId connectReq (\_pid -> pure Nothing)
+      ctx <- mkHopContext
+      handleConnect relayState ctx serverStream testPeerId connectReq (\_pid -> pure Nothing)
       result <- readHopMessage clientStream maxRelayMessageSize
       case result of
         Right resp -> hopStatus resp `shouldBe` Just ResourceLimitExceeded
@@ -207,7 +362,8 @@ spec = do
             , hopStatus = Nothing
             }
       writeHopMessage clientStream connectReq
-      let runConnect = handleConnect relayState serverStream testPeerId connectReq
+      ctx <- mkHopContext
+      let runConnect = handleConnect relayState ctx serverStream testPeerId connectReq
                          (\_pid -> pure (Just relayStopStream))
       withAsync runConnect $ \connectAsync -> do
         -- Fake target: accept the STOP CONNECT
@@ -249,7 +405,8 @@ spec = do
             , hopStatus = Nothing
             }
       writeHopMessage clientStream connectReq
-      handleConnect relayState serverStream testPeerId connectReq (\_pid -> pure Nothing)
+      ctx <- mkHopContext
+      handleConnect relayState ctx serverStream testPeerId connectReq (\_pid -> pure Nothing)
       result <- readHopMessage clientStream maxRelayMessageSize
       case result of
         Right resp -> hopStatus resp `shouldBe` Just NoReservation
@@ -266,7 +423,8 @@ spec = do
             , hopStatus = Nothing
             }
       writeHopMessage clientStream connectReq
-      handleConnect relayState serverStream testPeerId connectReq (\_pid -> pure Nothing)
+      ctx <- mkHopContext
+      handleConnect relayState ctx serverStream testPeerId connectReq (\_pid -> pure Nothing)
       result <- readHopMessage clientStream maxRelayMessageSize
       case result of
         Right resp -> hopStatus resp `shouldBe` Just MalformedMessage
@@ -293,7 +451,8 @@ spec = do
             }
       writeHopMessage clientStream connectReq
       -- Target has a valid reservation, but the relay cannot reach it
-      handleConnect relayState serverStream testPeerId connectReq (\_pid -> pure Nothing)
+      ctx <- mkHopContext
+      handleConnect relayState ctx serverStream testPeerId connectReq (\_pid -> pure Nothing)
       result <- readHopMessage clientStream maxRelayMessageSize
       case result of
         Right resp -> hopStatus resp `shouldBe` Just ConnectionFailed
@@ -323,7 +482,8 @@ spec = do
             , hopStatus = Nothing
             }
       writeHopMessage clientStream connectReq
-      let runConnect = handleConnect relayState serverStream testPeerId connectReq
+      ctx <- mkHopContext
+      let runConnect = handleConnect relayState ctx serverStream testPeerId connectReq
                          (\_pid -> pure (Just relayStopStream))
       withAsync runConnect $ \connectAsync -> do
         -- Fake target refuses the incoming circuit
@@ -379,11 +539,9 @@ spec = do
             }
           -- Limit of 5 bytes per direction
           limitCfg = Just RelayLimit { rlDuration = Nothing, rlData = Just 5 }
-      -- Queue 6 bytes (one past the limit) before starting the bridge.
-      -- NOTE (#177): the bridge currently only detects the limit after
-      -- reading byte limit+1 from the source; sending exactly `limit` bytes
-      -- does not terminate the circuit. This test therefore sends limit+1
-      -- bytes and asserts termination, forwarding cut-off, and stream close.
+      -- Queue 6 bytes (one past the limit) before starting the bridge. The
+      -- bridge must cut the circuit at exactly `limit` forwarded bytes and
+      -- leave byte limit+1 unconsumed (see the exact-at-limit test below).
       streamWrite streamA1 (BS.pack [1, 2, 3, 4, 5, 6])
       result <- race
         (bridgeStreams limitCfg
@@ -397,6 +555,27 @@ spec = do
       bs <- mapM (\_ -> streamReadByte streamB2) [1..5 :: Int]
       bs `shouldBe` [1, 2, 3, 4, 5]
       -- Both sides of the circuit must be torn down
+      readIORef closedA `shouldReturn` True
+      readIORef closedB `shouldReturn` True
+
+    it "should terminate the bridge once exactly the data limit has been forwarded" $ do
+      (streamA1, streamA2) <- mkStreamPair
+      (streamB1, streamB2) <- mkStreamPair
+      closedA <- newIORef False
+      closedB <- newIORef False
+      let trackClose ref s = s { streamClose = modifyIORef' ref (const True) }
+          limitCfg = Just RelayLimit { rlDuration = Nothing, rlData = Just 5 }
+      -- Exactly the limit's worth of data: the circuit must terminate on its
+      -- own without the bridge having to consume byte limit+1 first.
+      streamWrite streamA1 (BS.pack [1, 2, 3, 4, 5])
+      result <- race
+        (bridgeStreams limitCfg
+           (trackClose closedA streamA2)
+           (trackClose closedB streamB1))
+        (threadDelay 2000000)
+      result `shouldBe` Left ()
+      bs <- mapM (\_ -> streamReadByte streamB2) [1..5 :: Int]
+      bs `shouldBe` [1, 2, 3, 4, 5]
       readIORef closedA `shouldReturn` True
       readIORef closedB `shouldReturn` True
 
@@ -452,3 +631,14 @@ spec = do
       isRelayedConnection circuitAddr `shouldBe` True
       isRelayedConnection directAddr `shouldBe` False
       isRelayedConnection BS.empty `shouldBe` False
+
+    it "should not report a relayed connection when a peer id merely contains the p2p-circuit byte pattern" $ do
+      -- The varint encoding of the p2p-circuit code (290) is 0xA2 0x02. A
+      -- substring scan misfires when those bytes appear inside another
+      -- component, e.g. an identity-multihash peer id with digest A2 02.
+      let trickyPeerId = BS.pack [0x00, 0x02, 0xA2, 0x02]
+          directAddr = toBytes (Multiaddr [IP4 0xCB007101, TCP 4001, P2P trickyPeerId])
+      isRelayedConnection directAddr `shouldBe` False
+      -- Structural inspection must still detect a real circuit component
+      let circuitAddr = toBytes (Multiaddr [IP4 0xCB007101, TCP 4001, P2P trickyPeerId, P2PCircuit])
+      isRelayedConnection circuitAddr `shouldBe` True
