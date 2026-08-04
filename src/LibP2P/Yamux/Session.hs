@@ -20,6 +20,7 @@ module LibP2P.Yamux.Session
   ) where
 
 import Control.Concurrent.STM
+import Control.Exception (finally)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
@@ -149,11 +150,11 @@ ping sess = do
           , yhLength = pingId
           }
   atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
-  -- Wait for ACK
-  atomically $ takeTMVar waiter
+  -- Wait for ACK (or a session-failure notification)
+  result <- atomically $ takeTMVar waiter
   -- Cleanup
   atomically $ modifyTVar' (ysessPings sess) (Map.delete pingId)
-  pure (Right ())
+  pure result
 
 -- | Send a GoAway frame with the specified error code.
 -- Sets ysessShutdown to True so no new streams can be opened.
@@ -173,8 +174,14 @@ sendGoAway sess code = do
 
 -- | Receive loop: reads 12-byte headers from transport and dispatches frames.
 -- This loop runs until the transport connection is closed or an error occurs.
+--
+-- Whenever the loop terminates -- transport EOF or error (ysessRead
+-- throws), a fatal protocol error, or cancellation -- the session is
+-- torn down via failSession so that no reader, writer or ping waiter
+-- is left blocked forever on a session that can no longer make
+-- progress.
 recvLoop :: YamuxSession -> IO ()
-recvLoop sess = go
+recvLoop sess = go `finally` failSession sess
   where
     go = do
       -- Read 12-byte header
@@ -190,6 +197,23 @@ recvLoop sess = go
             else do
               continue <- dispatchFrame sess hdr
               when continue go
+
+-- | Tear down the session once the receive loop can no longer make
+-- progress (transport EOF mid-frame, transport error, or a fatal
+-- protocol error). Mirrors go-yamux, which closes every stream with
+-- the session error on exit: new streams are refused, every registered
+-- stream is reset so blocked readers and writers observe an error
+-- instead of hanging, and every pending ping fails with
+-- YamuxSessionShutdown.
+failSession :: YamuxSession -> IO ()
+failSession sess = atomically $ do
+  writeTVar (ysessShutdown sess) True
+  streams <- readTVar (ysessStreams sess)
+  mapM_ (\s -> writeTVar (ysState s) StreamReset) (Map.elems streams)
+  writeTVar (ysessStreams sess) Map.empty
+  pings <- readTVar (ysessPings sess)
+  mapM_ (\w -> tryPutTMVar w (Left YamuxSessionShutdown)) (Map.elems pings)
+  writeTVar (ysessPings sess) Map.empty
 
 -- | Dispatch a decoded frame to the appropriate handler.
 -- Returns False when a fatal protocol error occurred and the receive
@@ -404,7 +428,7 @@ handlePing sess hdr
       atomically $ do
         pMap <- readTVar (ysessPings sess)
         case Map.lookup pingId pMap of
-          Just waiter -> putTMVar waiter ()
+          Just waiter -> putTMVar waiter (Right ())
           Nothing -> pure ()
   | otherwise = pure ()
 

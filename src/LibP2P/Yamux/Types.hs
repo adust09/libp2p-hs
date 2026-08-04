@@ -10,6 +10,7 @@ module LibP2P.Yamux.Types
   , YamuxError (..)
   , YamuxStream (..)
   , YamuxSession (..)
+  , PingWaiter
   ) where
 
 import Control.Concurrent.STM (TBQueue, TMVar, TQueue, TVar)
@@ -17,6 +18,10 @@ import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word32)
 import LibP2P.Yamux.Frame (GoAwayCode, YamuxHeader)
+
+-- | Result delivered to a pending ping waiter: Right on a matching ACK,
+-- Left when the session dies before the ACK arrives.
+type PingWaiter = TMVar (Either YamuxError ())
 
 -- | SessionRole determines stream ID parity (spec.md §Stream Identification).
 -- Client uses odd IDs (1, 3, 5, ...), Server uses even IDs (2, 4, 6, ...).
@@ -65,7 +70,7 @@ data YamuxSession = YamuxSession
   , ysessSendCh :: !(TQueue (YamuxHeader, ByteString)) -- ^ Outbound frame queue
   , ysessShutdown :: !(TVar Bool) -- ^ Local GoAway sent
   , ysessRemoteGoAway :: !(TVar (Maybe GoAwayCode)) -- ^ Code of the remote GoAway, if one was received
-  , ysessPings :: !(TVar (Map.Map Word32 (TMVar ()))) -- ^ Pending ping responses
+  , ysessPings :: !(TVar (Map.Map Word32 PingWaiter)) -- ^ Pending ping responses
   , ysessNextPingId :: !(TVar Word32)
   , ysessWrite :: !(ByteString -> IO ()) -- ^ Underlying transport write
   , ysessRead :: !(Int -> IO ByteString) -- ^ Underlying transport read exact N bytes
