@@ -55,6 +55,31 @@ mkScriptedStream canned = do
         }
   pure (stream, readIORef writtenRef)
 
+-- | Like 'mkScriptedStream', but additionally snapshots everything the
+-- code under test had written at the moment of its FIRST read. Lets a
+-- transcript assert pipelining: which bytes were already on the wire
+-- before the initiator started waiting for the peer's reply.
+mkScriptedStreamSnapshottingFirstRead
+  :: ByteString -> IO (StreamIO, IO (Maybe ByteString))
+mkScriptedStreamSnapshottingFirstRead canned = do
+  writtenRef <- newIORef BS.empty
+  readRef <- newIORef canned
+  firstReadRef <- newIORef Nothing
+  let stream = StreamIO
+        { streamWrite = \bs -> modifyIORef' writtenRef (`BS.append` bs)
+        , streamReadByte = do
+            snapshot <- readIORef firstReadRef
+            case snapshot of
+              Just _ -> pure ()
+              Nothing -> readIORef writtenRef >>= writeIORef firstReadRef . Just
+            buf <- readIORef readRef
+            case BS.uncons buf of
+              Nothing -> ioError (userError "scripted stream: EOF")
+              Just (b, rest) -> writeIORef readRef rest >> pure b
+        , streamClose = pure ()
+        }
+  pure (stream, readIORef firstReadRef)
+
 -- multistream-select vectors (multiformats/multistream-select README:
 -- every message is <varint-length><UTF-8 payload>\n, length includes \n).
 
@@ -93,6 +118,19 @@ spec = do
       result `shouldBe` Accepted "/noise"
       written <- getWritten
       written `shouldBe` mssHeader <> mssNoise
+
+    -- multistream-select README (select flow): "the initiator SHOULD
+    -- pipeline the multistream protocol id and the desired protocol id
+    -- in the same packet", saving one round trip per negotiation. Both
+    -- messages must already be on the wire when the initiator first
+    -- blocks on the responder's reply.
+    it "initiator pipelines header and first proposal before its first read" $ do
+      (stream, getWrittenAtFirstRead) <-
+        mkScriptedStreamSnapshottingFirstRead (mssHeader <> mssNoise)
+      result <- negotiateInitiator stream ["/noise"]
+      result `shouldBe` Accepted "/noise"
+      writtenAtFirstRead <- getWrittenAtFirstRead
+      writtenAtFirstRead `shouldBe` Just (mssHeader <> mssNoise)
 
     it "initiator falls back to its second protocol on na" $ do
       (stream, getWritten) <- mkScriptedStream (mssHeader <> mssNa <> mssYamux)
