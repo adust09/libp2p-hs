@@ -552,6 +552,20 @@ spec = do
         seen <- readTVarIO (gsSeen router)
         Map.size seen `shouldBe` 1
 
+      -- #217: anonymous messages carry neither from nor seqno; if their ids
+      -- collapsed to one value, the second publish would be deduplicated away
+      -- and the mcache entry overwritten.
+      it "keeps distinct anonymous publishes distinct under StrictNoSign" $ do
+        let params = defaultGossipSubParams { paramSignaturePolicy = StrictNoSign }
+        (router, _) <- mkTestRouterWithParams params localPid
+        addSubscribedPeer router (mkPeerId 1) "blocks"
+        publish router "blocks" (BS.pack [1]) Nothing
+        publish router "blocks" (BS.pack [2]) Nothing
+        seen <- readTVarIO (gsSeen router)
+        Map.size seen `shouldBe` 2
+        cache <- readTVarIO (gsMessageCache router)
+        Map.size (mcIndex cache) `shouldBe` 2
+
       it "signs the message and the result verifies under StrictSign" $ do
         kp <- newKeyPair
         (router, logRef) <- mkTestRouter (fromPublicKey (kpPublic kp))

@@ -59,14 +59,18 @@ module LibP2P.Protocol.GossipSub.Types
 
 import Control.Concurrent.STM (TVar)
 import Control.Exception (Exception)
+import qualified Crypto.Hash as Hash
+import qualified Data.ByteArray as BA
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.Maybe (fromMaybe)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Sequence (Seq)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import qualified Data.Text.Encoding as TE
 import Data.Time (NominalDiffTime, UTCTime)
 import Data.Word (Word64)
 import LibP2P.Crypto.PeerId (PeerId)
@@ -214,12 +218,17 @@ data GossipSubParams = GossipSubParams
     -- peers always exchange messages and are never mesh members
   }
 
--- | Default message ID: concatenation of from and seqno fields.
+-- | Default message ID: concatenation of from and seqno fields. Anonymous
+-- messages (StrictNoSign) carry neither field, and a shared empty id would
+-- collapse seen-cache dedup, the mcache and IHAVE/IWANT tracking, so those
+-- fall back to a content-addressed id of @SHA-256(topic <> data)@ (#217).
 defaultMessageId :: PubSubMessage -> MessageId
 defaultMessageId msg =
-  let from = maybe BS.empty id (msgFrom msg)
-      seqno = maybe BS.empty id (msgSeqNo msg)
-  in from <> seqno
+  case (msgFrom msg, msgSeqNo msg) of
+    (Nothing, Nothing) ->
+      BA.convert (Hash.hash (TE.encodeUtf8 (msgTopic msg) <> msgData msg) :: Hash.Digest Hash.SHA256)
+    (from, seqno) ->
+      fromMaybe BS.empty from <> fromMaybe BS.empty seqno
 
 -- | Default GossipSub parameters per spec.
 defaultGossipSubParams :: GossipSubParams
