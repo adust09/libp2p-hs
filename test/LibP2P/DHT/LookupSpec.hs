@@ -348,7 +348,76 @@ spec = do
       let entriesB = filter ((== pidB) . entryPeerId) result
       map entryAddrs entriesB `shouldBe` [[addrB]]
 
+    -- Issue #148 (4): "Peers encountered throughout the search are
+    -- inserted in the routing table, as per usual business."
+    it "inserts peers discovered during the lookup into the routing table" $ do
+      now <- getCurrentTime
+      let pidA = mkPeerId (BS.pack [10])
+          pidB = mkPeerId (BS.pack [20])
+          pidC = mkPeerId (BS.pack [30])
+          targetPid = mkPeerId (BS.pack [42, 42, 42, 42])
+          wantKey = peerIdBytes targetPid
+          network = Map.fromList
+            [ (pidA, expecting FindNode wantKey
+                (findNodeReply [DHTPeer (peerIdBytes pidB) [] NotConnected]))
+            , (pidB, expecting FindNode wantKey
+                (findNodeReply [DHTPeer (peerIdBytes pidC) [] NotConnected]))
+            , (pidC, expecting FindNode wantKey (findNodeReply []))
+            ]
+      node <- mkNodeWithMock localPid (mockSendFromNetwork network)
+      let entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        fst (insertPeer entryA rt)
+
+      _ <- iterativeFindNode node targetPid
+      rt <- readTVarIO (dhtRoutingTable node)
+      let tablePids = map entryPeerId (allPeers rt)
+      tablePids `shouldContain` [pidB]
+      tablePids `shouldContain` [pidC]
+
   describe "iterativeGetValue" $ do
+    -- Issue #148 (1): the validator must also gate values retrieved in
+    -- GET_VALUE queries, not just PUT_VALUE storage.
+    it "ignores retrieved records that fail validation" $ do
+      now <- getCurrentTime
+      let pidA = mkPeerId (BS.pack [10])
+          pidB = mkPeerId (BS.pack [20])
+          key = BS.pack [0xCA, 0xFE]
+          badRecord = DHTRecord key (BS.pack [0xBA, 0xD0]) ""
+          goodRecord = DHTRecord key (BS.pack [0x60, 0x0D]) ""
+          network = Map.fromList
+            [ (pidA, expecting GetValue key (emptyDHTMessage
+                { msgType = GetValue
+                , msgRecord = Just badRecord
+                , msgCloserPeers = [DHTPeer (peerIdBytes pidB) [] NotConnected]
+                }))
+            , (pidB, \req -> case msgType req of
+                GetValue -> expecting GetValue key (emptyDHTMessage
+                  { msgType = GetValue
+                  , msgRecord = Just goodRecord
+                  , msgCloserPeers = []
+                  }) req
+                -- The invalid record's holder may receive a repair.
+                PutValue -> expecting PutValue key
+                  (emptyDHTMessage { msgType = PutValue, msgKey = key }) req
+                other -> Left $ "mock: unexpected request type " ++ show other)
+            ]
+          validator = Validator
+            { valValidate = \_ value ->
+                if value == recValue badRecord
+                  then Left "invalid record"
+                  else Right ()
+            , valSelect = \_ _ -> Right 0
+            }
+      node <- mkNodeWithMock localPid (mockSendFromNetwork network)
+      let entryA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        fst (insertPeer entryA rt)
+
+      result <- iterativeGetValue node validator key
+      case result of
+        Right rec -> recValue rec `shouldBe` recValue goodRecord
+        Left err -> expectationFailure $ "Expected the valid record, got: " ++ err
     it "sends the raw record key as the wire key" $ do
       now <- getCurrentTime
       sentKeysRef <- newIORef ([] :: [BS.ByteString])

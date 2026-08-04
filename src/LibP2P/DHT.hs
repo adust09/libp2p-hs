@@ -12,12 +12,18 @@ module LibP2P.DHT
   , DHTMode (..)
   , ProviderEntry (..)
   , Validator (..)
+    -- * Validators
+  , defaultValidator
+  , namespacedValidator
+  , pkValidator
     -- * Construction
   , newDHTNode
     -- * Handler registration
   , registerDHTHandler
     -- * Inbound RPC handler
   , handleDHTRequest
+    -- * Routing table maintenance
+  , addPeerToTable
     -- * Store operations
   , storeRecord
   , lookupRecord
@@ -27,20 +33,36 @@ module LibP2P.DHT
   , decodePeerAddrs
     -- * Constants
   , dhtProtocolId
+  , providerRecordTTL
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, catch, try)
 import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
-import Data.Time (UTCTime, getCurrentTime)
+import qualified Data.Text as T
+import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
+import Data.Time.Format.ISO8601 (iso8601Show)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT.Distance (keyToDHTKey, peerIdToKey)
 import LibP2P.DHT.Message
-import LibP2P.DHT.RoutingTable (RoutingTable, closestPeers, newRoutingTable)
+import LibP2P.DHT.RoutingTable
+  ( RoutingTable
+  , allPeers
+  , closestPeers
+  , insertPeer
+  , newRoutingTable
+  , removePeer
+  )
 import LibP2P.DHT.Types
+import LibP2P.DHT.Validator
+  ( Validator (..)
+  , defaultValidator
+  , namespacedValidator
+  , pkValidator
+  )
 import LibP2P.Multiaddr (Multiaddr, fromBytes, toBytes)
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
@@ -66,11 +88,10 @@ data ProviderEntry = ProviderEntry
   , peTimestamp :: !UTCTime
   } deriving (Show, Eq)
 
--- | Validator interface for record validation.
-data Validator = Validator
-  { valValidate :: ByteString -> ByteString -> Either String ()
-  , valSelect   :: ByteString -> [ByteString] -> Either String Int
-  }
+-- | Provider record expiration interval, per specs/kad-dht (48 hours).
+-- Expired entries are pruned on read in 'getProviders'.
+providerRecordTTL :: NominalDiffTime
+providerRecordTTL = 48 * 3600
 
 -- | Top-level DHT node state.
 data DHTNode = DHTNode
@@ -81,6 +102,10 @@ data DHTNode = DHTNode
   , dhtLocalKey      :: !DHTKey
   , dhtLocalPeerId   :: !PeerId
   , dhtMode          :: !DHTMode
+  , dhtValidator     :: !Validator
+    -- ^ Record validator applied to PUT_VALUE records before storage
+    -- (and available to GET_VALUE conflict resolution). Defaults to
+    -- 'defaultValidator' (the @/pk/@ namespace).
   , dhtStreams       :: !(TVar (Map PeerId StreamIO))
     -- ^ Cached outbound @/ipfs/kad/1.0.0@ streams, one per peer
     -- (go-libp2p reuses a single long-lived stream per peer)
@@ -105,15 +130,23 @@ newDHTNode sw mode = do
     , dhtLocalKey      = peerIdToKey localPid
     , dhtLocalPeerId   = localPid
     , dhtMode          = mode
+    , dhtValidator     = defaultValidator
     , dhtStreams       = streams
     , dhtSendRequest   = sendRequestViaSwitch sw streams
     }
 
--- | Register the DHT handler on the Switch (server mode only).
+-- | Register the DHT handler on the Switch.
+--
+-- Per specs/kad-dht (client and server mode), nodes operating in client
+-- mode do not offer the Kademlia protocol identifier for incoming
+-- streams, so this is a no-op for 'DHTClient' nodes: they keep issuing
+-- outbound queries via 'dhtSendRequest' but never serve inbound RPC.
 registerDHTHandler :: DHTNode -> IO ()
-registerDHTHandler node =
-  setStreamHandler (dhtSwitch node) dhtProtocolId
-    (\conn stream -> handleDHTRequest node stream (connPeerId conn))
+registerDHTHandler node = case dhtMode node of
+  DHTClient -> pure ()
+  DHTServer ->
+    setStreamHandler (dhtSwitch node) dhtProtocolId
+      (\conn stream -> handleDHTRequest node stream (connPeerId conn))
 
 -- | Handle an inbound DHT stream.
 --
@@ -132,6 +165,18 @@ handleDHTRequest node stream remotePeerId = loop
           Right msg -> do
             response <- processRequest node msg remotePeerId
             writeFramedMessage stream response
+            -- Routing-table growth: a peer speaking the DHT protocol to
+            -- us is a live contact; insert (or refresh) it. Note this
+            -- cannot distinguish client-mode senders (the spec would
+            -- exclude them) without identify-provided protocol lists.
+            now <- getCurrentTime
+            _ <- addPeerToTable node BucketEntry
+              { entryPeerId   = remotePeerId
+              , entryKey      = peerIdToKey remotePeerId
+              , entryAddrs    = []
+              , entryLastSeen = now
+              , entryConnType = Connected
+              }
             pure (Right ())
       case result of
         Left (_ :: SomeException) -> pure ()  -- Stream closed or reset
@@ -179,18 +224,36 @@ handleGetValue node msg = do
     , msgCloserPeers = peers
     }
 
--- | PUT_VALUE: store record and echo it back.
+-- | PUT_VALUE: validate, store with a receiver-set timestamp, and echo.
+--
+-- Per specs/kad-dht (Entry validation), incoming records are validated
+-- before being stored: the record key must match the message key and
+-- the configured 'dhtValidator' must accept the key/value binding
+-- (e.g. @/pk/@ records must carry the public key hashing to the key's
+-- multihash). Rejected records are neither stored nor echoed back.
+--
+-- The stored record's @timeReceived@ is set by the receiver (Record
+-- field 5: "Time the record was received, set by receiver"), never
+-- taken from the sender's claim.
 handlePutValue :: DHTNode -> DHTMessage -> IO DHTMessage
 handlePutValue node msg = do
   case msgRecord msg of
-    Nothing -> pure emptyDHTMessage { msgType = PutValue }
-    Just rec -> do
-      storeRecord node rec
-      pure emptyDHTMessage
-        { msgType = PutValue
-        , msgKey = msgKey msg
-        , msgRecord = Just rec
-        }
+    Nothing -> pure rejected
+    Just rec
+      | recKey rec /= msgKey msg -> pure rejected
+      | otherwise ->
+          case valValidate (dhtValidator node) (recKey rec) (recValue rec) of
+            Left _err -> pure rejected
+            Right () -> do
+              now <- getCurrentTime
+              storeRecord node rec { recTimeReceived = T.pack (iso8601Show now) }
+              pure emptyDHTMessage
+                { msgType = PutValue
+                , msgKey = msgKey msg
+                , msgRecord = Just rec
+                }
+  where
+    rejected = emptyDHTMessage { msgType = PutValue }
 
 -- | ADD_PROVIDER: verify sender and store provider record.
 handleAddProvider :: DHTNode -> DHTMessage -> PeerId -> IO DHTMessage
@@ -206,19 +269,69 @@ handleAddProvider node msg remotePeerId = do
 handleGetProviders :: DHTNode -> DHTMessage -> IO DHTMessage
 handleGetProviders node msg = do
   rt <- readTVarIO (dhtRoutingTable node)
-  providerMap <- readTVarIO (dhtProviderStore node)
   let key = msgKey msg
       -- Store lookup uses the raw key; distance uses its SHA-256.
       targetKey = keyToDHTKey key
       closest = closestPeers targetKey kValue rt
       closerPeers = map entryToDHTPeer closest
-      providers = Map.findWithDefault [] key providerMap
-      providerPeers = map providerToDHTPeer providers
+  -- getProviders prunes entries past the 48h provider TTL on read.
+  providers <- getProviders node key
+  let providerPeers = map providerToDHTPeer providers
   pure emptyDHTMessage
     { msgType = GetProviders
     , msgCloserPeers = closerPeers
     , msgProviderPeers = providerPeers
     }
+
+-- Routing table maintenance
+
+-- | Insert a peer into the routing table, applying the Kademlia
+-- full-bucket eviction policy.
+--
+-- When the target bucket is full, the least-recently-seen peer is
+-- probed with a FIND_NODE request (the DHT liveness check; our
+-- 'MessageType' has no PING, and go-libp2p likewise treats any
+-- successful RPC as proof of liveness):
+--
+-- * if the LRS peer answers, it is kept (refreshed to
+--   most-recently-seen) and the new peer is dropped ('BucketFull');
+-- * if it does not answer, it is evicted and the new peer takes its
+--   place ('Inserted').
+addPeerToTable :: DHTNode -> BucketEntry -> IO InsertResult
+addPeerToTable node entry = do
+  result <- atomically $ do
+    rt <- readTVar (dhtRoutingTable node)
+    let (rt', res) = insertPeer entry rt
+    writeTVar (dhtRoutingTable node) rt'
+    pure res
+  case result of
+    BucketFull lrs -> evictOrKeep lrs
+    other -> pure other
+  where
+    evictOrKeep lrs = do
+      let ping = emptyDHTMessage { msgType = FindNode, msgKey = peerIdBytes lrs }
+      response <- dhtSendRequest node lrs ping
+        `catch` \(e :: SomeException) -> pure (Left (show e))
+      case response of
+        Right _ -> do
+          -- LRS peer is alive: move it to most-recently-seen and drop
+          -- the newcomer.
+          now <- getCurrentTime
+          atomically $ modifyTVar' (dhtRoutingTable node) (refreshPeer lrs now)
+          pure (BucketFull lrs)
+        Left _ -> do
+          -- LRS peer is dead: evict it and insert the newcomer.
+          atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+            fst (insertPeer entry (removePeer lrs rt))
+          pure Inserted
+
+-- | Move an existing peer to the most-recently-seen position of its
+-- bucket with a fresh last-seen timestamp. No-op if the peer is gone.
+refreshPeer :: PeerId -> UTCTime -> RoutingTable -> RoutingTable
+refreshPeer pid now rt =
+  case filter ((== pid) . entryPeerId) (allPeers rt) of
+    (e : _) -> fst (insertPeer e { entryLastSeen = now } rt)
+    [] -> rt
 
 -- Outbound RPC
 
@@ -299,15 +412,30 @@ lookupRecord :: DHTNode -> ByteString -> IO (Maybe DHTRecord)
 lookupRecord node key = Map.lookup key <$> readTVarIO (dhtRecordStore node)
 
 -- | Add a provider entry for a content key.
+--
+-- A provider republishing on schedule replaces its previous entry
+-- (deduplicated by peer ID) instead of appending a duplicate, so the
+-- entry's timestamp is refreshed and GET_PROVIDERS responses stay
+-- bounded.
 addProvider :: DHTNode -> ByteString -> ProviderEntry -> IO ()
 addProvider node key entry = atomically $
   modifyTVar' (dhtProviderStore node) $ \m ->
-    Map.insertWith (++) key [entry] m
+    Map.insertWith merge key [entry] m
+  where
+    merge new old = new ++ filter (\e -> peProvider e /= peProvider entry) old
 
--- | Get providers for a content key.
+-- | Get providers for a content key, pruning entries older than
+-- 'providerRecordTTL' (48h expiration interval per specs/kad-dht).
 getProviders :: DHTNode -> ByteString -> IO [ProviderEntry]
-getProviders node key =
-  Map.findWithDefault [] key <$> readTVarIO (dhtProviderStore node)
+getProviders node key = do
+  now <- getCurrentTime
+  atomically $ do
+    m <- readTVar (dhtProviderStore node)
+    let live = filter (\e -> diffUTCTime now (peTimestamp e) < providerRecordTTL)
+                      (Map.findWithDefault [] key m)
+        m' = if null live then Map.delete key m else Map.insert key live m
+    writeTVar (dhtProviderStore node) m'
+    pure live
 
 -- Helpers
 
