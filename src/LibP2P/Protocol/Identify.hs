@@ -36,7 +36,8 @@ import Control.Exception (SomeException, catch)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
-import LibP2P.Crypto.Protobuf (encodePublicKey)
+import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
+import LibP2P.Crypto.Protobuf (decodePublicKey, encodePublicKey)
 import LibP2P.Crypto.Key (kpPublic)
 import LibP2P.Multiaddr.Codec (encodeProtocols)
 import LibP2P.Multiaddr (Multiaddr (..))
@@ -83,13 +84,17 @@ handleIdentify sw conn stream = do
 -- | Request Identify from a remote peer (initiator side).
 --
 -- Opens a new stream, negotiates /ipfs/id/1.0.0, then reads one
--- varint-length-prefixed protobuf message.
+-- varint-length-prefixed protobuf message. The publicKey field is
+-- validated against the connection's authenticated peer id (see
+-- 'validatePublicKey').
 requestIdentify :: Connection -> IO (Either String IdentifyInfo)
 requestIdentify conn = do
   stream <- muxOpenStream (connSession conn)
   result <- negotiateInitiator stream [identifyProtocolId]
   case result of
-    Accepted _ -> readFramedIdentify stream maxIdentifySize
+    Accepted _ ->
+      fmap (validatePublicKey (connPeerId conn))
+        <$> readFramedIdentify stream maxIdentifySize
     NoProtocol -> pure (Left "remote does not support identify")
 
 -- | Handle an inbound Identify Push (responder side).
@@ -106,11 +111,30 @@ handleIdentifyPush sw conn stream = do
   infoOrErr <- readFramedIdentify stream maxIdentifySize
   case infoOrErr of
     Left _ -> pure ()
-    Right info -> atomically $ do
-      store <- readTVar (swPeerStore sw)
-      let merged = maybe info (`mergeIdentify` info)
-                     (Map.lookup (connPeerId conn) store)
-      writeTVar (swPeerStore sw) (Map.insert (connPeerId conn) merged store)
+    Right rawInfo -> do
+      let info = validatePublicKey (connPeerId conn) rawInfo
+      atomically $ do
+        store <- readTVar (swPeerStore sw)
+        let merged = maybe info (`mergeIdentify` info)
+                       (Map.lookup (connPeerId conn) store)
+        writeTVar (swPeerStore sw) (Map.insert (connPeerId conn) merged store)
+
+-- | Enforce the identify spec's key/peer-id binding: the publicKey
+-- field must derive the sender's peer id, which the security handshake
+-- has already authenticated.
+--
+-- A key that fails to decode or derives a different peer id is an
+-- identity claim the sender cannot back up, so it is dropped from the
+-- message (matching go-libp2p, which discards the key and keeps the
+-- connection — it is already authenticated). The rest of the message
+-- is untouched, and previously known good data stays intact because
+-- 'mergeIdentify' keeps the known key when the update carries none.
+validatePublicKey :: PeerId -> IdentifyInfo -> IdentifyInfo
+validatePublicKey remotePeer info = case idPublicKey info of
+  Nothing -> info
+  Just keyBytes -> case decodePublicKey keyBytes of
+    Right pk | fromPublicKey pk == remotePeer -> info
+    _ -> info { idPublicKey = Nothing }
 
 -- | Merge a received (possibly partial) Identify update into the
 -- previously known info for a peer.

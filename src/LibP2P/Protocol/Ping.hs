@@ -48,6 +48,7 @@ module LibP2P.Protocol.Ping
   , maxPingStreamsPerPeer
   ) where
 
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Concurrent.STM
   ( TVar
   , atomically
@@ -58,7 +59,6 @@ import Control.Concurrent.STM
   )
 import Control.Exception (SomeException, catch, finally, try)
 import Control.Monad (unless)
-import qualified Data.ByteString as BS
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
@@ -164,9 +164,15 @@ handlePingLimited (PingLimiter countsVar) stream peer = do
 -- pings with 'ping', and always release with 'closePingSession'. A
 -- session whose ping failed (timeout, mismatch, I/O error) closes its
 -- stream immediately and rejects further pings.
+--
+-- Concurrent 'ping' calls on one session are serialized on 'psLock':
+-- exactly one write/echo exchange runs on the stream at a time, so
+-- concurrent callers queue instead of interleaving their 32-byte
+-- payloads on the wire.
 data PingSession = PingSession
   { psStream :: !StreamIO
   , psClosed :: !(IORef Bool)
+  , psLock   :: !(MVar ())  -- ^ Held for the duration of one ping exchange
   }
 
 -- | Open a ping stream on the connection and negotiate the protocol.
@@ -186,7 +192,8 @@ openPingSession sw conn = do
       case negotiated of
         Right (Accepted _) -> do
           closedRef <- newIORef False
-          pure (Right (PingSession stream closedRef))
+          lock <- newMVar ()
+          pure (Right (PingSession stream closedRef lock))
         Right NoProtocol -> do
           closeQuietly stream
           pure (Left (PingStreamError "remote does not support ping"))
@@ -203,8 +210,13 @@ ping = pingWithTimeout pingTimeoutMicros
 -- microseconds for the echo. On failure the session is closed: a stream
 -- whose echo timed out or went wrong cannot be reused, because a late
 -- echo would corrupt the next ping.
+--
+-- The whole exchange runs under the session lock, so concurrent callers
+-- are queued one after another on the single stream. The closed check
+-- happens under the lock too: a caller queued behind a failed ping sees
+-- the session as closed instead of writing into a poisoned stream.
 pingWithTimeout :: Int -> PingSession -> IO (Either PingError PingResult)
-pingWithTimeout timeoutUs sess = do
+pingWithTimeout timeoutUs sess = withMVar (psLock sess) $ \() -> do
   closed <- readIORef (psClosed sess)
   if closed
     then pure (Left (PingStreamError "ping session is closed"))

@@ -280,6 +280,36 @@ spec = do
         opens <- readIORef opensRef
         opens `shouldBe` 1
 
+    it "10 concurrent pings on one session share a single outbound stream" $ do
+      -- ping.md: "The dialing peer MUST NOT keep more than one outbound
+      -- stream for the ping protocol per peer" — even when callers ping
+      -- concurrently, the session serializes them on its one stream and
+      -- every ping still gets its own matching echo.
+      withConnectedPair $ \(swA, _pidA) _nodeB conn -> do
+        opensRef <- newIORef (0 :: Int)
+        let realSession = connSession conn
+            countingSession = realSession
+              { muxOpenStream = do
+                  modifyIORef' opensRef (+ 1)
+                  muxOpenStream realSession
+              }
+            countingConn = conn { connSession = countingSession }
+        result <- timeout 30000000 $ withPingSession swA countingConn $ \sess ->
+          forConcurrently [1 .. 10 :: Int] $ \_ -> ping sess
+        case result of
+          Nothing -> expectationFailure "concurrent ping session timed out"
+          Just (Left err) ->
+            expectationFailure $ "ping session failed to open: " ++ show err
+          Just (Right results) -> do
+            length results `shouldBe` 10
+            mapM_
+              (\r -> case r of
+                 Right (PingResult rtt) -> rtt `shouldSatisfy` (> 0)
+                 Left err -> expectationFailure $ "concurrent ping failed: " ++ show err)
+              results
+        opens <- readIORef opensRef
+        opens `shouldBe` 1
+
     it "unknown protocol gets na over real TCP and the connection stays usable" $ do
       withConnectedPair $ \(swA, _pidA) _nodeB conn -> do
         stream <- muxOpenStream (connSession conn)

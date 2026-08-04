@@ -348,6 +348,148 @@ spec = do
           idAgentVersion merged `shouldBe` Just "go-libp2p/0.36.0"
           idProtocolVersion merged `shouldBe` Just "ipfs/0.1.0"
 
+    it "handleIdentifyPush stores a publicKey that derives the authenticated peer id" $ do
+      -- specs/identify: receivers must validate that the publicKey
+      -- derives the sender's peer id. A key that matches the peer id
+      -- authenticated by the security handshake is stored.
+      sw <- mkTestSwitch
+      Right remoteKp <- generateKeyPair
+      let remotePid = fromPublicKey (kpPublic remoteKp)
+          remoteKey = encodePublicKey (kpPublic remoteKp)
+          pushInfo = emptyInfo
+            { idPublicKey    = Just remoteKey
+            , idAgentVersion = Just "go-libp2p/0.36.0"
+            }
+      (streamA, streamB) <- mkClosableStreamPair
+      streamWrite streamA (frame (encodeIdentify pushInfo))
+      streamClose streamA
+      conn <- mkTestConnection remotePid (Multiaddr [IP4 0x7f000001, TCP 4001])
+      handleIdentifyPush sw conn streamB
+      store <- atomically $ readTVar (swPeerStore sw)
+      fmap idPublicKey (Map.lookup remotePid store) `shouldBe` Just (Just remoteKey)
+
+    it "handleIdentifyPush drops a publicKey that does not derive the authenticated peer id" $ do
+      -- A pushed key deriving some other peer id is an identity claim
+      -- the sender cannot back up: discard the key (go-libp2p behaviour;
+      -- the connection is already authenticated by Noise), keep the
+      -- known-good key, and still apply the rest of the update.
+      sw <- mkTestSwitch
+      Right remoteKp <- generateKeyPair
+      Right otherKp  <- generateKeyPair
+      let remotePid = fromPublicKey (kpPublic remoteKp)
+          knownKey  = encodePublicKey (kpPublic remoteKp)
+          wrongKey  = encodePublicKey (kpPublic otherKp)
+          knownInfo = emptyInfo
+            { idPublicKey    = Just knownKey
+            , idAgentVersion = Just "agent/1.0"
+            }
+      atomically $ do
+        store <- readTVar (swPeerStore sw)
+        writeTVar (swPeerStore sw) (Map.insert remotePid knownInfo store)
+      let update = emptyInfo
+            { idPublicKey    = Just wrongKey
+            , idAgentVersion = Just "agent/2.0"
+            }
+      (streamA, streamB) <- mkClosableStreamPair
+      streamWrite streamA (frame (encodeIdentify update))
+      streamClose streamA
+      conn <- mkTestConnection remotePid (Multiaddr [IP4 0x7f000001, TCP 4001])
+      handleIdentifyPush sw conn streamB
+      store <- atomically $ readTVar (swPeerStore sw)
+      case Map.lookup remotePid store of
+        Nothing -> expectationFailure "expected peer in store"
+        Just stored -> do
+          -- The mismatched key is not stored; the known-good key survives.
+          idPublicKey stored `shouldBe` Just knownKey
+          -- Validation only touches the key: the rest of the update merges.
+          idAgentVersion stored `shouldBe` Just "agent/2.0"
+
+    it "handleIdentifyPush does not store a mismatched publicKey for an unknown peer" $ do
+      sw <- mkTestSwitch
+      Right remoteKp <- generateKeyPair
+      Right otherKp  <- generateKeyPair
+      let remotePid = fromPublicKey (kpPublic remoteKp)
+          wrongKey  = encodePublicKey (kpPublic otherKp)
+          update = emptyInfo
+            { idPublicKey    = Just wrongKey
+            , idAgentVersion = Just "agent/2.0"
+            }
+      (streamA, streamB) <- mkClosableStreamPair
+      streamWrite streamA (frame (encodeIdentify update))
+      streamClose streamA
+      conn <- mkTestConnection remotePid (Multiaddr [IP4 0x7f000001, TCP 4001])
+      handleIdentifyPush sw conn streamB
+      store <- atomically $ readTVar (swPeerStore sw)
+      case Map.lookup remotePid store of
+        Nothing -> expectationFailure "expected peer in store"
+        Just stored -> do
+          idPublicKey stored `shouldBe` Nothing
+          idAgentVersion stored `shouldBe` Just "agent/2.0"
+
+    it "handleIdentifyPush drops a publicKey that cannot be decoded" $ do
+      -- A key that does not even parse as a PublicKey protobuf cannot be
+      -- validated against the peer id, so it must not be stored either.
+      sw <- mkTestSwitch
+      Right remoteKp <- generateKeyPair
+      let remotePid = fromPublicKey (kpPublic remoteKp)
+          update = emptyInfo { idPublicKey = Just (BS.pack [0xde, 0xad, 0xbe, 0xef]) }
+      (streamA, streamB) <- mkClosableStreamPair
+      streamWrite streamA (frame (encodeIdentify update))
+      streamClose streamA
+      conn <- mkTestConnection remotePid (Multiaddr [IP4 0x7f000001, TCP 4001])
+      handleIdentifyPush sw conn streamB
+      store <- atomically $ readTVar (swPeerStore sw)
+      fmap idPublicKey (Map.lookup remotePid store) `shouldBe` Just Nothing
+
+    it "requestIdentify drops a publicKey that does not derive the remote peer id" $ do
+      -- Response path of the same validation: the identify response is
+      -- returned with the mismatched key removed, other fields intact.
+      Right remoteKp <- generateKeyPair
+      Right otherKp  <- generateKeyPair
+      let remotePid = fromPublicKey (kpPublic remoteKp)
+          wrongKey  = encodePublicKey (kpPublic otherKp)
+          responseInfo = emptyInfo
+            { idPublicKey    = Just wrongKey
+            , idAgentVersion = Just "impostor/1.0"
+            }
+      (streamA, streamB) <- mkClosableStreamPair
+      conn <- mkPushConnection remotePid (Multiaddr [IP4 0x7f000001, TCP 4001])
+                (pure streamA)
+      remote <- async $ do
+        negResult <- negotiateResponder streamB [identifyProtocolId]
+        negResult `shouldBe` Accepted identifyProtocolId
+        streamWrite streamB (encodeFramedIdentify responseInfo)
+        streamClose streamB
+      result <- requestIdentify conn
+      wait remote
+      case result of
+        Left err -> expectationFailure $ "requestIdentify failed: " ++ err
+        Right info -> do
+          idPublicKey info `shouldBe` Nothing
+          idAgentVersion info `shouldBe` Just "impostor/1.0"
+
+    it "requestIdentify keeps a publicKey that derives the remote peer id" $ do
+      Right remoteKp <- generateKeyPair
+      let remotePid = fromPublicKey (kpPublic remoteKp)
+          remoteKey = encodePublicKey (kpPublic remoteKp)
+          responseInfo = emptyInfo
+            { idPublicKey    = Just remoteKey
+            , idAgentVersion = Just "honest/1.0"
+            }
+      (streamA, streamB) <- mkClosableStreamPair
+      conn <- mkPushConnection remotePid (Multiaddr [IP4 0x7f000001, TCP 4001])
+                (pure streamA)
+      remote <- async $ do
+        negResult <- negotiateResponder streamB [identifyProtocolId]
+        negResult `shouldBe` Accepted identifyProtocolId
+        streamWrite streamB (encodeFramedIdentify responseInfo)
+        streamClose streamB
+      result <- requestIdentify conn
+      wait remote
+      case result of
+        Left err -> expectationFailure $ "requestIdentify failed: " ++ err
+        Right info -> idPublicKey info `shouldBe` Just remoteKey
+
     it "mergeIdentify replaces present optional fields and non-empty repeated fields wholesale" $ do
       -- specs/identify: only *missing* fields are ignored. A field that
       -- is present in the update wins, and repeated fields are replaced
