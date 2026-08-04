@@ -467,3 +467,71 @@ spec = do
         Set.size kept `shouldBe` 6
         Set.member (mkPeerId 1) kept `shouldBe` True
         Set.member (mkPeerId 2) kept `shouldBe` True
+
+    -- Issue #157 remainder: direct peering, version-gated PRUNE, IHAVE cap
+    describe "Direct peers (#157)" $ do
+      it "mesh fill never GRAFTs a direct peer" $ do
+        let dp = mkPeerId 9
+        (logRef, sendFn) <- newSendLog
+        timeRef <- newIORef fixedTime
+        router <- newRouter
+          defaultGossipSubParams { paramDirectPeers = Set.singleton dp }
+          localPid sendFn (readIORef timeRef)
+        addSubscribedPeer router dp "t" fixedTime
+        addSubscribedPeer router (mkPeerId 1) "t" fixedTime
+        atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "t")
+        heartbeatOnce router
+        mesh <- readTVarIO (gsMesh router)
+        Set.member dp (Map.findWithDefault Set.empty "t" mesh) `shouldBe` False
+        Set.member (mkPeerId 1) (Map.findWithDefault Set.empty "t" mesh) `shouldBe` True
+        sent <- readIORef logRef
+        let graftTo = [ pid | (pid, rpc) <- sent
+                            , Just ctrl <- [rpcControl rpc]
+                            , not (null (ctrlGraft ctrl)) ]
+        graftTo `shouldBe` [mkPeerId 1]
+
+    describe "Protocol version gating (#157)" $ do
+      it "negative-score PRUNE to a /meshsub/1.0.0 peer omits the backoff field" $ do
+        (router, logRef, _) <- mkHeartbeatRouter localPid fixedTime
+        let pid = mkPeerId 1
+            routerNeg = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = const (-1) } }
+        addPeer routerNeg pid GossipSubV10Peer False fixedTime
+        atomically $ do
+          modifyTVar' (gsPeers routerNeg) $
+            Map.adjust (\ps -> ps { psTopics = Set.singleton "t" }) pid
+          modifyTVar' (gsMesh routerNeg) $ Map.insert "t" (Set.singleton pid)
+        heartbeatOnce routerNeg
+        sent <- readIORef logRef
+        let prunes = [ p | (to, rpc) <- sent, to == pid
+                         , Just ctrl <- [rpcControl rpc], p <- ctrlPrune ctrl ]
+        case prunes of
+          [p] -> do
+            prunePeers p `shouldBe` []
+            pruneBackoff p `shouldBe` Nothing
+          _ -> expectationFailure "expected exactly one PRUNE"
+
+    describe "IHAVE limits (#157)" $ do
+      it "caps gossip IHAVE ids at paramMaxIHaveLength" $ do
+        (logRef, sendFn) <- newSendLog
+        timeRef <- newIORef fixedTime
+        router <- newRouter
+          defaultGossipSubParams { paramMaxIHaveLength = 2 }
+          localPid sendFn (readIORef timeRef)
+        -- Topic lives in fanout so mesh maintenance does not graft the
+        -- gossip target into the mesh before gossip emission runs.
+        addSubscribedPeer router (mkPeerId 1) "t" fixedTime
+        let mkMsg n = PubSubMessage
+              { msgFrom = Nothing, msgData = BS.pack [n], msgSeqNo = Nothing
+              , msgTopic = "t", msgSignature = Nothing, msgKey = Nothing }
+        atomically $ do
+          modifyTVar' (gsFanout router) (Map.insert "t" Set.empty)
+          modifyTVar' (gsMessageCache router) $ \c ->
+            foldl (\acc n -> cachePut (BS.pack [n]) (mkMsg n) acc) c [1, 2, 3]
+        heartbeatOnce router
+        sent <- readIORef logRef
+        let ihaveIds = concat [ ihaveMessageIds ih | (_, rpc) <- sent
+                              , Just ctrl <- [rpcControl rpc]
+                              , ih <- ctrlIHave ctrl ]
+        length ihaveIds `shouldBe` 2

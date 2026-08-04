@@ -26,7 +26,7 @@ import List.Shuffle (sampleIO)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Protocol.GossipSub.Types
 import LibP2P.Protocol.GossipSub.MessageCache (cacheGetGossipIds, cacheShift)
-import LibP2P.Protocol.GossipSub.Router (selectPXPeers)
+import LibP2P.Protocol.GossipSub.Router (buildPrune)
 import LibP2P.Protocol.GossipSub.Score
   ( computeScore
   , decayPeerCounters
@@ -45,6 +45,7 @@ heartbeatOnce router = do
   expireIWantPromises router
   decayAllScores router
   cleanSeenCache router
+  resetGossipBudgets router
   -- Increment heartbeat counter
   atomically $ modifyTVar' (gsHeartbeatCount router) (+ 1)
 
@@ -78,13 +79,17 @@ meshMaintenance router = do
     -- Step 3: Trim if oversubscribed (> D_hi)
     trimOversubscribed router topic filled
 
--- | Remove peers with negative score from mesh, send PRUNE.
+-- | Remove peers with negative score from mesh, send PRUNE. Direct
+-- peers are exempt: explicit peering agreements are never scored out
+-- (gossipsub-v1.1.md; they should never be mesh members to begin with).
 pruneNegativeScore :: GossipSubRouter -> Topic -> Set.Set PeerId -> UTCTime -> IO (Set.Set PeerId)
 pruneNegativeScore router topic meshPeers now = do
   let scoreParams = gsScoreParams router
+      direct = paramDirectPeers (gsParams router)
   ipMap <- readTVarIO (gsIPPeerCount router)
   peers <- readTVarIO (gsPeers router)
   let negatives = Set.filter (\pid ->
+        not (Set.member pid direct) &&
         case Map.lookup pid peers of
           Nothing -> False
           Just ps -> computeScore scoreParams pid ps ipMap now < 0
@@ -92,10 +97,9 @@ pruneNegativeScore router topic meshPeers now = do
   -- Send PRUNE to negative-score peers (no PX for negative-score peers)
   forM_ (Set.toList negatives) $ \pid -> do
     let backoffSecs = round (paramPruneBackoff (gsParams router)) :: Word64
+    prn <- buildPrune router pid topic False backoffSecs
     gsSendRPC router pid emptyRPC
-      { rpcControl = Just emptyControlMessage
-          { ctrlPrune = [Prune topic [] (Just backoffSecs)] }
-      }
+      { rpcControl = Just emptyControlMessage { ctrlPrune = [prn] } }
     -- Start backoff and stop the P1 mesh clock
     atomically $ do
       modifyTVar' (gsBackoff router) $
@@ -121,9 +125,11 @@ fillUndersubscribed router topic meshPeers now = do
       peersMap <- readTVarIO (gsPeers router)
       backoffMap <- readTVarIO (gsBackoff router)
       ipMap <- readTVarIO (gsIPPeerCount router)
-      let eligible = [ pid | (pid, ps) <- Map.toList peersMap
+      let direct = paramDirectPeers params
+          eligible = [ pid | (pid, ps) <- Map.toList peersMap
                            , Set.member topic (psTopics ps)
                            , not (Set.member pid meshPeers)
+                           , not (Set.member pid direct)  -- never graft direct peers
                            , not (isInBackoff backoffMap pid topic now)
                            , computeScore (gsScoreParams router) pid ps ipMap now >= 0
                            ]
@@ -181,11 +187,9 @@ trimOversubscribed router topic meshPeers = do
     -- Send PRUNE with peer exchange to removed peers
     forM_ (Set.toList toRemove) $ \pid -> do
       let backoffSecs = round (paramPruneBackoff params) :: Word64
-      px <- selectPXPeers router topic pid
+      prn <- buildPrune router pid topic True backoffSecs
       gsSendRPC router pid emptyRPC
-        { rpcControl = Just emptyControlMessage
-            { ctrlPrune = [Prune topic px (Just backoffSecs)] }
-        }
+        { rpcControl = Just emptyControlMessage { ctrlPrune = [prn] } }
       atomically $ do
         modifyTVar' (gsBackoff router) $
           Map.insert (pid, topic) (addUTCTime (paramPruneBackoff params) now)
@@ -215,9 +219,11 @@ fanoutMaintenance router = do
         let d = paramD (gsParams router)
         when (Set.size fanoutPeers < d) $ do
           peersMap <- readTVarIO (gsPeers router)
-          let eligible = [ pid | (pid, ps) <- Map.toList peersMap
+          let direct = paramDirectPeers (gsParams router)
+              eligible = [ pid | (pid, ps) <- Map.toList peersMap
                                , Set.member topic (psTopics ps)
                                , not (Set.member pid fanoutPeers)
+                               , not (Set.member pid direct)
                                ]
           let needed = d - Set.size fanoutPeers
           selected <- sampleIO (min needed (length eligible)) eligible
@@ -243,9 +249,10 @@ emitGossip router = do
       topics = Set.unions
         [ subs, Map.keysSet meshMap, Map.keysSet fanoutMap ]
 
-  -- For each topic in mesh+fanout, send IHAVE to non-mesh peers
+  -- For each topic in mesh+fanout, send IHAVE to non-mesh peers.
+  -- The advertised id list is capped at paramMaxIHaveLength (#157).
   forM_ (Set.toList topics) $ \topic -> do
-    let gossipIds = cacheGetGossipIds topic cache
+    let gossipIds = take (paramMaxIHaveLength params) (cacheGetGossipIds topic cache)
     unless (null gossipIds) $ do
       let meshPeers = Map.findWithDefault Set.empty topic meshMap
           -- Eligible: subscribed to topic, not in mesh, and scoring at or
@@ -287,6 +294,16 @@ expireIWantPromises router = do
     pure (map fst (Map.keys expired))
   atomically $ modifyTVar' (gsPeers router) $ \pm ->
     foldl' (\m pid -> Map.adjust addP7Penalty pid m) pm broken
+
+-- IHAVE/IWANT budget reset
+
+-- | Reset the per-peer IHAVE/IWANT flood-protection budgets; the caps in
+-- Router.handleIHave / Router.handleIWant apply per heartbeat (#157).
+resetGossipBudgets :: GossipSubRouter -> IO ()
+resetGossipBudgets router = atomically $ do
+  writeTVar (gsIHaveCounts router) Map.empty
+  writeTVar (gsIAskedCounts router) Map.empty
+  writeTVar (gsIWantServed router) Map.empty
 
 -- Score decay
 
