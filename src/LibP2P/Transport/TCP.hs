@@ -72,8 +72,16 @@ tcpDial addr = case stripP2P addr of
   _ -> fail "tcpDial: unsupported multiaddr"
 
 -- | Create a RawConnection from a connected socket.
+--
+-- TCP_NODELAY is set on every connection (dialed and accepted), matching
+-- go-libp2p and rust-libp2p. libp2p traffic is already coalesced into
+-- frames by the muxer, and the many small write-write-read exchanges of
+-- the upgrade pipeline (multistream-select, Noise, per-stream
+-- negotiation) otherwise stall on Nagle/delayed-ACK interaction —
+-- observed as ~270ms per ping open/close cycle in the soak tier.
 mkRawConnection :: NS.Socket -> Multiaddr -> IO RawConnection
 mkRawConnection sock remoteAddr = do
+  NS.setSocketOption sock NS.NoDelay 1
   localSockAddr <- NS.getSocketName sock
   localAddr <- sockAddrToMultiaddr localSockAddr
   pure RawConnection
