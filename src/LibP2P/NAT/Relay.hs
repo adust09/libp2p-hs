@@ -12,6 +12,7 @@ module LibP2P.NAT.Relay
     RelayConfig (..)
   , RelayState (..)
   , ActiveReservation (..)
+  , HopContext (..)
     -- * Configuration
   , defaultRelayConfig
     -- * State management
@@ -24,6 +25,10 @@ module LibP2P.NAT.Relay
     -- * Relay address helpers
   , buildRelayAddrBytes
   , isRelayedConnection
+  , isRelayedAddr
+    -- * Voucher constants
+  , relayRsvpDomain
+  , relayRsvpPayloadType
   ) where
 
 import Data.ByteString (ByteString)
@@ -37,8 +42,12 @@ import qualified Data.Map.Strict as Map
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32, Word64)
 import LibP2P.NAT.Relay.Message
+import LibP2P.Multiaddr (Multiaddr (..), fromBytes, toBytes)
+import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import LibP2P.Crypto.PeerId (PeerId (..))
+import LibP2P.Crypto.Key (KeyPair (..))
+import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
+import LibP2P.Crypto.SignedEnvelope (createEnvelope, encodeSignedEnvelope)
 import LibP2P.Core.Varint (encodeUvarint)
 
 -- | Relay server configuration.
@@ -80,49 +89,98 @@ newRelayState config = RelayState config
   <$> newTVarIO Map.empty
   <*> newTVarIO Map.empty
 
+-- | Per-request context for the hop handlers: the relay's own identity
+-- (used to sign reservation vouchers), its public addresses (advertised in
+-- the reservation), and the address the requesting connection arrived over
+-- (used to refuse requests over already-relayed connections).
+data HopContext = HopContext
+  { hcRelayId    :: !PeerId       -- ^ Relay's own peer ID
+  , hcRelayKey   :: !KeyPair      -- ^ Relay identity key, signs vouchers
+  , hcRelayAddrs :: ![Multiaddr]
+    -- ^ Relay public addresses including the trailing @/p2p/\<relay\>@
+    -- component but without @/p2p-circuit@, per circuit-v2 reservation addrs
+  , hcRemoteAddr :: !Multiaddr    -- ^ Address the request arrived over
+  }
+
+-- | Domain separation string for reservation voucher envelopes (circuit-v2).
+relayRsvpDomain :: ByteString
+relayRsvpDomain = "libp2p-relay-rsvp"
+
+-- | Multicodec payload type for reservation vouchers (0x0302).
+relayRsvpPayloadType :: ByteString
+relayRsvpPayloadType = BS.pack [0x03, 0x02]
+
 -- | Handle a RESERVE request from a peer.
-handleReserve :: RelayState -> StreamIO -> PeerId -> IO ()
-handleReserve state stream peerId = do
-  -- Check resource limits
-  reservations <- readTVarIO (rsReservations state)
-  let limit = rcMaxReservations (rsConfig state)
-  if Map.size reservations >= limit
-    -- Per circuit-v2 spec, a reservation rejected because the relay is at
-    -- capacity is RESERVATION_REFUSED (200); RESOURCE_LIMIT_EXCEEDED (201)
-    -- is reserved for relayed-connection limits on CONNECT.
-    then sendHopStatus stream ReservationRefused
-    else do
-      -- Create reservation. Per circuit-v2 spec, Reservation.expire is an
-      -- absolute UTC Unix time in seconds, not a duration.
+handleReserve :: RelayState -> HopContext -> StreamIO -> PeerId -> IO ()
+handleReserve state ctx stream peerId
+  -- Per circuit-v2 spec, relays must not serve requests arriving over an
+  -- already-relayed connection (no relay chains).
+  | isRelayedAddr (hcRemoteAddr ctx) = sendHopStatus stream PermissionDenied
+  | otherwise = do
+      -- Per circuit-v2 spec, Reservation.expire is an absolute UTC Unix
+      -- time in seconds, not a duration.
       now <- getPOSIXTime
       let expiration = floor now + rcReservationDuration (rsConfig state)
           reservation = ActiveReservation
             { arPeerId = peerId
             , arExpiration = expiration
             }
-      atomically $ modifyTVar' (rsReservations state) (Map.insert peerId reservation)
-      -- Send OK response with reservation info
-      let resp = HopMessage
-            { hopType = Just HopStatus
-            , hopPeer = Nothing
-            , hopReservation = Just Reservation
-                { rsvExpire = Just expiration
-                , rsvAddrs = []  -- relay would populate with own addresses
-                , rsvVoucher = Nothing  -- voucher signing handled separately
+      granted <- atomically $ do
+        reservations <- readTVar (rsReservations state)
+        let limit = rcMaxReservations (rsConfig state)
+            isRefresh = Map.member peerId reservations
+        -- A refresh from an existing holder is not a new reservation: it
+        -- must succeed even when the relay is at capacity.
+        if not isRefresh && Map.size reservations >= limit
+          then pure False
+          else do
+            modifyTVar' (rsReservations state) (Map.insert peerId reservation)
+            pure True
+      if not granted
+        -- Per circuit-v2 spec, a reservation rejected because the relay is
+        -- at capacity is RESERVATION_REFUSED (200); RESOURCE_LIMIT_EXCEEDED
+        -- (201) is reserved for relayed-connection limits on CONNECT.
+        then sendHopStatus stream ReservationRefused
+        else do
+          -- Send OK response with reservation info
+          let resp = HopMessage
+                { hopType = Just HopStatus
+                , hopPeer = Nothing
+                , hopReservation = Just Reservation
+                    { rsvExpire = Just expiration
+                    , rsvAddrs = map toBytes (hcRelayAddrs ctx)
+                    , rsvVoucher = signVoucher ctx peerId expiration
+                    }
+                , hopLimit = Just RelayLimit
+                    { rlDuration = Just (rcDefaultDurationLimit (rsConfig state))
+                    , rlData = Just (rcDefaultDataLimit (rsConfig state))
+                    }
+                , hopStatus = Just RelayOK
                 }
-            , hopLimit = Just RelayLimit
-                { rlDuration = Just (rcDefaultDurationLimit (rsConfig state))
-                , rlData = Just (rcDefaultDataLimit (rsConfig state))
-                }
-            , hopStatus = Just RelayOK
-            }
-      writeHopMessage stream resp
+          writeHopMessage stream resp
+
+-- | Sign a reservation voucher: a circuit-v2 Voucher payload wrapped in an
+-- RFC 0002 signed envelope under the relay-rsvp domain.
+signVoucher :: HopContext -> PeerId -> Word64 -> Maybe ByteString
+signVoucher ctx peerId expiration =
+  let payload = encodeVoucher Voucher
+        { vRelay = peerIdBytes (hcRelayId ctx)
+        , vPeer = peerIdBytes peerId
+        , vExpiration = expiration
+        }
+      kp = hcRelayKey ctx
+  in case createEnvelope (kpPrivate kp) (kpPublic kp) relayRsvpDomain relayRsvpPayloadType payload of
+       Left _    -> Nothing  -- voucher is optional per spec; omit if signing fails
+       Right env -> Just (encodeSignedEnvelope env)
 
 -- | Handle a CONNECT request from a peer.
 -- The openStopStream callback is used to open a stop stream to the target.
-handleConnect :: RelayState -> StreamIO -> PeerId -> HopMessage -> (PeerId -> IO (Maybe StreamIO)) -> IO ()
-handleConnect state stream sourcePeerId msg openStopStream = do
-  case hopPeer msg of
+handleConnect :: RelayState -> HopContext -> StreamIO -> PeerId -> HopMessage -> (PeerId -> IO (Maybe StreamIO)) -> IO ()
+handleConnect state ctx stream sourcePeerId msg openStopStream
+  -- Per circuit-v2 spec, a CONNECT arriving over an already-relayed
+  -- connection is refused: circuits cannot be chained through relays.
+  | isRelayedAddr (hcRemoteAddr ctx) = sendHopStatus stream PermissionDenied
+  | otherwise = case hopPeer msg of
     Nothing -> sendHopStatus stream MalformedMessage
     Just peer -> do
       let targetId = PeerId (rpId peer)
@@ -255,15 +313,18 @@ bridgeStreams mLimit streamA streamB = do
       streamClose streamB
 
 -- | Forward bytes from source to destination with a byte limit.
+-- The limit is checked before each read, so the circuit terminates as soon
+-- as exactly @limit@ bytes have been forwarded — no byte beyond the limit
+-- is consumed from the source.
 forwardWithLimit :: StreamIO -> StreamIO -> IORef Int -> Int -> IO ()
 forwardWithLimit src dst countRef limit = go
   where
     go = do
-      b <- streamReadByte src
       count <- readIORef countRef
       if count >= limit
         then pure ()  -- limit reached, stop forwarding
         else do
+          b <- streamReadByte src
           modifyIORef' countRef (+ 1)
           streamWrite dst (BS.singleton b)
           go
@@ -285,9 +346,13 @@ buildRelayAddrBytes relayAddr relayIdBytes targetIdBytes =
     p2pCircuitBytes :: ByteString
     p2pCircuitBytes = encodeUvarint 290
 
--- | Check if raw multiaddr bytes contain P2PCircuit (code 290).
--- Simple heuristic: look for the varint encoding of 290.
+-- | Check whether a multiaddr contains a p2p-circuit component.
+isRelayedAddr :: Multiaddr -> Bool
+isRelayedAddr (Multiaddr ps) = P2PCircuit `elem` ps
+
+-- | Check whether raw multiaddr bytes describe a relayed connection.
+-- Decodes the bytes structurally: the p2p-circuit byte pattern occurring
+-- inside another component (e.g. a peer ID) does not count, unlike the
+-- previous substring heuristic. Undecodable bytes are not relayed.
 isRelayedConnection :: ByteString -> Bool
-isRelayedConnection bs =
-  let circuitMarker = encodeUvarint 290
-  in circuitMarker `BS.isInfixOf` bs
+isRelayedConnection = either (const False) isRelayedAddr . fromBytes
