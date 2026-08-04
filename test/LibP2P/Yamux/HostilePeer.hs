@@ -9,11 +9,17 @@
 -- state-machine tests: with two of our sessions wired together, any
 -- frame shape a conformant-but-differently-written peer may send is
 -- structurally unreachable.
+--
+-- The transport is a chunk-based in-memory pipe that can be closed:
+-- closing the inject direction makes the session's next read throw an
+-- EOF IOError once the buffered bytes run out, exactly like the
+-- production readExact-over-socket wiring in Switch.Upgrade.
 module LibP2P.Yamux.HostilePeer
   ( HostilePeer (..)
   , withHostilePeer
   , injectFrame
   , expectFrame
+  , expectBytes
   , acceptWithin
   , awaitState
   , awaitTrue
@@ -36,31 +42,90 @@ data HostilePeer = HostilePeer
   -- ^ The session under test (recvLoop/sendLoop already running)
   , hpInject :: ByteString -> IO ()
   -- ^ Write raw bytes into the session's receive side
+  , hpCloseInject :: IO ()
+  -- ^ Signal transport EOF on the session's receive side: after the
+  -- already-injected bytes are consumed, the session's read throws
   , hpNextFrame :: IO (YamuxHeader, ByteString)
   -- ^ Decode the next frame the session wrote (header + Data payload)
+  , hpRecvRaw :: Int -> IO ByteString
+  -- ^ Read exactly n raw bytes the session wrote (byte-exact asserts)
   }
+
+-- | One direction of the in-memory transport: a queue of chunks, a
+-- leftover buffer for partially consumed chunks, and a closed flag.
+data Pipe = Pipe
+  { pipeChunks :: TQueue ByteString
+  , pipeLeftover :: TVar ByteString
+  , pipeClosed :: TVar Bool
+  }
+
+newPipe :: IO Pipe
+newPipe = Pipe <$> newTQueueIO <*> newTVarIO BS.empty <*> newTVarIO False
+
+pipeWrite :: Pipe -> ByteString -> IO ()
+pipeWrite p bs
+  | BS.null bs = pure ()
+  | otherwise = atomically $ writeTQueue (pipeChunks p) bs
+
+pipeClose :: Pipe -> IO ()
+pipeClose p = atomically $ writeTVar (pipeClosed p) True
+
+-- | Read exactly n bytes, blocking until they arrive. Throws an
+-- IOError on EOF before n bytes are available, mirroring the
+-- production transport read (readExact fails on a short read).
+pipeRead :: Pipe -> Int -> IO ByteString
+pipeRead p n = go [] n
+  where
+    go acc 0 = pure (BS.concat (reverse acc))
+    go acc want = do
+      mChunk <- atomically $ do
+        leftover <- readTVar (pipeLeftover p)
+        if not (BS.null leftover)
+          then do
+            writeTVar (pipeLeftover p) BS.empty
+            pure (Just leftover)
+          else do
+            mc <- tryReadTQueue (pipeChunks p)
+            case mc of
+              Just c -> pure (Just c)
+              Nothing -> do
+                closed <- readTVar (pipeClosed p)
+                if closed then pure Nothing else retry
+      case mChunk of
+        Nothing -> ioError (userError "pipeRead: transport EOF mid-read")
+        Just c
+          | BS.length c <= want -> go (c : acc) (want - BS.length c)
+          | otherwise -> do
+              let (use, rest) = BS.splitAt want c
+              atomically $ writeTVar (pipeLeftover p) rest
+              go (use : acc) 0
 
 -- | Run an action against a session wired to a raw byte peer.
 withHostilePeer :: SessionRole -> (HostilePeer -> IO a) -> IO a
 withHostilePeer role action = do
-  toSession <- newTQueueIO
-  fromSession <- newTQueueIO
-  let writeTo q bs = mapM_ (atomically . writeTQueue q) (BS.unpack bs)
-      readFrom q n = BS.pack <$> mapM (const (atomically (readTQueue q))) [1 .. n]
-  sess <- newSession role (writeTo fromSession) (readFrom toSession)
+  toSession <- newPipe
+  fromSession <- newPipe
+  sess <- newSession role (pipeWrite fromSession) (pipeRead toSession)
   let nextFrame = do
-        hdrBytes <- readFrom fromSession headerSize
+        hdrBytes <- pipeRead fromSession headerSize
         case decodeHeader hdrBytes of
           Left err -> fail ("frame recorder: " <> err)
           Right hdr -> do
             payload <-
               if yhType hdr == FrameData && yhLength hdr > 0
-                then readFrom fromSession (fromIntegral (yhLength hdr))
+                then pipeRead fromSession (fromIntegral (yhLength hdr))
                 else pure BS.empty
             pure (hdr, payload)
   withAsync (sendLoop sess) $ \_ ->
     withAsync (recvLoop sess) $ \_ ->
-      action (HostilePeer sess (writeTo toSession) nextFrame)
+      action
+        HostilePeer
+          { hpSession = sess
+          , hpInject = pipeWrite toSession
+          , hpCloseInject = pipeClose toSession
+          , hpNextFrame = nextFrame
+          , hpRecvRaw = pipeRead fromSession
+          }
 
 -- | Inject a frame (header plus optional Data payload) as raw bytes.
 injectFrame :: HostilePeer -> YamuxHeader -> ByteString -> IO ()
@@ -74,6 +139,15 @@ expectFrame hp = do
   case mFrame of
     Just frame -> pure frame
     Nothing -> fail "expected an outbound frame within 1s, got none"
+
+-- | Assert that the session's next outbound bytes are exactly the
+-- given ones (byte-exact golden assertion), failing after 1s.
+expectBytes :: HostilePeer -> ByteString -> Expectation
+expectBytes hp expected = do
+  mGot <- timeout 1000000 (hpRecvRaw hp (BS.length expected))
+  case mGot of
+    Just got -> got `shouldBe` expected
+    Nothing -> expectationFailure "expected outbound bytes within 1s, got none"
 
 -- | Accept an inbound stream, failing loudly after 1s.
 acceptWithin :: HostilePeer -> IO YamuxStream

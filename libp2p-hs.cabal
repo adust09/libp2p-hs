@@ -150,6 +150,9 @@ test-suite libp2p-hs-test
     LibP2P.Yamux.SessionSpec
     LibP2P.Yamux.StateMachineSpec
     LibP2P.Yamux.LifecycleSpec
+    LibP2P.Yamux.PropertySpec
+    LibP2P.Yamux.TraceReplaySpec
+    LibP2P.Yamux.TransportEofSpec
     LibP2P.Transport.TCPSpec
     LibP2P.Switch.ConnPoolSpec
     LibP2P.Switch.ConnectionLifecycleSpec
