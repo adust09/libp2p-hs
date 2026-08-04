@@ -201,6 +201,26 @@ directTopicPeers router peers topic =
     Just ps -> Set.member topic (psTopics ps)
     Nothing -> False) (paramDirectPeers (gsParams router))
 
+-- FloodSub peers (gossipsub-v1.0.md "Compatibility with FloodSub")
+
+-- | True when the peer negotiated /floodsub/1.0.0. Floodsub peers have
+-- no mesh and understand no gossipsub control messages: they are flooded
+-- every message for topics they subscribe to and must never be grafted,
+-- pruned or gossiped to.
+isFloodSubPeer :: Map.Map PeerId PeerState -> PeerId -> Bool
+isFloodSubPeer peers pid = case Map.lookup pid peers of
+  Just ps -> psProtocol ps == FloodSubPeer
+  Nothing -> False
+
+-- | Known floodsub peers subscribed to the topic. They receive every
+-- published and forwarded message for it (flooding).
+floodSubTopicPeers :: Map.Map PeerId PeerState -> Topic -> Set.Set PeerId
+floodSubTopicPeers peers topic =
+  Map.foldlWithKey' (\acc pid ps ->
+    if psProtocol ps == FloodSubPeer && Set.member topic (psTopics ps)
+    then Set.insert pid acc
+    else acc) Set.empty peers
+
 -- Protocol version gating
 
 -- | True when the peer negotiated /meshsub/1.1.0. Unknown peers are
@@ -256,12 +276,14 @@ join router topic = do
     let currentMesh = Map.findWithDefault Set.empty topic meshNow
     peerMap <- readTVar (gsPeers router)
     -- Direct peers are never mesh candidates (gossipsub-v1.1.md
-    -- explicit peering agreements)
+    -- explicit peering agreements); neither are floodsub peers, which
+    -- have no mesh and would not understand the GRAFT (#157)
     let eligible = Map.foldlWithKey' (\acc pid ps ->
           if Set.member topic (psTopics ps)
              && not (Set.member pid currentMesh)
              && pid /= gsLocalPeerId router
              && not (isDirectPeer router pid)
+             && psProtocol ps /= FloodSubPeer
           then Set.insert pid acc
           else acc) Set.empty peerMap
     pure (foPeers, eligible)
@@ -364,18 +386,21 @@ publish router topic payload mKeyPair = do
             else acc) [] peers
       mapM_ (\pid -> gsSendRPC router pid pubRPC) targets
     else do
-      -- Mesh-based publish; subscribed direct peers are always included
-      -- although they are never mesh or fanout members
+      -- Mesh-based publish; subscribed direct and floodsub peers are
+      -- always included although they are never mesh or fanout members
+      -- (floodsub peers are flooded every message for their topics, #157)
       peers <- readTVarIO (gsPeers router)
       let direct = directTopicPeers router peers topic
+          flood  = floodSubTopicPeers peers topic
       meshPeers <- atomically $ do
         m <- readTVar (gsMesh router)
         pure (Map.findWithDefault Set.empty topic m)
       if not (Set.null meshPeers)
         then mapM_ (\pid -> gsSendRPC router pid pubRPC)
-               (Set.toList (Set.union meshPeers direct))
+               (Set.toList (Set.unions [meshPeers, direct, flood]))
         else do
-          -- Fanout: use existing or create new (direct peers excluded)
+          -- Fanout: use existing or create new (direct and floodsub
+          -- peers excluded from selection but always sent to)
           foPeers <- atomically $ do
             fo <- readTVar (gsFanout router)
             pure (Map.findWithDefault Set.empty topic fo)
@@ -385,6 +410,7 @@ publish router topic payload mKeyPair = do
                     if Set.member topic (psTopics ps)
                        && pid /= gsLocalPeerId router
                        && not (isDirectPeer router pid)
+                       && psProtocol ps /= FloodSubPeer
                     then pid : acc
                     else acc) [] peers
               selected <- sampleIO (min (paramD (gsParams router)) (length eligible)) eligible
@@ -397,7 +423,7 @@ publish router topic payload mKeyPair = do
               atomically $ modifyTVar' (gsFanoutPub router) (Map.insert topic now)
               pure foPeers
           mapM_ (\pid -> gsSendRPC router pid pubRPC)
-            (Set.toList (Set.union targets direct))
+            (Set.toList (Set.unions [targets, direct, flood]))
 
   -- Deliver to local application
   onMsg <- readTVarIO (gsOnMessage router)
@@ -559,9 +585,15 @@ handleOneGraft router sender now (Graft topic) = do
   -- with no peers has no mesh entry but its GRAFTs must be accepted
   -- (gossipsub-v1.0.md GRAFT handling; issue #155).
   subs <- readTVarIO (gsSubscriptions router)
+  peersMap <- readTVarIO (gsPeers router)
   let subscribed = Set.member topic subs
 
-  if not subscribed
+  if isFloodSubPeer peersMap sender
+    then
+      -- Floodsub peers have no mesh and understand no control messages:
+      -- never graft them and never answer with PRUNE (#157)
+      pure []
+    else if not subscribed
     then
       -- gossipsub-v1.1.md GRAFT flood protection: GRAFTs for unknown
       -- topics are ignored — replying with PRUNE (the v1.0 behaviour)
@@ -666,7 +698,12 @@ handleOnePrune router sender now prune = do
 handleIHave :: GossipSubRouter -> PeerId -> [IHave] -> IO ()
 handleIHave router sender ihaves = do
   score <- peerScore router sender
-  unless (score < stGossipThreshold (gsThresholds router) || null ihaves) $ do
+  peersMap <- readTVarIO (gsPeers router)
+  -- Floodsub peers never receive control messages, so an (unexpected)
+  -- IHAVE from one must not be answered with IWANT (#157)
+  unless (score < stGossipThreshold (gsThresholds router)
+          || isFloodSubPeer peersMap sender
+          || null ihaves) $ do
     let params = gsParams router
     withinBudget <- atomically $ do
       counts <- readTVar (gsIHaveCounts router)
@@ -735,7 +772,9 @@ handleSubscriptions router sender subs = atomically $
 
 -- | Forward a message to mesh peers for its topic, excluding the sender.
 -- Subscribed direct peers always receive the message even though they
--- are never mesh members (gossipsub-v1.1.md explicit peering).
+-- are never mesh members (gossipsub-v1.1.md explicit peering), and so do
+-- subscribed floodsub peers, which are flooded before the mesh
+-- (gossipsub-v1.0.md: forward "to every peer in peers.floodsub[topic]").
 forwardMessage :: GossipSubRouter -> PeerId -> PubSubMessage -> IO ()
 forwardMessage router sender msg = do
   let topic = msgTopic msg
@@ -744,7 +783,8 @@ forwardMessage router sender msg = do
     pure (Map.findWithDefault Set.empty topic m)
   peers <- readTVarIO (gsPeers router)
   let direct = directTopicPeers router peers topic
-      targets = Set.delete sender (Set.union meshPeers direct)
+      flood  = floodSubTopicPeers peers topic
+      targets = Set.delete sender (Set.unions [meshPeers, direct, flood])
       fwdRPC = emptyRPC { rpcPublish = [msg] }
   mapM_ (\pid -> gsSendRPC router pid fwdRPC) (Set.toList targets)
 
