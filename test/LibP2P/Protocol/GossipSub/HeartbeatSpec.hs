@@ -11,7 +11,7 @@ import Data.Time (UTCTime, addUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import LibP2P.Crypto.PeerId (PeerId (..))
 import LibP2P.Protocol.GossipSub.Types
-import LibP2P.Protocol.GossipSub.Router (newRouter, addPeer, peerScore)
+import LibP2P.Protocol.GossipSub.Router (newRouter, addPeer, handleIHave, peerScore)
 import LibP2P.Protocol.GossipSub.MessageCache (newMessageCache, cachePut, cacheGetGossipIds)
 import LibP2P.Protocol.GossipSub.Score (markPeerInMesh)
 import LibP2P.Protocol.GossipSub.Heartbeat
@@ -98,6 +98,31 @@ spec = do
                 Nothing -> False) sent
         length pruneMsgs `shouldSatisfy` (>= 1)
 
+      it "withholds PX in the PRUNE to a negative-score peer" $ do
+        -- gossipsub-v1.1.md peer exchange: PX is only supplied to peers in
+        -- good standing — handing an attacker a list of topic peers on the
+        -- way out would aid eclipse attacks.
+        (router, logRef, _) <- mkHeartbeatRouter localPid fixedTime
+        let bad = mkPeerId 1
+            routerNeg = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspAppSpecificScore = \pid ->
+                      if pid == bad then -1 else 0 } }
+        addMeshPeer routerNeg bad "t" fixedTime
+        -- Other well-scoring topic peers exist, so PX would have content
+        mapM_ (\n -> addSubscribedPeer routerNeg (mkPeerId n) "t" fixedTime)
+          [2..5 :: Int]
+        heartbeatOnce routerNeg
+        sent <- readIORef logRef
+        let prunes = [ p | (to, rpc) <- sent, to == bad
+                         , Just ctrl <- [rpcControl rpc], p <- ctrlPrune ctrl ]
+        case prunes of
+          [p] -> prunePeers p `shouldBe` []
+          _   -> expectationFailure "expected exactly one PRUNE to the bad peer"
+        -- And the backoff penalty is recorded
+        backoff <- readTVarIO (gsBackoff routerNeg)
+        Map.member (bad, "t") backoff `shouldBe` True
+
       it "GRAFTs when mesh is undersubscribed (< D_lo)" $ do
         (router, logRef, _) <- mkHeartbeatRouter localPid fixedTime
         -- D=6, D_lo=4: add 2 mesh peers + 4 more subscribed but not in mesh
@@ -137,6 +162,31 @@ spec = do
         mesh <- readTVarIO (gsMesh router)
         let meshPeers = Map.findWithDefault Set.empty "t" mesh
         Set.member backoffPeer meshPeers `shouldBe` False
+
+      it "enforces the backoff across heartbeats and grafts after expiry" $ do
+        -- gossipsub-v1.1.md backoff: the pruned peer stays out of the mesh
+        -- for the whole backoff window, however many heartbeats that
+        -- spans, and becomes an ordinary candidate again once it ends.
+        (router, _, timeRef) <- mkHeartbeatRouter localPid fixedTime
+        let pid = mkPeerId 1
+        addSubscribedPeer router pid "t" fixedTime
+        atomically $ do
+          modifyTVar' (gsSubscriptions router) (Set.insert "t")
+          modifyTVar' (gsBackoff router) $
+            Map.insert (pid, "t") (addUTCTime 30 fixedTime)
+        let inMesh = do
+              mesh <- readTVarIO (gsMesh router)
+              pure (Set.member pid (Map.findWithDefault Set.empty "t" mesh))
+        -- Two heartbeats inside the window: still excluded
+        heartbeatOnce router
+        inMesh `shouldReturn` False
+        writeIORef timeRef (addUTCTime 15 fixedTime)
+        heartbeatOnce router
+        inMesh `shouldReturn` False
+        -- First heartbeat after expiry: grafted again
+        writeIORef timeRef (addUTCTime 31 fixedTime)
+        heartbeatOnce router
+        inMesh `shouldReturn` True
 
       it "PRUNEs when mesh is oversubscribed (> D_hi)" $ do
         (router, logRef, _) <- mkHeartbeatRouter localPid fixedTime
@@ -395,6 +445,26 @@ spec = do
           Nothing -> expectationFailure "peer not found"
         promises <- readTVarIO (gsIWantPromises router)
         promises `shouldBe` Map.empty
+
+      it "drives the peer's score negative after a broken IHAVE promise" $ do
+        -- End-to-end P7: the promise is created by the router's own
+        -- IHAVE handling (not injected), expires on heartbeat, and the
+        -- resulting penalty is visible in peerScore — w7 is negative by
+        -- default, so a broken promise alone must take the score below 0.
+        (router, _, timeRef) <- mkHeartbeatRouter localPid fixedTime
+        let pid = mkPeerId 1
+        addPeer router pid GossipSubPeer False fixedTime
+        peerScore router pid `shouldReturn` 0
+        -- Peer advertises a message id we have not seen: router IWANTs it
+        -- and records the promise with deadline paramIWantFollowupTime (3s)
+        handleIHave router pid [IHave "t" [BS.pack [1]]]
+        promises <- readTVarIO (gsIWantPromises router)
+        Map.member (pid, BS.pack [1]) promises `shouldBe` True
+        -- The peer never delivers; past the deadline the promise breaks
+        writeIORef timeRef (addUTCTime 4 fixedTime)
+        heartbeatOnce router
+        score <- peerScore router pid
+        score `shouldSatisfy` (< 0)
 
       it "does not penalize before the deadline" $ do
         (router, _, _) <- mkHeartbeatRouter localPid fixedTime

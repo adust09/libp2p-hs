@@ -31,6 +31,7 @@ module LibP2P.Protocol.GossipSub.Types
     -- * Errors
   , GossipSubError (..)
     -- * Topic validation
+  , ValidationResult (..)
   , TopicValidator
     -- * Configuration
   , GossipSubParams (..)
@@ -187,10 +188,23 @@ instance Exception GossipSubError
 
 -- Topic validation
 
--- | Application validator for a topic. Receives the propagation source and the
--- message; returning False drops the message without propagation
--- (specs/pubsub/README.md, "Topic validation").
-type TopicValidator = PeerId -> PubSubMessage -> IO Bool
+-- | Outcome of an application topic validator (gossipsub-v1.1.md
+-- "Extended Validators"). The trichotomy exists because rejection is a
+-- scoring event while ignoring is not: a message that is provably invalid
+-- (Reject) counts against the propagation source's P4 counter, whereas a
+-- message that merely cannot be validated right now (Ignore) is dropped
+-- without penalising the peer that relayed it.
+data ValidationResult
+  = ValidationAccept  -- ^ Deliver and propagate the message
+  | ValidationReject  -- ^ Drop without propagation; penalise the source (P4)
+  | ValidationIgnore  -- ^ Drop without propagation; no penalty
+  deriving (Show, Eq)
+
+-- | Application validator for a topic. Receives the propagation source and
+-- the message and decides whether it is delivered and forwarded
+-- (specs/pubsub/README.md "Topic validation"; gossipsub-v1.1.md extended
+-- validators).
+type TopicValidator = PeerId -> PubSubMessage -> IO ValidationResult
 
 -- Configuration
 

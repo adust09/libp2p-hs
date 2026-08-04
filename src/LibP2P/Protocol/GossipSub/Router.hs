@@ -116,8 +116,10 @@ newRouter params localPid sendRPC getTime = do
 
 -- Topic validation
 
--- | Attach an application validator to a topic. Messages the validator rejects
--- are dropped without propagation and count against the sender's P4 score.
+-- | Attach an application validator to a topic. Messages the validator
+-- rejects are dropped without propagation and count against the sender's
+-- P4 score; ignored messages are dropped without any penalty
+-- (gossipsub-v1.1.md extended validators).
 registerValidator :: GossipSubRouter -> Topic -> TopicValidator -> IO ()
 registerValidator router topic v = atomically $
   modifyTVar' (gsValidators router) (Map.insert topic v)
@@ -495,10 +497,14 @@ handlePublishedMessage router sender msg =
           -- in our mesh and delivered within the near-first window
           creditMeshDelivery router sender topic (Just (firstSeen, now))
         Nothing -> do
-          accepted <- runTopicValidator router sender msg
-          if not accepted
-            then rejectMessage router sender msg
-            else do
+          outcome <- runTopicValidator router sender msg
+          case outcome of
+            -- Provably invalid: drop and penalise the source (P4)
+            ValidationReject -> rejectMessage router sender msg
+            -- Undecidable: drop without penalty (extended validators,
+            -- gossipsub-v1.1.md — Ignore must not affect the score)
+            ValidationIgnore -> pure ()
+            ValidationAccept -> do
               -- First valid delivery: P2, plus P3 for mesh senders (#156)
               creditFirstDelivery router sender topic
               creditMeshDelivery router sender topic Nothing
@@ -549,11 +555,11 @@ creditMeshDelivery router sender topic mWindow = do
       sender
 
 -- | Run the topic validator, if one is registered. No validator means accept.
-runTopicValidator :: GossipSubRouter -> PeerId -> PubSubMessage -> IO Bool
+runTopicValidator :: GossipSubRouter -> PeerId -> PubSubMessage -> IO ValidationResult
 runTopicValidator router sender msg = do
   validators <- readTVarIO (gsValidators router)
   case Map.lookup (msgTopic msg) validators of
-    Nothing -> pure True
+    Nothing -> pure ValidationAccept
     Just v  -> v sender msg
 
 -- | Drop a message and charge the propagation source a P4 invalid delivery.
