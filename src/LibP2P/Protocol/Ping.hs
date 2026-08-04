@@ -14,6 +14,13 @@
 -- when the session ends or on the first failed ping. Streams are opened
 -- through the Switch ('newStream'), so each session holds exactly one
 -- stream reservation, released on close.
+--
+-- The listener accepts at most two concurrent ping streams per remote
+-- peer (ping.md: "The listening peer SHOULD accept at most two streams
+-- per peer since cross-stream behavior is non-linear and stream writes
+-- occur asynchronously"). 'registerPingHandler' installs a
+-- 'PingLimiter' that counts live inbound ping streams per peer and
+-- resets the third and subsequent streams without serving them.
 module LibP2P.Protocol.Ping
   ( -- * Protocol ID
     pingProtocolId
@@ -23,6 +30,9 @@ module LibP2P.Protocol.Ping
   , PingSession
     -- * Responder
   , handlePing
+  , PingLimiter
+  , newPingLimiter
+  , handlePingLimited
     -- * Initiator
   , sendPing
   , openPingSession
@@ -35,9 +45,17 @@ module LibP2P.Protocol.Ping
     -- * Constants
   , pingSize
   , pingTimeoutMicros
+  , maxPingStreamsPerPeer
   ) where
 
-import Control.Concurrent.STM (atomically, readTVar, writeTVar)
+import Control.Concurrent.STM
+  ( TVar
+  , atomically
+  , modifyTVar'
+  , newTVarIO
+  , readTVar
+  , writeTVar
+  )
 import Control.Exception (SomeException, catch, finally, try)
 import Control.Monad (unless)
 import qualified Data.ByteString as BS
@@ -74,6 +92,13 @@ pingSize = 32
 pingTimeoutMicros :: Int
 pingTimeoutMicros = 10000000
 
+-- | Maximum concurrent inbound ping streams served per remote peer
+-- (ping.md: "The listening peer SHOULD accept at most two streams per
+-- peer since cross-stream behavior is non-linear and stream writes
+-- occur asynchronously").
+maxPingStreamsPerPeer :: Int
+maxPingStreamsPerPeer = 2
+
 -- | Ping error types.
 data PingError
   = PingTimeout          -- ^ No echo within the timeout
@@ -102,6 +127,36 @@ handlePing stream _remotePeerId = echoLoop `finally` closeQuietly stream
         Right payload -> do
           streamWrite stream payload
           echoLoop
+
+-- | Per-peer accounting of live inbound ping streams, shared by every
+-- invocation of the registered ping handler on one Switch.
+newtype PingLimiter = PingLimiter (TVar (Map.Map PeerId Int))
+
+-- | Create an empty inbound ping stream limiter.
+newPingLimiter :: IO PingLimiter
+newPingLimiter = PingLimiter <$> newTVarIO Map.empty
+
+-- | Serve an inbound ping stream, enforcing the per-peer cap.
+--
+-- If the remote peer already has 'maxPingStreamsPerPeer' live ping
+-- streams, the new stream is reset (closed without serving the echo
+-- loop). Otherwise the stream occupies a slot for the duration of
+-- 'handlePing'; the slot is released when the stream closes or errors.
+handlePingLimited :: PingLimiter -> StreamIO -> PeerId -> IO ()
+handlePingLimited (PingLimiter countsVar) stream peer = do
+  accepted <- atomically $ do
+    counts <- readTVar countsVar
+    let live = Map.findWithDefault 0 peer counts
+    if live >= maxPingStreamsPerPeer
+      then pure False
+      else do
+        writeTVar countsVar (Map.insert peer (live + 1) counts)
+        pure True
+  if accepted
+    then handlePing stream peer `finally` atomically (modifyTVar' countsVar releaseSlot)
+    else closeQuietly stream
+  where
+    releaseSlot = Map.update (\n -> if n <= 1 then Nothing else Just (n - 1)) peer
 
 -- | The single outbound ping stream to a peer, negotiated and ready.
 --
@@ -210,11 +265,16 @@ sendPing :: Switch -> Connection -> IO (Either PingError PingResult)
 sendPing sw conn = either Left id <$> withPingSession sw conn ping
 
 -- | Register the Ping handler on the Switch.
+--
+-- The installed handler shares one 'PingLimiter', so concurrent inbound
+-- ping streams are capped at 'maxPingStreamsPerPeer' per remote peer.
 registerPingHandler :: Switch -> IO ()
-registerPingHandler sw = atomically $ do
-  protos <- readTVar (swProtocols sw)
-  let handler conn stream = handlePing stream (connPeerId conn)
-  writeTVar (swProtocols sw) (Map.insert pingProtocolId handler protos)
+registerPingHandler sw = do
+  limiter <- newPingLimiter
+  atomically $ do
+    protos <- readTVar (swProtocols sw)
+    let handler conn stream = handlePingLimited limiter stream (connPeerId conn)
+    writeTVar (swProtocols sw) (Map.insert pingProtocolId handler protos)
 
 -- | Close a stream, swallowing any exception (best-effort EOF signal).
 closeQuietly :: StreamIO -> IO ()

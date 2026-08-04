@@ -451,6 +451,150 @@ spec = do
       BS.length payload2 `shouldBe` pingSize
       payload2 `shouldNotBe` payload1
 
+  describe "Ping responder stream cap" $ do
+    -- ping.md: "The listening peer SHOULD accept at most two streams
+    -- per peer since cross-stream behavior is non-linear and stream
+    -- writes occur asynchronously."
+    it "accepts two concurrent ping streams from the same peer, both echo" $ do
+      limiter <- newPingLimiter
+      let peer = PeerId "capped-peer"
+      (dialer1, close1, listener1) <- mkClosableStreamPair
+      (dialer2, close2, listener2) <- mkClosableStreamPair
+      h1 <- async $ handlePingLimited limiter listener1 peer
+      h2 <- async $ handlePingLimited limiter listener2 peer
+      let payload1 = BS.pack [1..32]
+          payload2 = BS.pack [33..64]
+      streamWrite dialer1 payload1
+      resp1 <- readNBytes dialer1 pingSize
+      resp1 `shouldBe` payload1
+      streamWrite dialer2 payload2
+      resp2 <- readNBytes dialer2 pingSize
+      resp2 `shouldBe` payload2
+      close1
+      close2
+      wait h1
+      wait h2
+
+    it "resets the third concurrent ping stream from a peer while the first two stay usable" $ do
+      limiter <- newPingLimiter
+      let peer = PeerId "capped-peer"
+      (dialer1, close1, listener1) <- mkClosableStreamPair
+      (dialer2, close2, listener2) <- mkClosableStreamPair
+      (dialer3, _close3, listener3) <- mkClosableStreamPair
+      h1 <- async $ handlePingLimited limiter listener1 peer
+      h2 <- async $ handlePingLimited limiter listener2 peer
+      -- Prove both slots are held before opening the third stream.
+      streamWrite dialer1 (BS.pack [1..32])
+      _ <- readNBytes dialer1 pingSize
+      streamWrite dialer2 (BS.pack [33..64])
+      _ <- readNBytes dialer2 pingSize
+      -- The third stream must be refused: the handler returns without
+      -- serving the echo loop and closes its side of the stream.
+      h3 <- async $ handlePingLimited limiter listener3 peer
+      done3 <- timeout 1000000 (wait h3)
+      done3 `shouldBe` Just ()
+      streamWrite dialer3 (BS.pack [65..96])
+      echoed <- try (readNBytes dialer3 pingSize)
+      case echoed of
+        Left (_ :: IOError) -> pure ()  -- EOF from the reset
+        Right bs -> expectationFailure $
+          "third ping stream was served, echoed: " ++ show bs
+      -- The first two streams keep echoing after the refusal.
+      let payload1' = BS.pack [97..128]
+          payload2' = BS.pack [129..160]
+      streamWrite dialer1 payload1'
+      resp1 <- readNBytes dialer1 pingSize
+      resp1 `shouldBe` payload1'
+      streamWrite dialer2 payload2'
+      resp2 <- readNBytes dialer2 pingSize
+      resp2 `shouldBe` payload2'
+      close1
+      close2
+      wait h1
+      wait h2
+
+    it "closing a ping stream frees a slot for a new stream from the same peer" $ do
+      limiter <- newPingLimiter
+      let peer = PeerId "capped-peer"
+      (dialer1, close1, listener1) <- mkClosableStreamPair
+      (dialer2, close2, listener2) <- mkClosableStreamPair
+      h1 <- async $ handlePingLimited limiter listener1 peer
+      h2 <- async $ handlePingLimited limiter listener2 peer
+      streamWrite dialer1 (BS.pack [1..32])
+      _ <- readNBytes dialer1 pingSize
+      streamWrite dialer2 (BS.pack [33..64])
+      _ <- readNBytes dialer2 pingSize
+      -- Close the first stream; once its handler exits, the slot is free.
+      close1
+      wait h1
+      (dialer3, close3, listener3) <- mkClosableStreamPair
+      h3 <- async $ handlePingLimited limiter listener3 peer
+      let payload3 = BS.pack [65..96]
+      streamWrite dialer3 payload3
+      resp3 <- readNBytes dialer3 pingSize
+      resp3 `shouldBe` payload3
+      close2
+      close3
+      wait h2
+      wait h3
+
+    it "caps ping streams per peer, not globally" $ do
+      limiter <- newPingLimiter
+      let peerA = PeerId "peer-a"
+          peerB = PeerId "peer-b"
+      (dialerA1, closeA1, listenerA1) <- mkClosableStreamPair
+      (dialerA2, closeA2, listenerA2) <- mkClosableStreamPair
+      hA1 <- async $ handlePingLimited limiter listenerA1 peerA
+      hA2 <- async $ handlePingLimited limiter listenerA2 peerA
+      -- Peer A holds both of its slots.
+      streamWrite dialerA1 (BS.pack [1..32])
+      _ <- readNBytes dialerA1 pingSize
+      streamWrite dialerA2 (BS.pack [33..64])
+      _ <- readNBytes dialerA2 pingSize
+      -- A stream from peer B is still served.
+      (dialerB, closeB, listenerB) <- mkClosableStreamPair
+      hB <- async $ handlePingLimited limiter listenerB peerB
+      let payloadB = BS.pack [65..96]
+      streamWrite dialerB payloadB
+      respB <- readNBytes dialerB pingSize
+      respB `shouldBe` payloadB
+      closeA1
+      closeA2
+      closeB
+      wait hA1
+      wait hA2
+      wait hB
+
+    it "the handler registered by registerPingHandler enforces the per-peer cap" $ do
+      sw <- mkTestSwitch
+      registerPingHandler sw
+      protos <- atomically $ readTVar (swProtocols sw)
+      handler <- maybe (fail "ping handler not registered") pure
+        (Map.lookup pingProtocolId protos)
+      conn <- mkPingConnection (fail "test connection: no outbound streams")
+      (dialer1, close1, listener1) <- mkClosableStreamPair
+      (dialer2, close2, listener2) <- mkClosableStreamPair
+      (dialer3, _close3, listener3) <- mkClosableStreamPair
+      h1 <- async $ handler conn listener1
+      h2 <- async $ handler conn listener2
+      streamWrite dialer1 (BS.pack [1..32])
+      _ <- readNBytes dialer1 pingSize
+      streamWrite dialer2 (BS.pack [33..64])
+      _ <- readNBytes dialer2 pingSize
+      h3 <- async $ handler conn listener3
+      done3 <- timeout 1000000 (wait h3)
+      done3 `shouldBe` Just ()
+      streamWrite dialer3 (BS.pack [65..96])
+      echoed <- try (readNBytes dialer3 pingSize)
+      case echoed of
+        Left (_ :: IOError) -> pure ()
+        Right bs -> expectationFailure $
+          "third ping stream was served, echoed: " ++ show bs
+      close1
+      close2
+      wait h1
+      wait h2
+
   describe "Ping registration" $ do
     it "registerPingHandler adds handler to switch" $ do
       Right kp <- generateKeyPair
