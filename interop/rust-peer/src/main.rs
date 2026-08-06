@@ -18,9 +18,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(false)
         .init();
 
-    let is_dialer = env::var("is_dialer").unwrap_or_else(|_| "false".to_string()) == "true";
-    let redis_addr = env::var("redis_addr").unwrap_or_else(|_| "redis:6379".to_string());
+    let is_dialer = env::var("IS_DIALER").unwrap_or_else(|_| "false".to_string()) == "true";
+    let redis_addr = env::var("REDIS_ADDR").unwrap_or_else(|_| "redis:6379".to_string());
+    let test_key = env::var("TEST_KEY")?;
     let redis_url = format!("redis://{}/", redis_addr);
+    let addr_key = format!("{}_listener_multiaddr", test_key);
 
     // Generate Ed25519 keypair
     let local_key = identity::Keypair::generate_ed25519();
@@ -54,9 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     swarm.behaviour_mut().subscribe(&topic)?;
 
     if is_dialer {
-        run_dialer(&mut swarm, &topic, &redis_url).await
+        run_dialer(&mut swarm, &topic, &redis_url, &addr_key).await
     } else {
-        run_listener(&mut swarm, &topic, &redis_url).await
+        run_listener(&mut swarm, &topic, &redis_url, &addr_key).await
     }
 }
 
@@ -64,6 +66,7 @@ async fn run_listener(
     swarm: &mut Swarm<gossipsub::Behaviour>,
     topic: &gossipsub::IdentTopic,
     redis_url: &str,
+    addr_key: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
@@ -94,7 +97,7 @@ async fn run_listener(
 
     let client = redis::Client::open(redis_url)?;
     let mut redis_conn = client.get_connection()?;
-    redis_conn.rpush::<_, _, ()>("listenerAddr", &full_addr)?;
+    redis_conn.set::<_, _, ()>(addr_key, &full_addr)?;
 
     // Wait for incoming messages — log all events for debugging
     let result = timeout(Duration::from_secs(60), async {
@@ -163,15 +166,24 @@ async fn run_dialer(
     swarm: &mut Swarm<gossipsub::Behaviour>,
     topic: &gossipsub::IdentTopic,
     redis_url: &str,
+    addr_key: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("Waiting for listener address from Redis...");
+    eprintln!("Polling Redis for listener address...");
 
     let client = redis::Client::open(redis_url)?;
     let mut redis_conn = client.get_connection()?;
 
-    // BLPOP for listener address
-    let result: Option<(String, String)> = redis_conn.blpop("listenerAddr", 60.0)?;
-    let (_key, addr_str) = result.ok_or("timeout waiting for listener address")?;
+    // Poll GET until the listener publishes its address (60s timeout)
+    let addr_str = timeout(Duration::from_secs(60), async {
+        loop {
+            if let Some(addr) = redis_conn.get::<_, Option<String>>(addr_key)? {
+                return Ok::<_, redis::RedisError>(addr);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .map_err(|_| "timeout waiting for listener address")??;
     eprintln!("Got listener address: {addr_str}");
 
     let remote_addr: Multiaddr = addr_str.parse()?;

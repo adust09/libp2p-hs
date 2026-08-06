@@ -1,60 +1,79 @@
 # GossipSub cross-implementation interop test: libp2p-hs <-> rust-libp2p.
+# Both peers use the unified-testing "modern" env var and Redis key scheme
+# (the gossipsub mode itself is a local extension, not an upstream contract).
 #
 # Test 1 (Rust listener, HS dialer):
-#   docker compose -f docker-compose.gossipsub.yml up --build rust-listener hs-dialer redis --abort-on-container-exit
+#   docker compose -f docker-compose.gossipsub.yml up --build --exit-code-from hs-dialer redis rust-listener hs-dialer
 #
 # Test 2 (HS listener, Rust dialer):
-#   docker compose -f docker-compose.gossipsub.yml up --build hs-listener rust-dialer redis --abort-on-container-exit
+#   docker compose -f docker-compose.gossipsub.yml up --build --exit-code-from rust-dialer redis hs-listener rust-dialer
+x-test-key: &test-key "90551b29"
+
+x-hs-env: &hs-env
+  REDIS_ADDR: "redis:6379"
+  TEST_KEY: *test-key
+  TRANSPORT: tcp
+  SECURE_CHANNEL: noise
+  MUXER: yamux
+  LISTENER_IP: "0.0.0.0"
+  TEST_MODE: gossipsub
+
+x-rust-env: &rust-env
+  REDIS_ADDR: "redis:6379"
+  TEST_KEY: *test-key
+
 services:
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
 
   # --- Test 1: Rust listener, HS dialer ---
   rust-listener:
     build:
       context: ./interop/rust-peer
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
-      is_dialer: "false"
-      redis_addr: "redis:6379"
+      <<: *rust-env
+      IS_DIALER: "false"
 
   hs-dialer:
     build: .
     depends_on:
-      - redis
-      - rust-listener
+      redis:
+        condition: service_healthy
+      rust-listener:
+        condition: service_started
     environment:
-      transport: tcp
-      security: noise
-      muxer: yamux
-      is_dialer: "true"
-      redis_addr: "redis:6379"
-      test_timeout_seconds: "180"
-      test_mode: gossipsub
+      <<: *hs-env
+      IS_DIALER: "true"
 
   # --- Test 2: HS listener, Rust dialer ---
   hs-listener:
     build: .
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
-      transport: tcp
-      security: noise
-      muxer: yamux
-      is_dialer: "false"
-      redis_addr: "redis:6379"
-      test_timeout_seconds: "180"
-      test_mode: gossipsub
+      <<: *hs-env
+      IS_DIALER: "false"
 
   rust-dialer:
     build:
       context: ./interop/rust-peer
     depends_on:
-      - redis
-      - hs-listener
+      redis:
+        condition: service_healthy
+      hs-listener:
+        condition: service_started
     environment:
-      is_dialer: "true"
-      redis_addr: "redis:6379"
+      <<: *rust-env
+      IS_DIALER: "true"

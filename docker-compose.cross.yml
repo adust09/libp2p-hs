@@ -3,6 +3,15 @@
 # Prerequisites:
 #   git clone --depth 1 --branch v0.48.0 https://github.com/libp2p/go-libp2p.git go-libp2p
 #
+# libp2p-hs speaks the unified-testing "modern" contract (uppercase env vars,
+# TEST_KEY-namespaced `<TEST_KEY>_listener_multiaddr` string key). The pinned
+# go-libp2p test app is a "legacy" test-plans app (lowercase env vars,
+# `listenerAddr` list). The shim-* services translate between the two key
+# schemes, mirroring the Redis proxy unified-testing runs for legacy images.
+# Each dialer pulls its shim in via depends_on, and a shim idles after
+# translating so it never triggers --exit-code-from's abort-on-exit before
+# the dialer finishes; the dialer's own timeout bounds the run.
+#
 # Test 1: go-libp2p listener, libp2p-hs dialer
 #   docker compose -f docker-compose.cross.yml up --build --exit-code-from hs-dialer redis go-listener hs-dialer
 #
@@ -11,10 +20,27 @@
 #
 # --exit-code-from <dialer> makes `up` return the dialer's exit code (0 on success),
 # so failures are not masked when another container exits 0 first.
+x-test-key: &test-key "cafe0129"
+
+x-hs-env: &hs-env
+  REDIS_ADDR: "redis:6379"
+  TEST_KEY: *test-key
+  TRANSPORT: tcp
+  SECURE_CHANNEL: noise
+  MUXER: yamux
+  LISTENER_IP: "0.0.0.0"
+
+x-go-env: &go-env
+  transport: tcp
+  security: noise
+  muxer: yamux
+  redis_addr: "redis:6379"
+  test_timeout_seconds: "180"
+
 services:
   redis:
     image: redis:7-alpine
-    # Disable persistence so a stale listenerAddr never survives across runs.
+    # Disable persistence so a stale listener address never survives across runs.
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "6379"
@@ -24,7 +50,7 @@ services:
       timeout: 3s
       retries: 30
 
-  # --- Test 1: go listener, hs dialer ---
+  # --- Test 1: go listener (legacy), hs dialer (modern) ---
   go-listener:
     build:
       context: ./go-libp2p
@@ -33,12 +59,25 @@ services:
       redis:
         condition: service_healthy
     environment:
-      transport: tcp
-      security: noise
-      muxer: yamux
+      <<: *go-env
       is_dialer: "false"
-      redis_addr: "redis:6379"
-      test_timeout_seconds: "180"
+
+  # Legacy -> modern: BLPOP the go listener's address off the legacy
+  # `listenerAddr` list and SET it under the modern namespaced key.
+  shim-go-to-hs:
+    image: redis:7-alpine
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      TEST_KEY: *test-key
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        ADDR=$$(redis-cli -h redis blpop listenerAddr 0 | tail -1)
+        if [ -z "$$ADDR" ]; then echo "shim: no listener address" >&2; exit 1; fi
+        redis-cli -h redis set "$${TEST_KEY}_listener_multiaddr" "$$ADDR"
+        exec tail -f /dev/null
 
   hs-dialer:
     build: .
@@ -48,15 +87,13 @@ services:
         condition: service_healthy
       go-listener:
         condition: service_started
+      shim-go-to-hs:
+        condition: service_started
     environment:
-      transport: tcp
-      security: noise
-      muxer: yamux
-      is_dialer: "true"
-      redis_addr: "redis:6379"
-      test_timeout_seconds: "180"
+      <<: *hs-env
+      IS_DIALER: "true"
 
-  # --- Test 2: hs listener, go dialer ---
+  # --- Test 2: hs listener (modern), go dialer (legacy) ---
   hs-listener:
     build: .
     image: libp2p-hs-interop:latest
@@ -64,12 +101,24 @@ services:
       redis:
         condition: service_healthy
     environment:
-      transport: tcp
-      security: noise
-      muxer: yamux
-      is_dialer: "false"
-      redis_addr: "redis:6379"
-      test_timeout_seconds: "180"
+      <<: *hs-env
+      IS_DIALER: "false"
+
+  # Modern -> legacy: poll the modern namespaced key and RPUSH it onto the
+  # legacy `listenerAddr` list for the go dialer's BLPOP.
+  shim-hs-to-go:
+    image: redis:7-alpine
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      TEST_KEY: *test-key
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        until ADDR=$$(redis-cli -h redis get "$${TEST_KEY}_listener_multiaddr"); [ -n "$$ADDR" ]; do sleep 0.2; done
+        redis-cli -h redis rpush listenerAddr "$$ADDR"
+        exec tail -f /dev/null
 
   go-dialer:
     build:
@@ -80,10 +129,8 @@ services:
         condition: service_healthy
       hs-listener:
         condition: service_started
+      shim-hs-to-go:
+        condition: service_started
     environment:
-      transport: tcp
-      security: noise
-      muxer: yamux
+      <<: *go-env
       is_dialer: "true"
-      redis_addr: "redis:6379"
-      test_timeout_seconds: "180"
