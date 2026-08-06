@@ -1,6 +1,6 @@
 ---
 title: Transport-Interop Results
-last_updated: 2026-05-27
+last_updated: 2026-08-06
 tags:
   - interop
   - transport
@@ -15,6 +15,13 @@ This document records reproducible evidence that the `libp2p-interop` binary
 [libp2p/test-plans](https://github.com/libp2p/test-plans/tree/master/transport-interop)
 **ping** contract against go-libp2p, in both dialer and listener roles, over
 **TCP + Noise + Yamux**.
+
+> **Update (2026-08-06, issue #129):** `interop/Main.hs` has since been migrated
+> to the [libp2p/unified-testing](https://github.com/libp2p/unified-testing)
+> "modern" transport contract (uppercase env vars, `TEST_KEY`-namespaced Redis
+> keys, YAML results on stdout). The legacy-contract details below are kept as
+> a historical record of the original test-plans runs; the go-libp2p cross
+> tests now go through the key-translation shims in `docker-compose.cross.yml`.
 
 ## Environment
 

@@ -1,21 +1,28 @@
--- | Interop test daemon for libp2p test-plans framework.
+-- | Interop test daemon for the libp2p/unified-testing framework.
 --
--- Reads configuration from environment variables, acts as either
--- a listener or dialer, coordinating via Redis.
+-- Implements the "modern" transport test-app contract
+-- (unified-testing docs/write-a-transport-test-app.md): reads uppercase
+-- environment variables, coordinates listener discovery through a shared
+-- Redis instance namespaced by TEST_KEY, and reports dialer measurements
+-- as YAML on stdout. All logging goes to stderr.
 --
--- Environment variables:
---   transport          - must be "tcp"
---   security           - must be "noise"
---   muxer              - must be "yamux"
---   is_dialer          - "true" or "false"
---   ip                 - bind address (default: "0.0.0.0")
---   redis_addr         - Redis host:port (default: "redis:6379")
---   test_timeout_seconds - timeout in seconds (default: "180")
---   test_mode          - "ping" (default) or "gossipsub"
+-- Environment variables (transport contract):
+--   IS_DIALER      - "true" or "false"
+--   REDIS_ADDR     - Redis host:port (default: "redis:6379")
+--   TEST_KEY       - hex key namespacing Redis coordination keys
+--   TRANSPORT      - must be "tcp"
+--   SECURE_CHANNEL - must be "noise"
+--   MUXER          - must be "yamux"
+--   LISTENER_IP    - bind address (default: "0.0.0.0")
+--   DEBUG          - accepted but ignored; all logging goes to stderr
+--
+-- Local extension (not part of the upstream contract):
+--   TEST_MODE      - "ping" (default) or "gossipsub"
 module Main (main) where
 
 import Control.Concurrent (threadDelay, forkIO, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, writeTVar)
+import Control.Monad (forever, join, void)
 import Data.Aeson (object, (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Char8 as BS8
@@ -72,19 +79,23 @@ import System.Environment (lookupEnv)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, hPutStrLn, stderr, stdout)
 import System.Timeout (timeout)
+import Text.Printf (printf)
+
+-- | The runner kills containers itself; this bounds Redis polling and
+-- local gossipsub waits.
+testTimeoutSeconds :: Int
+testTimeoutSeconds = 180
 
 main :: IO ()
 main = do
-  -- Read environment variables
-  transport <- getEnvRequired "transport"
-  security  <- getEnvRequired "security"
-  muxer     <- getEnvRequired "muxer"
-  isDialer  <- getEnvRequired "is_dialer"
-  ip        <- fromMaybe "0.0.0.0" <$> lookupEnv "ip"
-  redisAddr <- fromMaybe "redis:6379" <$> lookupEnv "redis_addr"
-  timeoutS  <- maybe 180 read <$> lookupEnv "test_timeout_seconds"
-
-  testMode  <- fromMaybe "ping" <$> lookupEnv "test_mode"
+  isDialer  <- getEnvRequired "IS_DIALER"
+  redisAddr <- fromMaybe "redis:6379" <$> lookupEnv "REDIS_ADDR"
+  testKey   <- getEnvRequired "TEST_KEY"
+  transport <- getEnvRequired "TRANSPORT"
+  security  <- lookupEnv "SECURE_CHANNEL"
+  muxer     <- lookupEnv "MUXER"
+  ip        <- fromMaybe "0.0.0.0" <$> lookupEnv "LISTENER_IP"
+  testMode  <- fromMaybe "ping" <$> lookupEnv "TEST_MODE"
 
   -- Validate supported protocols
   case validateProtocols transport security muxer of
@@ -92,6 +103,8 @@ main = do
       hPutStrLn stderr $ "Unsupported configuration: " ++ err
       exitFailure
     Right () -> pure ()
+
+  let addrKey = BS8.pack (testKey ++ "_listener_multiaddr")
 
   -- Generate identity
   ekp <- generateKeyPair
@@ -116,85 +129,44 @@ main = do
             }
       redisConn <- Redis.checkedConnect redisConnInfo
 
-      case testMode of
-        "gossipsub" -> case isDialer of
-          "false" -> runGossipSubListener sw pid ip redisConn timeoutS
-          "true"  -> runGossipSubDialer sw pid redisConn timeoutS
-          other   -> do
-            hPutStrLn stderr $ "Invalid is_dialer value: " ++ other
-            switchClose sw
-            exitFailure
-        _ -> do
-          registerPingHandler sw
-          case isDialer of
-            "false" -> runListener sw pid ip redisConn timeoutS
-            "true"  -> runDialer sw pid redisConn timeoutS
-            other   -> do
-              hPutStrLn stderr $ "Invalid is_dialer value: " ++ other
-              switchClose sw
-              exitFailure
-
--- | Listener mode: bind, publish address to Redis, wait.
-runListener :: Switch -> PeerId -> String -> Redis.Connection -> Int -> IO ()
-runListener sw pid ip redisConn timeoutS = do
-  let bindAddr = case fromText (T.pack ("/ip4/" ++ ip ++ "/tcp/0")) of
-        Right ma -> ma
-        Left err -> error $ "Invalid bind address: " ++ err
-
-  addrs <- switchListen sw defaultConnectionGater [bindAddr]
-  case addrs of
-    [] -> do
-      hPutStrLn stderr "switchListen returned no addresses"
-      switchClose sw
-      exitFailure
-    (listenAddr : _) -> do
-      -- Resolve actual IP if bound to 0.0.0.0
-      actualAddr <- resolveListenAddr listenAddr ip
-
-      -- Construct full multiaddr with /p2p/<peerId>
-      let peerIdMH = peerIdBytes pid
-      let fullAddr = encapsulateP2P actualAddr peerIdMH
-      let addrText = toText fullAddr
-
-      logInfo $ "Listening on: " ++ T.unpack addrText
-
-      -- Publish to Redis
-      let addrBS = TE.encodeUtf8 addrText
-      result <- Redis.runRedis redisConn $ Redis.rpush "listenerAddr" [addrBS]
-      case result of
-        Left err -> do
-          hPutStrLn stderr $ "Redis RPUSH failed: " ++ show err
-          switchClose sw
-          exitFailure
-        Right _ -> do
-          logInfo "Address published to Redis, waiting..."
-          -- The test runner kills this process once the dialer finishes.
-          -- Reaching the timeout means we were never successfully dialed,
-          -- which is a test failure (transport-interop README, Listener step 5).
-          threadDelay (timeoutS * 1000000)
-          hPutStrLn stderr "Listener timed out waiting to be dialed"
+      dialer <- case isDialer of
+        "true"  -> pure True
+        "false" -> pure False
+        other   -> do
+          hPutStrLn stderr $ "Invalid IS_DIALER value: " ++ other
           switchClose sw
           exitFailure
 
--- | Dialer mode: get address from Redis, dial, ping, output JSON.
-runDialer :: Switch -> PeerId -> Redis.Connection -> Int -> IO ()
-runDialer sw _pid redisConn timeoutS = do
-  logInfo "Waiting for listener address from Redis..."
+      case (testMode, dialer) of
+        ("gossipsub", False) -> runGossipSubListener sw pid ip redisConn addrKey
+        ("gossipsub", True)  -> runGossipSubDialer sw pid redisConn addrKey
+        (_, False) -> registerPingHandler sw >> runListener sw pid ip redisConn addrKey
+        (_, True)  -> registerPingHandler sw >> runDialer sw pid redisConn addrKey
 
-  -- BLPOP with timeout
-  result <- Redis.runRedis redisConn $
-    Redis.blpop ["listenerAddr"] (fromIntegral timeoutS)
+-- | Listener mode: bind, publish address to Redis, run until Docker
+-- shuts the container down (transport contract, Listener step 5).
+runListener :: Switch -> PeerId -> String -> Redis.Connection -> BS8.ByteString -> IO ()
+runListener sw pid ip redisConn addrKey = do
+  addrText <- listenAndResolve sw pid ip
 
-  case result of
-    Left err -> do
-      hPutStrLn stderr $ "Redis BLPOP failed: " ++ show err
-      switchClose sw
-      exitFailure
-    Right Nothing -> do
+  logInfo $ "Listening on: " ++ T.unpack addrText
+
+  publishListenerAddr redisConn addrKey addrText
+  logInfo "Address published to Redis, waiting to be dialed..."
+  forever $ threadDelay 3600000000
+
+-- | Dialer mode: get address from Redis, dial, ping, output YAML.
+runDialer :: Switch -> PeerId -> Redis.Connection -> BS8.ByteString -> IO ()
+runDialer sw _pid redisConn addrKey = do
+  logInfo "Polling Redis for listener address..."
+
+  mAddr <- pollListenerAddr redisConn addrKey
+  case mAddr of
+    Nothing -> do
       hPutStrLn stderr "Timed out waiting for listener address"
       switchClose sw
       exitFailure
-    Right (Just (_key, addrBS)) -> do
+    Just addrBS -> do
       let addrText = TE.decodeUtf8 addrBS
       logInfo $ "Got listener address: " ++ T.unpack addrText
 
@@ -212,7 +184,7 @@ runDialer sw _pid redisConn timeoutS = do
             logInfo $ "Dialing peer: " ++ T.unpack (toBase58 remotePeerId)
 
             -- handshakeStartInstant, recorded before connecting
-            -- (transport-interop README, Dialer step 4).
+            -- (transport contract, Dialer step 4).
             t0 <- getCurrentTime
 
             dialResult <- dial sw remotePeerId [transportAddr]
@@ -222,8 +194,9 @@ runDialer sw _pid redisConn timeoutS = do
                 switchClose sw
                 exitFailure
               Right conn -> do
-                -- A single ping (README steps 5-6): its round-trip time is
-                -- pingRTT, and the total elapsed since t0 is handshakePlusOneRTT.
+                -- A single ping (contract steps 4-5): its round-trip time
+                -- is ping_rtt, and the total elapsed since t0 is
+                -- handshake_plus_one_rtt.
                 pingResult <- sendPing sw conn
                 t1 <- getCurrentTime
 
@@ -236,20 +209,18 @@ runDialer sw _pid redisConn timeoutS = do
                     let handshakePlusOneRTT = realToFrac (diffUTCTime t1 t0) * 1000 :: Double
                         pingRTTMs = realToFrac (pingRTT pr) * 1000 :: Double
 
-                    -- Output JSON (pingRTTMilllis triple-L is the upstream spelling)
-                    let jsonOutput = object
-                          [ "handshakePlusOneRTTMillis" .= handshakePlusOneRTT
-                          , "pingRTTMilllis" .= pingRTTMs
-                          ]
-                    LBS8.putStrLn (Aeson.encode jsonOutput)
+                    -- Results schema: YAML on stdout, stdout is used for
+                    -- nothing else (transport contract, Results Schema).
+                    printf "latency:\n  handshake_plus_one_rtt: %.3f\n  ping_rtt: %.3f\n  unit: ms\n"
+                      handshakePlusOneRTT pingRTTMs
                     hFlush stdout
 
                     switchClose sw
                     exitSuccess
 
 -- | GossipSub listener: join topic, wait for message, reply, report to Redis.
-runGossipSubListener :: Switch -> PeerId -> String -> Redis.Connection -> Int -> IO ()
-runGossipSubListener sw pid ip redisConn timeoutS = do
+runGossipSubListener :: Switch -> PeerId -> String -> Redis.Connection -> BS8.ByteString -> IO ()
+runGossipSubListener sw pid ip redisConn addrKey = do
   let gsParams = defaultGossipSubParams { paramHeartbeatInterval = 60.0 }
   gsNode <- newGossipSubNode sw gsParams
   startGossipSub gsNode
@@ -259,84 +230,61 @@ runGossipSubListener sw pid ip redisConn timeoutS = do
   atomically $ writeTVar (gsOnMessage (gsnRouter gsNode))
     (\topic msg -> putMVar msgMVar (topic, msgData msg))
 
-  let bindAddr = case fromText (T.pack ("/ip4/" ++ ip ++ "/tcp/0")) of
-        Right ma -> ma
-        Left err -> error $ "Invalid bind address: " ++ err
+  addrText <- listenAndResolve sw pid ip
+  logInfo $ "GossipSub listener on: " ++ T.unpack addrText
 
-  addrs <- switchListen sw defaultConnectionGater [bindAddr]
-  case addrs of
-    [] -> do
-      hPutStrLn stderr "switchListen returned no addresses"
+  publishListenerAddr redisConn addrKey addrText
+  logInfo "Address published to Redis"
+
+  -- Join topic
+  gossipJoin gsNode "interop-gossipsub-test"
+  logInfo "Joined topic interop-gossipsub-test"
+
+  -- Re-announce subscriptions to peers that connect after join.
+  -- onNewConnection should handle this but cross-impl timing
+  -- can cause the announcement to be lost.
+  _ <- forkIO $ reannounceLoop gsNode "interop-gossipsub-test" 10
+
+  -- Wait for message
+  mResult <- timeout (testTimeoutSeconds * 1000000) $ takeMVar msgMVar
+  case mResult of
+    Nothing -> do
+      hPutStrLn stderr "Timeout waiting for GossipSub message"
+      let jsonOutput = object
+            [ "gossipSubInterop" .= False
+            , "role" .= ("listener" :: T.Text)
+            , "error" .= ("timeout" :: T.Text)
+            ]
+      void $ Redis.runRedis redisConn $
+        Redis.rpush "gossipResult" [LBS.toStrict (Aeson.encode jsonOutput)]
       stopGossipSub gsNode; switchClose sw
       exitFailure
-    (listenAddr : _) -> do
-      actualAddr <- resolveListenAddr listenAddr ip
-      let peerIdMH = peerIdBytes pid
-      let fullAddr = encapsulateP2P actualAddr peerIdMH
-      let addrText = toText fullAddr
+    Just (_topic, msgBytes) -> do
+      let received = BS8.unpack msgBytes
+      logInfo $ "Received message: " ++ received
 
-      logInfo $ "GossipSub listener on: " ++ T.unpack addrText
+      -- Publish reply
+      threadDelay 500000  -- 0.5s for stability
+      let replyMsg = "hs-reply-to-" ++ received
+      gossipPublish gsNode "interop-gossipsub-test" (BS8.pack replyMsg)
+      logInfo $ "Published reply: " ++ replyMsg
 
-      -- Publish address to Redis
-      let addrBS = TE.encodeUtf8 addrText
-      result <- Redis.runRedis redisConn $ Redis.rpush "listenerAddr" [addrBS]
-      case result of
-        Left err -> do
-          hPutStrLn stderr $ "Redis RPUSH failed: " ++ show err
-          stopGossipSub gsNode; switchClose sw
-          exitFailure
-        Right _ -> do
-          logInfo "Address published to Redis"
+      let jsonOutput = object
+            [ "gossipSubInterop" .= True
+            , "role" .= ("listener" :: T.Text)
+            , "messageReceived" .= received
+            , "messageSent" .= replyMsg
+            ]
+      void $ Redis.runRedis redisConn $
+        Redis.rpush "gossipResult" [LBS.toStrict (Aeson.encode jsonOutput)]
 
-          -- Join topic
-          gossipJoin gsNode "interop-gossipsub-test"
-          logInfo "Joined topic interop-gossipsub-test"
-
-          -- Re-announce subscriptions to peers that connect after join.
-          -- onNewConnection should handle this but cross-impl timing
-          -- can cause the announcement to be lost.
-          _ <- forkIO $ reannounceLoop gsNode "interop-gossipsub-test" 10
-
-          -- Wait for message
-          mResult <- timeout (timeoutS * 1000000) $ takeMVar msgMVar
-          case mResult of
-            Nothing -> do
-              hPutStrLn stderr "Timeout waiting for GossipSub message"
-              let jsonOutput = object
-                    [ "gossipSubInterop" .= False
-                    , "role" .= ("listener" :: T.Text)
-                    , "error" .= ("timeout" :: T.Text)
-                    ]
-              void $ Redis.runRedis redisConn $
-                Redis.rpush "gossipResult" [LBS.toStrict (Aeson.encode jsonOutput)]
-              stopGossipSub gsNode; switchClose sw
-              exitFailure
-            Just (_topic, msgBytes) -> do
-              let received = BS8.unpack msgBytes
-              logInfo $ "Received message: " ++ received
-
-              -- Publish reply
-              threadDelay 500000  -- 0.5s for stability
-              let replyMsg = "hs-reply-to-" ++ received
-              gossipPublish gsNode "interop-gossipsub-test" (BS8.pack replyMsg)
-              logInfo $ "Published reply: " ++ replyMsg
-
-              let jsonOutput = object
-                    [ "gossipSubInterop" .= True
-                    , "role" .= ("listener" :: T.Text)
-                    , "messageReceived" .= received
-                    , "messageSent" .= replyMsg
-                    ]
-              void $ Redis.runRedis redisConn $
-                Redis.rpush "gossipResult" [LBS.toStrict (Aeson.encode jsonOutput)]
-
-              -- Keep alive briefly for reply delivery
-              threadDelay 3000000
-              stopGossipSub gsNode; switchClose sw
+      -- Keep alive briefly for reply delivery
+      threadDelay 3000000
+      stopGossipSub gsNode; switchClose sw
 
 -- | GossipSub dialer: connect, publish message, wait for reply, report JSON.
-runGossipSubDialer :: Switch -> PeerId -> Redis.Connection -> Int -> IO ()
-runGossipSubDialer sw _pid redisConn timeoutS = do
+runGossipSubDialer :: Switch -> PeerId -> Redis.Connection -> BS8.ByteString -> IO ()
+runGossipSubDialer sw _pid redisConn addrKey = do
   let gsParams = defaultGossipSubParams { paramHeartbeatInterval = 60.0 }
   gsNode <- newGossipSubNode sw gsParams
   startGossipSub gsNode
@@ -353,21 +301,15 @@ runGossipSubDialer sw _pid redisConn timeoutS = do
         else pure ()
     )
 
-  logInfo "GossipSub dialer: waiting for listener address from Redis..."
+  logInfo "GossipSub dialer: polling Redis for listener address..."
 
-  result <- Redis.runRedis redisConn $
-    Redis.blpop ["listenerAddr"] (fromIntegral timeoutS)
-
-  case result of
-    Left err -> do
-      hPutStrLn stderr $ "Redis BLPOP failed: " ++ show err
-      stopGossipSub gsNode; switchClose sw
-      exitFailure
-    Right Nothing -> do
+  mAddr <- pollListenerAddr redisConn addrKey
+  case mAddr of
+    Nothing -> do
       hPutStrLn stderr "Timed out waiting for listener address"
       stopGossipSub gsNode; switchClose sw
       exitFailure
-    Right (Just (_key, addrBS)) -> do
+    Just addrBS -> do
       let addrText = TE.decodeUtf8 addrBS
       logInfo $ "Got listener address: " ++ T.unpack addrText
 
@@ -409,7 +351,7 @@ runGossipSubDialer sw _pid redisConn timeoutS = do
                 logInfo $ "Published: " ++ BS8.unpack testMsg
 
                 -- Wait for reply
-                mResult <- timeout (timeoutS * 1000000) $ takeMVar msgMVar
+                mResult <- timeout (testTimeoutSeconds * 1000000) $ takeMVar msgMVar
                 t1 <- getCurrentTime
                 let roundTripMs = realToFrac (diffUTCTime t1 t0) * 1000 :: Double
 
@@ -445,6 +387,52 @@ runGossipSubDialer sw _pid redisConn timeoutS = do
                     stopGossipSub gsNode; switchClose sw
                     exitSuccess
 
+-- | Bind, resolve the non-localhost address, and return the full
+-- multiaddr (with /p2p/ suffix) as text.
+listenAndResolve :: Switch -> PeerId -> String -> IO T.Text
+listenAndResolve sw pid ip = do
+  let bindAddr = case fromText (T.pack ("/ip4/" ++ ip ++ "/tcp/0")) of
+        Right ma -> ma
+        Left err -> error $ "Invalid bind address: " ++ err
+
+  addrs <- switchListen sw defaultConnectionGater [bindAddr]
+  case addrs of
+    [] -> do
+      hPutStrLn stderr "switchListen returned no addresses"
+      switchClose sw
+      exitFailure
+    (listenAddr : _) -> do
+      -- Resolve actual IP if bound to 0.0.0.0
+      actualAddr <- resolveListenAddr listenAddr ip
+      let peerIdMH = peerIdBytes pid
+      let fullAddr = encapsulateP2P actualAddr peerIdMH
+      pure (toText fullAddr)
+
+-- | SET the listener multiaddr under the TEST_KEY-namespaced key.
+publishListenerAddr :: Redis.Connection -> BS8.ByteString -> T.Text -> IO ()
+publishListenerAddr redisConn addrKey addrText = do
+  result <- Redis.runRedis redisConn $ Redis.set addrKey (TE.encodeUtf8 addrText)
+  case result of
+    Left err -> do
+      hPutStrLn stderr $ "Redis SET failed: " ++ show err
+      exitFailure
+    Right _ -> pure ()
+
+-- | Poll GET on the listener-multiaddr key until it appears (dialer
+-- contract step 2). Returns Nothing on timeout or Redis error.
+pollListenerAddr :: Redis.Connection -> BS8.ByteString -> IO (Maybe BS8.ByteString)
+pollListenerAddr redisConn addrKey =
+  join <$> timeout (testTimeoutSeconds * 1000000) loop
+  where
+    loop = do
+      result <- Redis.runRedis redisConn $ Redis.get addrKey
+      case result of
+        Left err -> do
+          hPutStrLn stderr $ "Redis GET failed: " ++ show err
+          pure Nothing
+        Right (Just v) -> pure (Just v)
+        Right Nothing -> threadDelay 200000 >> loop
+
 -- | Periodically re-announce our topic subscription to all connected peers.
 -- Ensures cross-implementation peers that connect after we've joined the topic
 -- learn about our subscription even if the initial announcement is lost.
@@ -458,22 +446,22 @@ reannounceLoop gsNode topic iterations = go iterations
       gossipJoin gsNode topic
       go (n - 1)
 
--- | Discard the result of an IO action.
-void :: IO a -> IO ()
-void action = action >> pure ()
-
 -- | Validate that we support the requested protocol combination.
-validateProtocols :: String -> String -> String -> Either String ()
+-- SECURE_CHANNEL and MUXER are only set for non-standalone transports,
+-- which tcp is, so both are required here.
+validateProtocols :: String -> Maybe String -> Maybe String -> Either String ()
 validateProtocols transport security muxer = do
   case transport of
     "tcp" -> pure ()
     other -> Left $ "transport " ++ other ++ " not supported (only tcp)"
   case security of
-    "noise" -> pure ()
-    other -> Left $ "security " ++ other ++ " not supported (only noise)"
+    Just "noise" -> pure ()
+    Just other -> Left $ "secure channel " ++ other ++ " not supported (only noise)"
+    Nothing -> Left "SECURE_CHANNEL not set (required for tcp)"
   case muxer of
-    "yamux" -> pure ()
-    other -> Left $ "muxer " ++ other ++ " not supported (only yamux)"
+    Just "yamux" -> pure ()
+    Just other -> Left $ "muxer " ++ other ++ " not supported (only yamux)"
+    Nothing -> Left "MUXER not set (required for tcp)"
 
 -- | Parse "host:port" string.
 parseHostPort :: String -> (String, Int)

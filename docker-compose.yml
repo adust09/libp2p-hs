@@ -1,32 +1,43 @@
 # Self-to-self interop test: libp2p-hs listener + libp2p-hs dialer.
-# Usage: docker compose up --build --abort-on-container-exit
+# Both peers speak the unified-testing "modern" transport contract.
+# Usage: docker compose up --build --exit-code-from dialer
+x-hs-env: &hs-env
+  REDIS_ADDR: "redis:6379"
+  TEST_KEY: "cafe0129"
+  TRANSPORT: tcp
+  SECURE_CHANNEL: noise
+  MUXER: yamux
+  LISTENER_IP: "0.0.0.0"
+
 services:
   redis:
     image: redis:7-alpine
+    # Disable persistence so a stale listener address never survives across runs.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
 
   listener:
     build: .
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
-      transport: tcp
-      security: noise
-      muxer: yamux
-      is_dialer: "false"
-      redis_addr: "redis:6379"
-      test_timeout_seconds: "180"
+      <<: *hs-env
+      IS_DIALER: "false"
 
   dialer:
     build: .
     depends_on:
-      - redis
-      - listener
+      redis:
+        condition: service_healthy
+      listener:
+        condition: service_started
     environment:
-      transport: tcp
-      security: noise
-      muxer: yamux
-      is_dialer: "true"
-      redis_addr: "redis:6379"
-      test_timeout_seconds: "180"
+      <<: *hs-env
+      IS_DIALER: "true"

@@ -24,3 +24,4 @@ cabal.project.local~
 .playwright-mcp/
 cabal.project.freeze
 go-libp2p/
+interop/rust-peer/target/
