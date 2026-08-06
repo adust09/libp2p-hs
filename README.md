@@ -83,8 +83,6 @@ cabal test --test-option="--match=Integration"
 
 **[API Reference](https://adust09.github.io/libp2p-hs/)** — Generated Haddock documentation.
 
-Interop test evidence lives in `interop/RESULTS.md`.
-
 ## Specification
 
 Based on the [libp2p specification](https://github.com/libp2p/specs).
