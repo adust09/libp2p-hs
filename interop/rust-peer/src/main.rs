@@ -97,7 +97,7 @@ async fn run_listener(
 
     let client = redis::Client::open(redis_url)?;
     let mut redis_conn = client.get_connection()?;
-    redis_conn.set::<_, _, ()>(addr_key, &full_addr)?;
+    redis_conn.rpush::<_, _, ()>(addr_key, &full_addr)?;
 
     // Wait for incoming messages — log all events for debugging
     let result = timeout(Duration::from_secs(60), async {
@@ -173,10 +173,12 @@ async fn run_dialer(
     let client = redis::Client::open(redis_url)?;
     let mut redis_conn = client.get_connection()?;
 
-    // Poll GET until the listener publishes its address (60s timeout)
+    // Poll LPOP until the listener publishes its address (60s timeout).
+    // The address sits on a Redis list (listener RPUSHes, dialer LPOPs)
+    // per the unified-testing coordination contract.
     let addr_str = timeout(Duration::from_secs(60), async {
         loop {
-            if let Some(addr) = redis_conn.get::<_, Option<String>>(addr_key)? {
+            if let Some(addr) = redis_conn.lpop::<_, Option<String>>(addr_key, None)? {
                 return Ok::<_, redis::RedisError>(addr);
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
