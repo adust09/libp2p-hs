@@ -69,6 +69,7 @@ library
     LibP2P.DHT.Validator
     LibP2P.DHT
     LibP2P.DHT.Lookup
+    LibP2P.DHT.API
     LibP2P.NAT.AutoNAT.Message
     LibP2P.NAT.AutoNAT
     LibP2P.Crypto.SignedEnvelope
@@ -113,7 +114,7 @@ library
 
 executable libp2p-interop
   import:          warnings, lang
-  hs-source-dirs:  interop
+  hs-source-dirs:  interop/transport
   main-is:         Main.hs
   build-depends:
     base        >= 4.18 && < 5,
@@ -124,6 +125,22 @@ executable libp2p-interop
     hedis       >= 0.15 && < 0.16,
     aeson       >= 2.1  && < 2.3,
     stm         >= 2.4  && < 2.6,
+    libp2p-hs
+  ghc-options: -threaded -rtsopts
+
+executable libp2p-kad-dht-node
+  import:          warnings, lang
+  hs-source-dirs:  interop/kad-dht-node
+  main-is:         Main.hs
+  build-depends:
+    base        >= 4.18 && < 5,
+    bytestring  >= 0.10 && < 0.13,
+    text        >= 1.2  && < 2.2,
+    time        >= 1.9  && < 2,
+    network     >= 3.1  && < 3.3,
+    hedis       >= 0.15 && < 0.16,
+    stm         >= 2.4  && < 2.6,
+    containers  >= 0.6  && < 0.8,
     libp2p-hs
   ghc-options: -threaded -rtsopts
 
@@ -172,6 +189,7 @@ test-suite libp2p-hs-test
     LibP2P.DHT.DistanceSpec
     LibP2P.DHT.RoutingTableSpec
     LibP2P.DHT.MessageSpec
+    LibP2P.DHT.APISpec
     LibP2P.DHT.DHTSpec
     LibP2P.DHT.LookupSpec
     LibP2P.DHT.ValidatorSpec

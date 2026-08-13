@@ -1,0 +1,72 @@
+# Self-test docker-compose for the libp2p-hs kad-dht interop node.
+#
+# Runs the three roles (bootstrap, provider, querier) against each other
+# using Redis for coordination. Mirrors the unified-testing kad-dht pattern.
+#
+# Usage:
+#   docker compose -f docker-compose.kad-dht.yml up --build --exit-code-from querier
+#
+# The querier prints "status: pass" or "status: fail" on stdout.
+# The compose command returns the querier's exit code.
+
+x-test-key: &test-key "cafe0129"
+
+x-kad-env: &kad-env
+  REDIS_ADDR: "redis:6379"
+  TEST_KEY: *test-key
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  bootstrap:
+    build:
+      context: .
+      dockerfile: interop/kad-dht-node/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *kad-env
+      ROLE: bootstrap
+    # Stays up for the whole test; no --exit-code-from
+    stop_grace_period: 2s
+
+  provider:
+    build:
+      context: .
+      dockerfile: interop/kad-dht-node/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      bootstrap:
+        condition: service_started
+    environment:
+      <<: *kad-env
+      ROLE: provider
+    stop_grace_period: 2s
+
+  querier:
+    build:
+      context: .
+      dockerfile: interop/kad-dht-node/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      bootstrap:
+        condition: service_started
+      provider:
+        condition: service_started
+    environment:
+      <<: *kad-env
+      ROLE: querier
+    # querier exits when done — the test result is its exit code
+    stop_grace_period: 2s
