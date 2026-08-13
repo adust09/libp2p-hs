@@ -22,7 +22,7 @@ module Main (main) where
 
 import Control.Concurrent (threadDelay, forkIO, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, writeTVar)
-import Control.Monad (forever, join, void)
+import Control.Monad (forever, void)
 import Data.Aeson (object, (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Char8 as BS8
@@ -408,30 +408,36 @@ listenAndResolve sw pid ip = do
       let fullAddr = encapsulateP2P actualAddr peerIdMH
       pure (toText fullAddr)
 
--- | SET the listener multiaddr under the TEST_KEY-namespaced key.
+-- | RPUSH the listener multiaddr under the TEST_KEY-namespaced key.
+--
+-- The unified-testing coordination contract uses a Redis *list*: the
+-- listener RPUSHes its multiaddr and the dialer BLPOPs it. The test
+-- framework's redis-proxy only rewrites keys for RPUSH/BLPOP (legacy
+-- `listenerAddr` -> `{TEST_KEY}_listener_multiaddr`); a plain SET/GET
+-- string would collide with the list type and surface as Redis
+-- WRONGTYPE errors in every cross-implementation pair.
 publishListenerAddr :: Redis.Connection -> BS8.ByteString -> T.Text -> IO ()
 publishListenerAddr redisConn addrKey addrText = do
-  result <- Redis.runRedis redisConn $ Redis.set addrKey (TE.encodeUtf8 addrText)
+  result <- Redis.runRedis redisConn $ Redis.rpush addrKey [TE.encodeUtf8 addrText]
   case result of
     Left err -> do
-      hPutStrLn stderr $ "Redis SET failed: " ++ show err
+      hPutStrLn stderr $ "Redis RPUSH failed: " ++ show err
       exitFailure
     Right _ -> pure ()
 
--- | Poll GET on the listener-multiaddr key until it appears (dialer
--- contract step 2). Returns Nothing on timeout or Redis error.
+-- | BLPOP the listener-multiaddr key (dialer contract step 2). Blocks
+-- on Redis for up to 'testTimeoutSeconds' and returns the popped value,
+-- or Nothing on timeout / Redis error.
 pollListenerAddr :: Redis.Connection -> BS8.ByteString -> IO (Maybe BS8.ByteString)
-pollListenerAddr redisConn addrKey =
-  join <$> timeout (testTimeoutSeconds * 1000000) loop
-  where
-    loop = do
-      result <- Redis.runRedis redisConn $ Redis.get addrKey
-      case result of
-        Left err -> do
-          hPutStrLn stderr $ "Redis GET failed: " ++ show err
-          pure Nothing
-        Right (Just v) -> pure (Just v)
-        Right Nothing -> threadDelay 200000 >> loop
+pollListenerAddr redisConn addrKey = do
+  result <- Redis.runRedis redisConn $
+    Redis.blpop [addrKey] (fromIntegral testTimeoutSeconds)
+  case result of
+    Left err -> do
+      hPutStrLn stderr $ "Redis BLPOP failed: " ++ show err
+      pure Nothing
+    Right Nothing -> pure Nothing
+    Right (Just (_key, value)) -> pure (Just value)
 
 -- | Periodically re-announce our topic subscription to all connected peers.
 -- Ensures cross-implementation peers that connect after we've joined the topic
