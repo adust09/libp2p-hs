@@ -6,7 +6,7 @@
 IMAGE_NAME := libp2p-hs-interop
 
 .PHONY: build image self-test cross-test-go-listener cross-test-hs-listener \
-        cross-gossipsub-rust-listener cross-gossipsub-hs-listener cross-gossipsub
+        cross-gossipsub-rust-listener cross-gossipsub-hs-listener cross-gossipsub kad-dht
 
 image:
 	docker build -t $(IMAGE_NAME) ..
@@ -16,6 +16,10 @@ build: image
 # Self-test: hs listener + hs dialer
 self-test:
 	cd .. && docker compose up --build --exit-code-from dialer redis listener dialer
+
+# kad-dht self-test: hs bootstrap -> hs provider -> hs querier
+kad-dht:
+	cd .. && docker compose -f docker-compose.kad-dht.yml up --build --exit-code-from querier redis bootstrap provider querier
 
 # Cross-test: go listener, hs dialer (key-translation shim starts via depends_on)
 cross-test-go-listener:
