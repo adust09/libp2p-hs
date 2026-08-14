@@ -67,7 +67,7 @@ import LibP2P.DHT
   , registerDHTHandler
   )
 import LibP2P.DHT.API (findProviders, provide, putValue)
-import LibP2P.DHT.Lookup (iterativeGetValue)
+import LibP2P.DHT.Lookup (bootstrap, iterativeGetValue)
 import LibP2P.DHT.Message (DHTRecord (..))
 import LibP2P.DHT.Validator (Validator (..), namespacedValidator, pkValidator)
 
@@ -109,7 +109,10 @@ runBootstrap testKey = do
   tcp <- newTCPTransport
   sw  <- newSwitch pid kp
   addTransport sw tcp
-  dhtNode   <- newDHTNode sw DHTServer
+  dhtNode0 <- newDHTNode sw DHTServer
+  -- The interop contract stores values in the /example/ namespace, so
+  -- configure the server to validate that namespace before serving PUT_VALUE.
+  let dhtNode = dhtNode0 { dhtValidator = makeInteropValidator }
   registerDHTHandler dhtNode
 
   -- Listen on all interfaces
@@ -142,7 +145,8 @@ runProvider testKey = do
   tcp <- newTCPTransport
   sw  <- newSwitch pid kp
   addTransport sw tcp
-  dhtNode   <- newDHTNode sw DHTServer
+  dhtNode0 <- newDHTNode sw DHTServer
+  let dhtNode = dhtNode0 { dhtValidator = makeInteropValidator }
   registerDHTHandler dhtNode
 
   -- Listen
@@ -178,7 +182,12 @@ runProvider testKey = do
             result <- dial sw bootstrapPeerId [transportMA]
             case result of
               Left err -> die $ "failed to dial bootstrap: " ++ show err
-              Right _  -> logInfo "Connected to bootstrap node"
+              Right _  -> do
+                logInfo "Connected to bootstrap node"
+                -- Dialling alone does not populate a DHT routing table.
+                -- Seed it explicitly so the subsequent announcements reach
+                -- the bootstrap node.
+                bootstrap dhtNode [bootstrapPeerId]
 
             -- Let the DHT settle
             threadDelay 2000000
@@ -249,6 +258,9 @@ runQuerier testKey = do
                 printFail "dial_failed"
               Right _ -> do
                 logInfo "Connected to bootstrap node"
+                -- Seed the client routing table; otherwise lookups have no
+                -- initial candidate and return without sending an RPC.
+                bootstrap dhtNode [bootstrapPeerId]
 
                 -- Wait for provider to signal done
                 mDone <- pollRedis redisConn providerDoneKey
