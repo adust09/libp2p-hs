@@ -14,7 +14,7 @@
 --   addTransport sw tcp
 --   registerIdentifyHandlers sw
 --   registerPingHandler sw
---   _relayState <- registerNATHandlers sw defaultNATConfig
+--   (_relayState, _circuitState) <- registerNATHandlers sw defaultNATConfig
 --   addrs <- switchListen sw defaultConnectionGater [fromText "/ip4/127.0.0.1/tcp/0"]
 --   print addrs
 --   -- ... dial other peers, etc.
@@ -94,6 +94,9 @@ module LibP2P
   , RelayConfig (..)
   , defaultRelayConfig
   , newRelayState
+  , CircuitState
+  , circuitTransport
+  , newCircuitState
 
     -- * GossipSub
   , GossipSubNode (..)
@@ -123,6 +126,7 @@ import LibP2P.NAT
   , registerRelayStopHandler
   )
 import LibP2P.NAT.Relay (RelayConfig (..), RelayState, defaultRelayConfig, newRelayState)
+import LibP2P.NAT.Relay.Transport (CircuitState, circuitTransport, newCircuitState)
 import LibP2P.Protocol.GossipSub.Handler
   ( GossipSubNode (..)
   , gossipJoin
