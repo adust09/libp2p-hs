@@ -10,6 +10,10 @@
 --
 -- All logging goes to stderr. Stdout is reserved for the final pass/fail report.
 --
+-- Every role registers the Identify handlers. dotnet-libp2p awaits
+-- @\/ipfs\/id\/1.0.0@ on every outbound connection before its dial resolves, so
+-- a node that does not serve it is undialable from dotnet.
+--
 -- Environment variables:
 --   ROLE       - "bootstrap", "provider", or "querier"
 --   TEST_KEY   - hex key namespacing Redis coordination keys
@@ -70,6 +74,7 @@ import LibP2P.DHT.API (findProviders, provide, putValue)
 import LibP2P.DHT.Lookup (bootstrap, iterativeGetValue)
 import LibP2P.DHT.Message (DHTRecord (..))
 import LibP2P.DHT.Validator (Validator (..), namespacedValidator, pkValidator)
+import LibP2P.Protocol.Identify (registerIdentifyHandlers)
 
 ------------------------------------------------------------------------------
 -- Constants
@@ -100,6 +105,25 @@ main = do
       exitFailure
 
 ------------------------------------------------------------------------------
+-- Interop value contract
+------------------------------------------------------------------------------
+
+-- | Payload this node stores under the @/example/data/@ key.
+--
+-- The other implementations in the suite store @"hello from <impl> client"@
+-- (py: @"hello from py client"@, dotnet: @"hello from dotnet client"@), so a
+-- querier written against an exact payload can never read their records.
+interopValue :: String
+interopValue = "hello from haskell client"
+
+-- | Substring every implementation's payload shares.
+--
+-- Queriers match on this marker rather than the full payload so that a record
+-- published by any implementation is accepted.
+interopMarker :: ByteString
+interopMarker = BS8.pack "hello from"
+
+------------------------------------------------------------------------------
 -- Bootstrap role
 ------------------------------------------------------------------------------
 
@@ -109,6 +133,7 @@ runBootstrap testKey = do
   tcp <- newTCPTransport
   sw  <- newSwitch pid kp
   addTransport sw tcp
+  registerIdentifyHandlers sw
   dhtNode0 <- newDHTNode sw DHTServer
   -- The interop contract stores values in the /example/ namespace, so
   -- configure the server to validate that namespace before serving PUT_VALUE.
@@ -145,6 +170,7 @@ runProvider testKey = do
   tcp <- newTCPTransport
   sw  <- newSwitch pid kp
   addTransport sw tcp
+  registerIdentifyHandlers sw
   dhtNode0 <- newDHTNode sw DHTServer
   let dhtNode = dhtNode0 { dhtValidator = makeInteropValidator }
   registerDHTHandler dhtNode
@@ -195,7 +221,7 @@ runProvider testKey = do
             -- Build channel/value keys matching Python reference
             let channelKey    = "interop-test-key-" ++ testKey
                 valueKey      = "/example/data/" ++ testKey
-                value         = testKey ++ "-value"
+                value         = interopValue
                 validator     = makeInteropValidator
 
             -- Provide the channel key
@@ -226,6 +252,7 @@ runQuerier testKey = do
   tcp <- newTCPTransport
   sw  <- newSwitch pid kp
   addTransport sw tcp
+  registerIdentifyHandlers sw
   dhtNode   <- newDHTNode sw DHTClient
 
   -- Build Redis keys
@@ -277,7 +304,6 @@ runQuerier testKey = do
                     -- Build query keys
                     let channelKey    = "interop-test-key-" ++ testKey
                         valueKey      = "/example/data/" ++ testKey
-                        expectedValue = testKey ++ "-value"
                         validator     = makeInteropValidator
 
                     -- Test 1: findProviders
@@ -289,7 +315,7 @@ runQuerier testKey = do
                     logInfo $ "Querying getValue for key: " ++ valueKey
                     getResult <- iterativeGetValue dhtNode validator (BS8.pack valueKey)
                     let valueOk = case getResult of
-                          Right rec -> recValue rec == BS8.pack expectedValue
+                          Right rec -> interopMarker `BS8.isInfixOf` recValue rec
                           Left _    -> False
 
                     -- Print result
