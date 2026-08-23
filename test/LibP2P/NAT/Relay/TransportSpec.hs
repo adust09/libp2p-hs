@@ -23,6 +23,7 @@ import LibP2P.NAT.Relay.Transport
   ( CircuitAddr (..)
   , circuitAddrOf
   , circuitTransport
+  , defaultReservationRefreshConfig
   , newCircuitState
   , parseCircuitAddr
   )
@@ -177,7 +178,7 @@ spec = do
       (pid, kp) <- mkTestIdentity
       sw <- newSwitch pid kp
       st <- newCircuitState
-      let transport = circuitTransport sw st
+      let transport = circuitTransport sw st defaultReservationRefreshConfig
           relayId = samplePeerId 6
       transportCanDial transport (withCircuit tcpAddr relayId (Just (samplePeerId 7)))
         `shouldBe` True
