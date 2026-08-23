@@ -22,6 +22,9 @@ module LibP2P.NAT.Relay.Transport
   ( -- * Shared state
     CircuitState
   , newCircuitState
+    -- * Reservation refresh
+  , ReservationRefreshConfig (..)
+  , defaultReservationRefreshConfig
     -- * Transport
   , circuitTransport
     -- * Inbound relayed streams
@@ -32,21 +35,27 @@ module LibP2P.NAT.Relay.Transport
   , circuitAddrOf
   ) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (async)
 import Control.Concurrent.STM
   ( TQueue
   , TVar
   , atomically
+  , modifyTVar'
   , newTQueue
   , newTVar
   , newTVarIO
   , readTQueue
   , readTVar
+  , readTVarIO
   , writeTQueue
   , writeTVar
   )
-import Control.Exception (SomeException, catch, throwIO)
+import Control.Exception (SomeException, catch, throwIO, try)
 import Control.Monad (unless)
 import qualified Data.Map.Strict as Map
+import Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
+import Data.Word (Word64)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.Multiaddr (Multiaddr (..), fromBytes)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
@@ -64,6 +73,7 @@ import LibP2P.NAT.Relay.Message
   )
 import LibP2P.Switch.Connection (newStream)
 import LibP2P.Switch.Dial (dial)
+import LibP2P.Switch.Listen (switchWithdrawListener)
 import LibP2P.Switch.Types (Connection (..), Switch (..))
 import LibP2P.Transport (Listener (..), RawConnection (..), Transport (..))
 
@@ -93,14 +103,34 @@ data InboundQueue = InboundQueue
 newCircuitState :: IO CircuitState
 newCircuitState = CircuitState <$> newTVarIO Map.empty
 
+-- | Tuning for client-side reservation refresh (specs/relay/circuit-v2:
+-- "the reservation becomes invalid after this time and it's the
+-- responsibility of the client to refresh").
+--
+-- Values follow go-libp2p's @autorelay@ relay finder
+-- (@rsvpExpirationSlack@ / @rsvpRefreshInterval@): refresh once the
+-- reservation is within 'rrcMargin' of its expiry, checked every
+-- 'rrcPollInterval'.
+data ReservationRefreshConfig = ReservationRefreshConfig
+  { rrcMargin       :: !POSIXTime  -- ^ Refresh once expiry is within this margin
+  , rrcPollInterval :: !Int        -- ^ Microseconds between expiry checks
+  } deriving (Show, Eq)
+
+-- | Default refresh tuning: a 2 minute margin, checked every minute.
+defaultReservationRefreshConfig :: ReservationRefreshConfig
+defaultReservationRefreshConfig = ReservationRefreshConfig
+  { rrcMargin       = 120
+  , rrcPollInterval = 60 * 1000000
+  }
+
 -- | The Circuit Relay v2 client transport.
 --
 -- Captures the Switch so it can dial the relay; register it after
 -- 'LibP2P.Switch.newSwitch' with 'LibP2P.Switch.addTransport'.
-circuitTransport :: Switch -> CircuitState -> Transport
-circuitTransport sw st = Transport
+circuitTransport :: Switch -> CircuitState -> ReservationRefreshConfig -> Transport
+circuitTransport sw st refreshCfg = Transport
   { transportDial    = dialCircuit sw
-  , transportListen  = listenCircuit sw st
+  , transportListen  = listenCircuit sw st refreshCfg
   , transportCanDial = either (const False) (const True) . parseCircuitAddr
   }
 
@@ -166,24 +196,97 @@ dialCircuit sw addr = do
 
 -- | Reserve a slot on a relay and listen for relayed connections through it.
 --
--- The @hop@ stream is closed once the reservation is granted: per the
--- spec the reservation lives as long as the connection to the relay, and
--- inbound circuits arrive as fresh @stop@ streams on that connection.
-listenCircuit :: Switch -> CircuitState -> Multiaddr -> IO Listener
-listenCircuit sw st addr = do
+-- The @hop@ stream used for RESERVE is closed once the reservation is
+-- granted: per the spec the reservation lives as long as the connection
+-- to the relay, and inbound circuits arrive as fresh @stop@ streams on
+-- that connection. A background loop re-issues RESERVE on fresh @hop@
+-- streams ahead of the granted expiry to keep the reservation alive; see
+-- 'refreshLoop'.
+listenCircuit :: Switch -> CircuitState -> ReservationRefreshConfig -> Multiaddr -> IO Listener
+listenCircuit sw st refreshCfg addr = do
   circuit <- either fail pure (parseCircuitAddr addr)
   relayConn <- dialRelay sw circuit
   stream <- openHopStream sw relayConn
   resp <- makeReservation stream >>= either (failClosing stream) pure
   unless (hopStatus resp == Just RelayOK) $
     failClosing stream ("relay refused RESERVE: " ++ show (hopStatus resp))
+  expiry <- either (failClosing stream) pure (reservationExpiry resp)
   closeQuietly stream
   queue <- registerQueue st (caRelayId circuit)
+  let listenAddr = reservationAddr circuit resp
+  registerRelayLossNotifier sw relayConn listenAddr
+  _ <- async (refreshLoop refreshCfg sw relayConn queue listenAddr expiry)
   pure Listener
     { listenerAccept = acceptFrom queue
     , listenerClose  = unregisterQueue st (caRelayId circuit)
-    , listenerAddr   = reservationAddr circuit resp
+    , listenerAddr   = listenAddr
     }
+
+-- | Extract the expiration time the relay granted, per circuit-v2's
+-- Reservation.expire: "a UTC UNIX time in seconds". Refresh cannot be
+-- scheduled without it, so a missing value is treated as a failure
+-- rather than defaulted.
+reservationExpiry :: HopMessage -> Either String Word64
+reservationExpiry resp = case hopReservation resp >>= rsvExpire of
+  Just expiry -> Right expiry
+  Nothing     -> Left "relay RESERVE response is missing the reservation expiry"
+
+-- | Periodically re-issue RESERVE on the existing connection to the
+-- relay, ahead of the current reservation's expiry (specs/relay/circuit-v2:
+-- "it's the responsibility of the client to refresh").
+--
+-- Stops once the listener's queue is closed -- by 'listenerClose'
+-- (explicit close or 'LibP2P.Switch.switchClose'), by the relay-loss
+-- notifier registered in 'listenCircuit', or by this loop itself
+-- withdrawing the listener after a failed refresh.
+refreshLoop
+  :: ReservationRefreshConfig -> Switch -> Connection -> InboundQueue
+  -> Multiaddr -> Word64 -> IO ()
+refreshLoop cfg sw relayConn queue listenAddr = go
+  where
+    go expiry = do
+      threadDelay (rrcPollInterval cfg)
+      closed <- readTVarIO (iqClosed queue)
+      unless closed $ do
+        now <- getPOSIXTime
+        if now + rrcMargin cfg >= fromIntegral expiry
+          then do
+            result <- refreshReservation sw relayConn
+            case result of
+              Left _err       -> switchWithdrawListener sw listenAddr
+              Right newExpiry -> go newExpiry
+          else go expiry
+
+-- | Re-issue RESERVE on a fresh @hop@ stream over an existing connection
+-- to the relay, returning the new expiry or a description of why the
+-- refresh failed (transport error or a non-OK STATUS).
+refreshReservation :: Switch -> Connection -> IO (Either String Word64)
+refreshReservation sw relayConn = do
+  result <- try attempt
+  pure $ case result of
+    Left (e :: SomeException) -> Left (show e)
+    Right expiry               -> expiry
+  where
+    attempt = do
+      stream <- openHopStream sw relayConn
+      resp <- makeReservation stream >>= either (failClosing stream) pure
+      unless (hopStatus resp == Just RelayOK) $
+        failClosing stream ("relay refused RESERVE refresh: " ++ show (hopStatus resp))
+      closeQuietly stream
+      pure (reservationExpiry resp)
+
+-- | Withdraw the circuit listen address if the connection used for its
+-- reservation is lost (specs/relay/circuit-v2: "if the peer disconnects,
+-- the reservation is no longer valid"). Matches the connection by
+-- identity, not peer id: a different connection to the same relay does
+-- not carry this reservation.
+registerRelayLossNotifier :: Switch -> Connection -> Multiaddr -> IO ()
+registerRelayLossNotifier sw relayConn listenAddr =
+  atomically $ modifyTVar' (swDisconnectNotifiers sw) (notifier :)
+  where
+    notifier conn
+      | connState conn == connState relayConn = switchWithdrawListener sw listenAddr
+      | otherwise = pure ()
 
 -- | Hand a relayed stream that arrived via the @stop@ protocol to the
 -- listener for the relay it came over.

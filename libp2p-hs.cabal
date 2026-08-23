@@ -203,6 +203,7 @@ test-suite libp2p-hs-test
     LibP2P.NAT.Relay.ClientSpec
     LibP2P.NAT.Relay.TransportSpec
     LibP2P.NAT.Relay.ReservationLifecycleSpec
+    LibP2P.NAT.Relay.ReservationRefreshSpec
     LibP2P.NAT.DCUtR.MessageSpec
     LibP2P.NAT.DCUtR.DCUtRSpec
     LibP2P.NAT.RegistrationSpec

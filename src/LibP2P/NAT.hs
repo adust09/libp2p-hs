@@ -21,6 +21,8 @@ module LibP2P.NAT
   , registerReservationCleanup
     -- * Circuit client
   , CircuitState
+  , ReservationRefreshConfig (..)
+  , defaultReservationRefreshConfig
   ) where
 
 import Control.Concurrent.STM (atomically, modifyTVar')
@@ -61,8 +63,10 @@ import LibP2P.NAT.Relay.Message
   )
 import LibP2P.NAT.Relay.Transport
   ( CircuitState
+  , ReservationRefreshConfig (..)
   , acceptStopStream
   , circuitTransport
+  , defaultReservationRefreshConfig
   , newCircuitState
   )
 import LibP2P.Switch (addTransport, selectTransport, setStreamHandler)
@@ -79,15 +83,18 @@ import LibP2P.Switch.Upgrade (upgradeOutbound)
 import LibP2P.Transport (Transport (..))
 
 -- | Configuration for the NAT traversal handlers.
-newtype NATConfig = NATConfig
-  { ncRelayConfig :: RelayConfig
+data NATConfig = NATConfig
+  { ncRelayConfig       :: RelayConfig
     -- ^ Resource limits for the Circuit Relay v2 server side
+  , ncReservationRefresh :: ReservationRefreshConfig
+    -- ^ Tuning for the circuit client's reservation refresh loop
   }
 
--- | Default NAT configuration: default relay limits.
+-- | Default NAT configuration: default relay limits and refresh tuning.
 defaultNATConfig :: NATConfig
 defaultNATConfig = NATConfig
-  { ncRelayConfig = defaultRelayConfig
+  { ncRelayConfig        = defaultRelayConfig
+  , ncReservationRefresh = defaultReservationRefreshConfig
   }
 
 -- | Register the NAT protocol handlers and the circuit client transport
@@ -101,7 +108,7 @@ registerNATHandlers :: Switch -> NATConfig -> IO (RelayState, CircuitState)
 registerNATHandlers sw config = do
   relayState <- newRelayState (ncRelayConfig config)
   circuitState <- newCircuitState
-  addTransport sw (circuitTransport sw circuitState)
+  addTransport sw (circuitTransport sw circuitState (ncReservationRefresh config))
   registerAutoNATHandler sw
   registerRelayHopHandler sw relayState
   registerRelayStopHandler sw circuitState

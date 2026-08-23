@@ -97,6 +97,8 @@ module LibP2P
   , CircuitState
   , circuitTransport
   , newCircuitState
+  , ReservationRefreshConfig (..)
+  , defaultReservationRefreshConfig
 
     -- * GossipSub
   , GossipSubNode (..)
@@ -126,7 +128,13 @@ import LibP2P.NAT
   , registerRelayStopHandler
   )
 import LibP2P.NAT.Relay (RelayConfig (..), RelayState, defaultRelayConfig, newRelayState)
-import LibP2P.NAT.Relay.Transport (CircuitState, circuitTransport, newCircuitState)
+import LibP2P.NAT.Relay.Transport
+  ( CircuitState
+  , ReservationRefreshConfig (..)
+  , circuitTransport
+  , defaultReservationRefreshConfig
+  , newCircuitState
+  )
 import LibP2P.Protocol.GossipSub.Handler
   ( GossipSubNode (..)
   , gossipJoin

@@ -25,7 +25,12 @@ import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , negotiateInitiator
   )
-import LibP2P.NAT (NATConfig (..), defaultNATConfig, registerNATHandlers)
+import LibP2P.NAT
+  ( NATConfig (..)
+  , defaultNATConfig
+  , defaultReservationRefreshConfig
+  , registerNATHandlers
+  )
 import LibP2P.NAT.Relay
   ( ActiveReservation (..)
   , RelayConfig (..)
@@ -133,7 +138,10 @@ spec = describe "relay reservation lifecycle" $ do
     switchClose swR
 
   it "frees the reservation slot for another peer without waiting for expiry" $ do
-    let config = NATConfig { ncRelayConfig = defaultRelayConfig { rcMaxReservations = 1 } }
+    let config = NATConfig
+          { ncRelayConfig        = defaultRelayConfig { rcMaxReservations = 1 }
+          , ncReservationRefresh = defaultReservationRefreshConfig
+          }
     (swR, pidR, addrR, relayState) <- newRelaySwitch config
     (swC1, pidC1, _) <- newListeningSwitch
     (swC2, _pidC2, _) <- newListeningSwitch

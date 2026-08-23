@@ -16,12 +16,13 @@ module LibP2P.Switch.Listen
   , switchListen
   , acceptLoop
   , switchListenAddrs
+  , switchWithdrawListener
   ) where
 
-import Control.Concurrent.Async (async)
+import Control.Concurrent.Async (async, cancel)
 import Control.Concurrent.STM (atomically, readTVar, writeTChan, writeTVar)
 import Control.Exception (SomeException, catch, finally)
-import Data.List (find)
+import Data.List (find, partition)
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
@@ -214,3 +215,25 @@ switchListenAddrs :: Switch -> IO [Multiaddr]
 switchListenAddrs sw = atomically $ do
   listeners <- readTVar (swListeners sw)
   pure (map alAddress listeners)
+
+-- | Withdraw the listener bound to the given address: cancel its accept
+-- loop, close the underlying transport listener, and remove it from the
+-- Switch's listener set so 'switchListenAddrs' stops reporting it.
+--
+-- For listeners whose reachability guarantee can lapse independently of
+-- the Switch's own lifetime (e.g. a circuit relay reservation that
+-- expired or was refused on refresh), this withdraws just that one
+-- address without tearing down the rest of the Switch. A no-op if no
+-- listener is bound to the address (already withdrawn, or never was).
+switchWithdrawListener :: Switch -> Multiaddr -> IO ()
+switchWithdrawListener sw addr = do
+  withdrawn <- atomically $ do
+    listeners <- readTVar (swListeners sw)
+    let (removed, remaining) = partition ((== addr) . alAddress) listeners
+    writeTVar (swListeners sw) remaining
+    pure removed
+  mapM_ closeListener withdrawn
+  where
+    closeListener al = do
+      cancel (alAcceptLoop al) `catch` (\(_ :: SomeException) -> pure ())
+      listenerClose (alListener al) `catch` (\(_ :: SomeException) -> pure ())
