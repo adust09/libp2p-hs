@@ -18,11 +18,13 @@ module LibP2P.NAT
   , registerRelayHopHandler
   , registerRelayStopHandler
   , registerDCUtRHandler
+  , registerReservationCleanup
     -- * Circuit client
   , CircuitState
   ) where
 
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM (atomically, modifyTVar')
+import qualified Data.Map.Strict as Map
 import Control.Exception (SomeException, catch, try)
 import LibP2P.Crypto.PeerId (PeerId, peerIdBytes)
 import LibP2P.Multiaddr (Multiaddr (..), encapsulate)
@@ -44,6 +46,7 @@ import LibP2P.NAT.Relay
   , handleConnect
   , handleReserve
   , newRelayState
+  , rsReservations
   )
 import LibP2P.NAT.Relay.Client (handleStop)
 import LibP2P.NAT.Relay.Message
@@ -103,7 +106,33 @@ registerNATHandlers sw config = do
   registerRelayHopHandler sw relayState
   registerRelayStopHandler sw circuitState
   registerDCUtRHandler sw
+  registerReservationCleanup sw relayState
   pure (relayState, circuitState)
+
+-- | Drop a peer's relay reservation once its last connection to us goes
+-- away (specs/relay/circuit-v2): "the reservation remains valid until
+-- its expiration, as long as there is an active connection from the peer
+-- to the relay. If the peer disconnects, the reservation is no longer
+-- valid."
+--
+-- The reservation is bound to the peer, not to the connection the
+-- RESERVE arrived on, so a peer holding a second connection keeps it.
+-- This matches go-libp2p, whose relay returns early from its disconnect
+-- notifiee while @Connectedness(p) == Connected@.
+--
+-- 'closeConnection' removes the connection from the pool in the same STM
+-- transaction that marks it closed, and only then runs the notifiers, so
+-- the lookup below never observes the connection being torn down.
+registerReservationCleanup :: Switch -> RelayState -> IO ()
+registerReservationCleanup sw relayState =
+  atomically $ modifyTVar' (swDisconnectNotifiers sw) (dropReservation :)
+  where
+    dropReservation conn = atomically $ do
+      let peerId = connPeerId conn
+      remaining <- lookupConn (swConnPool sw) peerId
+      case remaining of
+        Just _  -> pure ()
+        Nothing -> modifyTVar' (rsReservations relayState) (Map.delete peerId)
 
 -- | Register the AutoNAT server handler (/libp2p/autonat/1.0.0).
 --

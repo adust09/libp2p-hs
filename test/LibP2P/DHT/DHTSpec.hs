@@ -70,6 +70,7 @@ mkMockSwitch pid = do
   resMgr <- mkMockResourceMgr
   peerStore <- newTVarIO Map.empty
   notifiers <- newTVarIO []
+  disconnectNotifiers <- newTVarIO []
   listeners <- newTVarIO []
   pure Switch
     { swLocalPeerId  = pid
@@ -84,6 +85,7 @@ mkMockSwitch pid = do
     , swResourceMgr  = resMgr
     , swPeerStore    = peerStore
     , swNotifiers    = notifiers
+    , swDisconnectNotifiers = disconnectNotifiers
     , swListeners    = listeners
     }
 

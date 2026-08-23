@@ -120,5 +120,6 @@ data Switch = Switch
   , swResourceMgr  :: !ResourceManager                                   -- ^ Hierarchical resource manager
   , swPeerStore    :: !(TVar (Map PeerId IdentifyInfo))                  -- ^ Identify info per peer
   , swNotifiers    :: !(TVar [Connection -> IO ()])                      -- ^ Callbacks on new connection
+  , swDisconnectNotifiers :: !(TVar [Connection -> IO ()])               -- ^ Callbacks on connection teardown
   , swListeners    :: !(TVar [ActiveListener])                           -- ^ Active listeners
   }

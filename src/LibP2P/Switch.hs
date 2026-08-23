@@ -46,6 +46,7 @@ newSwitch pid kp = do
     }
   peerStoreVar <- newTVarIO Map.empty
   notifiersVar <- newTVarIO []
+  disconnectNotifiersVar <- newTVarIO []
   listenersVar <- newTVarIO []
   pure Switch
     { swLocalPeerId  = pid
@@ -60,6 +61,7 @@ newSwitch pid kp = do
     , swResourceMgr  = resMgr
     , swPeerStore    = peerStoreVar
     , swNotifiers    = notifiersVar
+    , swDisconnectNotifiers = disconnectNotifiersVar
     , swListeners    = listenersVar
     }
 
