@@ -54,6 +54,8 @@ import LibP2P.Switch.Connection (closeConnection)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (defaultConnectionGater, switchListen, switchListenAddrs)
 import LibP2P.Switch.Types (Connection (..), Switch (..))
+import LibP2P.Switch.Upgrade (upgradeOutbound)
+import LibP2P.Transport (Transport (..))
 import LibP2P.Transport.TCP (newTCPTransport)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -96,6 +98,17 @@ fastRefreshConfig = ReservationRefreshConfig
   { rrcMargin       = 1        -- refresh once within 1 second of expiry
   , rrcPollInterval = 100000   -- check every 100ms
   }
+
+-- | Poll the pool until it holds at least @n@ connections for the peer.
+waitForConns :: Switch -> PeerId -> Int -> IO [Connection]
+waitForConns sw pid n = go (200 :: Int)
+  where
+    go 0 = fail $ "never pooled " ++ show n ++ " connection(s) for the peer"
+    go k = do
+      conns <- atomically $ lookupAllConns (swConnPool sw) pid
+      if length conns >= n
+        then pure conns
+        else threadDelay 10000 >> go (k - 1)
 
 spec :: Spec
 spec = describe "circuit relay reservation refresh" $ do
@@ -177,6 +190,52 @@ spec = describe "circuit relay reservation refresh" $ do
     remaining <- switchListenAddrs swB
     remaining `shouldBe` []
 
+    switchClose swB
+    switchClose swR
+
+  it "keeps the circuit listen address while another connection to the relay remains" $ do
+    -- The reservation is bound to the relay peer, not to the connection
+    -- the RESERVE went out on, matching go-libp2p's relay_finder, which
+    -- drops a reservation only once Connectedness reaches NotConnected.
+    let natConfig = defaultNATConfig { ncReservationRefresh = fastRefreshConfig }
+    (pidR, kpR) <- mkTestIdentity
+    swR <- newSwitch pidR kpR
+    addTransport swR =<< newTCPTransport
+    _ <- registerNATHandlers swR natConfig
+    addrsR <- switchListen swR defaultConnectionGater [loopbackAddr]
+    relayAddr <- case addrsR of
+      (a : _) -> pure a
+      []      -> fail "relay did not bind a listen address"
+    -- B listens on TCP as well, so the relay can dial it back and give B
+    -- a second, independent connection to the same peer.
+    (pidB, kpB) <- mkTestIdentity
+    swB <- newSwitch pidB kpB
+    addTransport swB =<< newTCPTransport
+    _ <- registerNATHandlers swB natConfig
+    tcpAddrsB <- switchListen swB defaultConnectionGater [loopbackAddr]
+    addrB <- case tcpAddrsB of
+      (a : _) -> pure a
+      []      -> fail "client did not bind a listen address"
+    circuitAddrsB <- switchListen swB defaultConnectionGater
+                       [withCircuit relayAddr pidR Nothing]
+    circuitAddrsB `shouldSatisfy` (not . null)
+    -- Switch.dial on the relay would hand back the connection B already
+    -- made, so drive the transport and the upgrade directly with the
+    -- relay's identity. B's accept path pools it as a second inbound
+    -- connection whose peer is the relay.
+    transport <- newTCPTransport
+    rawConn <- transportDial transport addrB
+    _second <- upgradeOutbound (swIdentityKey swR) rawConn
+    bConns <- waitForConns swB pidR 2
+    case bConns of
+      (first' : rest@(_ : _)) -> do
+        -- Losing one connection must not withdraw the circuit address
+        closeConnection swB first'
+        switchListenAddrs swB `shouldReturn` (tcpAddrsB ++ circuitAddrsB)
+        -- Losing the last one must, and must leave the TCP listener alone
+        mapM_ (closeConnection swB) rest
+        switchListenAddrs swB `shouldReturn` tcpAddrsB
+      _ -> expectationFailure "expected two pooled connections to the relay"
     switchClose swB
     switchClose swR
 

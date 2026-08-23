@@ -71,6 +71,7 @@ import LibP2P.NAT.Relay.Message
   , Reservation (..)
   , hopProtocolId
   )
+import LibP2P.Switch.ConnPool (lookupConn)
 import LibP2P.Switch.Connection (newStream)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (switchWithdrawListener)
@@ -275,18 +276,35 @@ refreshReservation sw relayConn = do
       closeQuietly stream
       pure (reservationExpiry resp)
 
--- | Withdraw the circuit listen address if the connection used for its
--- reservation is lost (specs/relay/circuit-v2: "if the peer disconnects,
--- the reservation is no longer valid"). Matches the connection by
--- identity, not peer id: a different connection to the same relay does
--- not carry this reservation.
+-- | Withdraw the circuit listen address once the last connection to the
+-- relay is gone (specs/relay/circuit-v2: "the reservation remains valid
+-- until its expiration, as long as there is an active connection from
+-- the peer to the relay. If the peer disconnects, the reservation is no
+-- longer valid").
+--
+-- The reservation is bound to the relay peer, not to the connection the
+-- RESERVE went out on, so a second connection to the same relay keeps
+-- the listen address alive. This is the same predicate the relay server
+-- side applies in 'LibP2P.NAT.registerReservationCleanup', and it has to
+-- match: against a go-libp2p relay, which keeps a reservation while any
+-- connection from us remains, per-connection matching would withdraw a
+-- listen address the relay still honours.
+--
+-- 'closeConnection' removes the connection from the pool in the same STM
+-- transaction that marks it closed and only then runs the notifiers, so
+-- the lookup below never observes the connection being torn down.
 registerRelayLossNotifier :: Switch -> Connection -> Multiaddr -> IO ()
 registerRelayLossNotifier sw relayConn listenAddr =
   atomically $ modifyTVar' (swDisconnectNotifiers sw) (notifier :)
   where
+    relayId = connPeerId relayConn
     notifier conn
-      | connState conn == connState relayConn = switchWithdrawListener sw listenAddr
-      | otherwise = pure ()
+      | connPeerId conn /= relayId = pure ()
+      | otherwise = do
+          remaining <- atomically $ lookupConn (swConnPool sw) relayId
+          case remaining of
+            Just _  -> pure ()
+            Nothing -> switchWithdrawListener sw listenAddr
 
 -- | Hand a relayed stream that arrived via the @stop@ protocol to the
 -- listener for the relay it came over.
