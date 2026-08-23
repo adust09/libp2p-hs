@@ -33,12 +33,19 @@ import LibP2P.Switch.Types
   )
 
 -- | Tear down a connection: remove it from the pool, release its
--- resource reservation, publish a Disconnected event, and close the
--- muxer session together with the underlying transport.
+-- resource reservation, publish a Disconnected event, run the
+-- disconnect notifiers, and close the muxer session together with the
+-- underlying transport.
 --
 -- Idempotent: the state transition to ConnClosed is atomic, so
 -- concurrent calls (accept loop exit, explicit close, switchClose)
--- perform the teardown exactly once.
+-- perform the teardown exactly once, and the notifiers run once.
+--
+-- Notifiers run synchronously, after the pool removal has committed and
+-- before the muxer is closed, so a notifier that asks whether the peer
+-- still has a live connection (Circuit Relay v2 reservation cleanup)
+-- never sees the connection being torn down. Each is isolated so a
+-- failing notifier cannot abort the teardown.
 closeConnection :: Switch -> Connection -> IO ()
 closeConnection sw conn = do
   shouldClose <- atomically $ do
@@ -52,7 +59,9 @@ closeConnection sw conn = do
         writeTChan (swEvents sw)
           (Disconnected (connPeerId conn) (connDirection conn) (connRemoteAddr conn))
         pure True
-  when shouldClose $
+  when shouldClose $ do
+    notifiers <- atomically $ readTVar (swDisconnectNotifiers sw)
+    mapM_ (\f -> f conn `catch` \(_ :: SomeException) -> pure ()) notifiers
     muxClose (connSession conn) `catch` \(_ :: SomeException) -> pure ()
 
 -- | Tear down every pooled connection (used by switchClose).

@@ -198,6 +198,7 @@ mkMockSwitch pid = do
   resMgr <- mkMockResourceMgr
   peerStore <- newTVarIO Map.empty
   notifiers <- newTVarIO []
+  disconnectNotifiers <- newTVarIO []
   listeners <- newTVarIO []
   kp <- getDummyKeyPair
   pure Switch
@@ -213,6 +214,7 @@ mkMockSwitch pid = do
     , swResourceMgr  = resMgr
     , swPeerStore    = peerStore
     , swNotifiers    = notifiers
+    , swDisconnectNotifiers = disconnectNotifiers
     , swListeners    = listeners
     }
 
