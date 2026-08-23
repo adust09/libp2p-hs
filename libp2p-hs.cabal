@@ -184,6 +184,7 @@ test-suite libp2p-hs-test
     LibP2P.Switch.ResourceManagerSpec
     LibP2P.Protocol.Identify.MessageSpec
     LibP2P.Protocol.Identify.IdentifySpec
+    LibP2P.Protocol.Identify.IdentifyOnConnectSpec
     LibP2P.Protocol.Ping.PingSpec
     LibP2P.Noise.HandshakeSpec
     LibP2P.Noise.ForeignPeerSpec
