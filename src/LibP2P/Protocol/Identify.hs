@@ -21,6 +21,9 @@ module LibP2P.Protocol.Identify
   , handleIdentifyPush
   , pushIdentify
   , mergeIdentify
+    -- * Identify on connect
+  , identifyPeer
+  , identifyTimeoutMicros
     -- * Building local info
   , buildLocalIdentify
     -- * Registration
@@ -31,8 +34,10 @@ module LibP2P.Protocol.Identify
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent.STM (atomically, readTVar, writeTVar)
-import Control.Exception (SomeException, catch)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, writeTVar)
+import Control.Exception (SomeException, bracket, catch, try)
+import Control.Monad (void)
+import System.Timeout (timeout)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
@@ -88,21 +93,64 @@ handleIdentify sw conn stream = do
   streamWrite stream (encodeFramedIdentify info)
   streamClose stream
 
+-- | Timeout for one Identify exchange: 5 seconds.
+--
+-- Matches go-libp2p's @identify.DefaultTimeout@, which it applies to all
+-- id interactions in both directions.
+identifyTimeoutMicros :: Int
+identifyTimeoutMicros = 5000000
+
 -- | Request Identify from a remote peer (initiator side).
 --
 -- Opens a new stream, negotiates /ipfs/id/1.0.0, then reads one
 -- varint-length-prefixed protobuf message. The publicKey field is
 -- validated against the connection's authenticated peer id (see
 -- 'validatePublicKey').
+--
+-- Identify is a one-shot exchange, so the stream is closed on every exit
+-- path — success, negotiation refusal, decode failure, timeout and
+-- exception alike. A caller that runs this per connection would
+-- otherwise leak a half-open stream per connection. The whole exchange
+-- is bounded by 'identifyTimeoutMicros': a peer that negotiates and then
+-- never answers must not pin a stream and a thread forever.
 requestIdentify :: Connection -> IO (Either String IdentifyInfo)
 requestIdentify conn = do
-  stream <- muxOpenStream (connSession conn)
-  result <- negotiateInitiator stream [identifyProtocolId]
+  outcome <- try $ bracket (muxOpenStream (connSession conn)) closeQuietly exchange
+  pure $ case outcome of
+    Left (e :: SomeException) -> Left ("identify failed: " ++ show e)
+    Right Nothing             -> Left "identify timed out"
+    Right (Just result)       -> result
+  where
+    exchange stream = timeout identifyTimeoutMicros $ do
+      negotiated <- negotiateInitiator stream [identifyProtocolId]
+      case negotiated of
+        NoProtocol -> pure (Left "remote does not support identify")
+        Accepted _ ->
+          fmap (validateIdentify (connPeerId conn))
+            <$> readFramedIdentify stream maxIdentifySize
+    closeQuietly stream = streamClose stream `catch` \(_ :: SomeException) -> pure ()
+
+-- | Run Identify against a freshly established connection and record the
+-- result in the peer store (specs/identify).
+--
+-- This is what makes a peer's advertised addresses and protocols known
+-- to us: without it 'swPeerStore' only ever fills from an inbound push,
+-- so nothing is known about a peer we dialled or accepted. go-libp2p
+-- drives its IDService from the swarm's Connected notification for the
+-- same reason.
+--
+-- Failure is returned rather than thrown: the connection stays usable,
+-- and no peer store entry is created. There is no retry — a peer that
+-- does not answer Identify now will be picked up by a later push, if it
+-- sends one.
+identifyPeer :: Switch -> Connection -> IO (Either String ())
+identifyPeer sw conn = do
+  result <- requestIdentify conn
   case result of
-    Accepted _ ->
-      fmap (validateIdentify (connPeerId conn))
-        <$> readFramedIdentify stream maxIdentifySize
-    NoProtocol -> pure (Left "remote does not support identify")
+    Left err -> pure (Left err)
+    Right info -> do
+      atomically $ storeIdentify sw (connPeerId conn) info
+      pure (Right ())
 
 -- | Handle an inbound Identify Push (responder side).
 --
@@ -118,13 +166,20 @@ handleIdentifyPush sw conn stream = do
   infoOrErr <- readFramedIdentify stream maxIdentifySize
   case infoOrErr of
     Left _ -> pure ()
-    Right rawInfo -> do
-      let info = validateIdentify (connPeerId conn) rawInfo
-      atomically $ do
-        store <- readTVar (swPeerStore sw)
-        let merged = maybe info (`mergeIdentify` info)
-                       (Map.lookup (connPeerId conn) store)
-        writeTVar (swPeerStore sw) (Map.insert (connPeerId conn) merged store)
+    Right rawInfo ->
+      atomically $ storeIdentify sw (connPeerId conn) (validateIdentify (connPeerId conn) rawInfo)
+
+-- | Merge validated Identify info into the peer store.
+--
+-- Shared by the push responder and by 'identifyPeer' so both follow the
+-- same rule: an update is merged into what is already known via
+-- 'mergeIdentify' rather than replacing it, because a push may be a
+-- partial update and must not erase fields it omits.
+storeIdentify :: Switch -> PeerId -> IdentifyInfo -> STM ()
+storeIdentify sw peerId info = do
+  store <- readTVar (swPeerStore sw)
+  let merged = maybe info (`mergeIdentify` info) (Map.lookup peerId store)
+  writeTVar (swPeerStore sw) (Map.insert peerId merged store)
 
 -- | Validate the identity-bound fields of a received Identify message
 -- against the peer id authenticated by the security handshake.
@@ -256,6 +311,11 @@ registerIdentifyHandlers sw = do
     let protos' = Map.insert identifyProtocolId (handleIdentify sw) protos
         protos'' = Map.insert identifyPushProtocolId (handleIdentifyPush sw) protos'
     writeTVar (swProtocols sw) protos''
+  -- Identify every connection as it comes up, inbound and outbound, so
+  -- the peer store reflects peers we dialled and accepted rather than
+  -- only those that pushed to us. The notifier discards the outcome;
+  -- callers that need to observe failure use 'identifyPeer' directly.
+  atomically $ modifyTVar' (swNotifiers sw) (void . identifyPeer sw :)
 
 -- | Encode an IdentifyInfo with its uvarint length prefix, as written
 -- on the wire: uvarint(len) ++ protobuf.
