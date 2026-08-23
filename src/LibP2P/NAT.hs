@@ -18,6 +18,8 @@ module LibP2P.NAT
   , registerRelayHopHandler
   , registerRelayStopHandler
   , registerDCUtRHandler
+    -- * Circuit client
+  , CircuitState
   ) where
 
 import Control.Concurrent.STM (atomically)
@@ -47,7 +49,6 @@ import LibP2P.NAT.Relay.Client (handleStop)
 import LibP2P.NAT.Relay.Message
   ( HopMessage (..)
   , HopMessageType (..)
-  , RelayLimit
   , RelayStatus (..)
   , hopProtocolId
   , maxRelayMessageSize
@@ -55,7 +56,13 @@ import LibP2P.NAT.Relay.Message
   , stopProtocolId
   , writeHopMessage
   )
-import LibP2P.Switch (selectTransport, setStreamHandler)
+import LibP2P.NAT.Relay.Transport
+  ( CircuitState
+  , acceptStopStream
+  , circuitTransport
+  , newCircuitState
+  )
+import LibP2P.Switch (addTransport, selectTransport, setStreamHandler)
 import LibP2P.Switch.ConnPool (lookupConn)
 import LibP2P.Switch.Connection (newStream)
 import LibP2P.Switch.Dial (dial)
@@ -69,36 +76,34 @@ import LibP2P.Switch.Upgrade (upgradeOutbound)
 import LibP2P.Transport (Transport (..))
 
 -- | Configuration for the NAT traversal handlers.
-data NATConfig = NATConfig
-  { ncRelayConfig     :: !RelayConfig
+newtype NATConfig = NATConfig
+  { ncRelayConfig :: RelayConfig
     -- ^ Resource limits for the Circuit Relay v2 server side
-  , ncOnRelayedStream :: !(PeerId -> Maybe RelayLimit -> StreamIO -> IO ())
-    -- ^ Invoked when a relay delivers an inbound relayed stream (stop
-    -- protocol) after the CONNECT/OK exchange: source peer, limit
-    -- advertised by the relay, and the relayed stream. The application
-    -- owns the stream from this point (e.g. to run DCUtR over it).
   }
 
--- | Default NAT configuration: default relay limits, and inbound relayed
--- streams are left to the remote end (no local consumer).
+-- | Default NAT configuration: default relay limits.
 defaultNATConfig :: NATConfig
 defaultNATConfig = NATConfig
-  { ncRelayConfig     = defaultRelayConfig
-  , ncOnRelayedStream = \_ _ _ -> pure ()
+  { ncRelayConfig = defaultRelayConfig
   }
 
--- | Register all four NAT protocol handlers on the Switch.
+-- | Register the NAT protocol handlers and the circuit client transport
+-- on the Switch.
 --
--- Creates the relay server state from 'ncRelayConfig' and returns it so
--- callers can inspect reservations/circuits.
-registerNATHandlers :: Switch -> NATConfig -> IO RelayState
+-- Returns the relay server state (so callers can inspect
+-- reservations/circuits) and the circuit client state, which ties
+-- 'transportListen' on a @p2p-circuit@ address to the inbound @stop@
+-- streams that arrive over the connection to that relay.
+registerNATHandlers :: Switch -> NATConfig -> IO (RelayState, CircuitState)
 registerNATHandlers sw config = do
   relayState <- newRelayState (ncRelayConfig config)
+  circuitState <- newCircuitState
+  addTransport sw (circuitTransport sw circuitState)
   registerAutoNATHandler sw
   registerRelayHopHandler sw relayState
-  registerRelayStopHandler sw (ncOnRelayedStream config)
+  registerRelayStopHandler sw circuitState
   registerDCUtRHandler sw
-  pure relayState
+  pure (relayState, circuitState)
 
 -- | Register the AutoNAT server handler (/libp2p/autonat/1.0.0).
 --
@@ -208,18 +213,22 @@ openStopStream sw targetId = do
     Right mStream -> pure mStream
 
 -- | Register the Circuit Relay v2 stop handler
--- (/libp2p/circuit/relay/0.2.0/stop): accept inbound relayed streams and
--- hand them to the application callback.
-registerRelayStopHandler
-  :: Switch
-  -> (PeerId -> Maybe RelayLimit -> StreamIO -> IO ())
-  -> IO ()
-registerRelayStopHandler sw onRelayedStream =
-  setStreamHandler sw stopProtocolId $ \_conn stream -> do
+-- (/libp2p/circuit/relay/0.2.0/stop).
+--
+-- After the CONNECT/OK exchange the stop stream *is* the relayed
+-- connection (specs/relay/circuit-v2), so it is handed to the circuit
+-- transport's listener for the relay it arrived over. The Switch then
+-- upgrades it like any other inbound raw connection.
+--
+-- The relay's advertised limit is not yet enforced (issue #269).
+registerRelayStopHandler :: Switch -> CircuitState -> IO ()
+registerRelayStopHandler sw circuitState =
+  setStreamHandler sw stopProtocolId $ \conn stream -> do
     result <- handleStop stream
     case result of
       Left _ -> pure ()
-      Right (sourcePeer, mLimit) -> onRelayedStream sourcePeer mLimit stream
+      Right (sourcePeer, _mLimit) ->
+        acceptStopStream circuitState conn sourcePeer stream
 
 -- | Register the DCUtR handler (/libp2p/dcutr).
 --
