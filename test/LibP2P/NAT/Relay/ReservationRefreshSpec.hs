@@ -28,6 +28,7 @@ import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import LibP2P.NAT
   ( NATConfig (..)
+  , defaultDCUtRUpgradeConfig
   , ReservationRefreshConfig (..)
   , defaultNATConfig
   , registerNATHandlers
@@ -119,6 +120,7 @@ spec = describe "circuit relay reservation refresh" $ do
         natConfig = NATConfig
           { ncRelayConfig        = relayConfig
           , ncReservationRefresh = fastRefreshConfig
+              , ncDCUtRUpgrade = defaultDCUtRUpgradeConfig
           }
     -- Relay R
     (pidR, kpR) <- mkTestIdentity
@@ -161,7 +163,8 @@ spec = describe "circuit relay reservation refresh" $ do
     switchClose swR
 
   it "withdraws the circuit listen address when the connection to the relay is lost" $ do
-    let natConfig = defaultNATConfig { ncReservationRefresh = fastRefreshConfig }
+    let natConfig = defaultNATConfig { ncReservationRefresh = fastRefreshConfig
+              , ncDCUtRUpgrade = defaultDCUtRUpgradeConfig }
     -- Relay R
     (pidR, kpR) <- mkTestIdentity
     swR <- newSwitch pidR kpR
@@ -197,7 +200,8 @@ spec = describe "circuit relay reservation refresh" $ do
     -- The reservation is bound to the relay peer, not to the connection
     -- the RESERVE went out on, matching go-libp2p's relay_finder, which
     -- drops a reservation only once Connectedness reaches NotConnected.
-    let natConfig = defaultNATConfig { ncReservationRefresh = fastRefreshConfig }
+    let natConfig = defaultNATConfig { ncReservationRefresh = fastRefreshConfig
+              , ncDCUtRUpgrade = defaultDCUtRUpgradeConfig }
     (pidR, kpR) <- mkTestIdentity
     swR <- newSwitch pidR kpR
     addTransport swR =<< newTCPTransport

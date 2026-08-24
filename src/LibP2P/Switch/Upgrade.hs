@@ -16,6 +16,7 @@ module LibP2P.Switch.Upgrade
     -- * Yamux → MuxerSession adapter
   , yamuxToMuxerSession
     -- * Full upgrade pipeline
+  , upgradeAs
   , upgradeOutbound
   , upgradeInbound
     -- * Helpers (exported for testing)
@@ -343,21 +344,30 @@ yamuxStreamToStreamIO yamuxStream = do
         pure ()
     }
 
--- | Upgrade an outbound (dialer) raw connection.
--- Pipeline: mss(/noise) → Noise XX → mss(/yamux/1.0.0) → Yamux client
-upgradeOutbound :: KeyPair -> RawConnection -> IO Connection
-upgradeOutbound identityKP rawConn = do
+-- | Upgrade a raw connection, taking every role from the direction.
+--
+-- Pipeline: mss(/noise) -> Noise XX -> mss(/yamux/1.0.0) -> Yamux.
+-- 'Outbound' runs the initiator/client side of all three, 'Inbound' the
+-- responder/server side. go-libp2p derives the same way
+-- (@isServer := dir == network.DirInbound@ in its upgrader), which is
+-- what lets a TCP simultaneous connect flip roles: the peer that must
+-- act as the server passes 'Inbound' even though it called connect().
+upgradeAs :: Direction -> KeyPair -> RawConnection -> IO Connection
+upgradeAs dir identityKP rawConn = do
   let rawIO = rcStreamIO rawConn
+      isServer = dir == Inbound
+      negotiate = if isServer then negotiateResponder else negotiateInitiator
+      role = if isServer then "upgradeInbound" else "upgradeOutbound"
 
-  -- Step 1: multistream-select → "/noise"
-  secResult <- negotiateInitiator rawIO ["/noise"]
+  -- Step 1: multistream-select -> "/noise"
+  secResult <- negotiate rawIO ["/noise"]
   case secResult of
     Accepted _ -> pure ()
-    NoProtocol -> fail "upgradeOutbound: /noise negotiation failed"
+    NoProtocol -> fail (role <> ": /noise negotiation failed")
 
-  -- Step 2: Noise XX handshake (initiator)
+  -- Step 2: Noise XX handshake
   (noiseSess, HandshakeResult remotePeerId _remotePK) <-
-    performStreamHandshake identityKP Outbound rawIO
+    performStreamHandshake identityKP dir rawIO
 
   -- Step 3: Create encrypted StreamIO
   sendRef <- newIORef noiseSess
@@ -365,23 +375,22 @@ upgradeOutbound identityKP rawConn = do
   bufRef  <- newIORef BS.empty
   let encryptedIO = noiseSessionToStreamIO sendRef recvRef bufRef rawIO
 
-  -- Step 4: multistream-select → "/yamux/1.0.0" (over encrypted channel)
-  muxResult <- negotiateInitiator encryptedIO ["/yamux/1.0.0"]
+  -- Step 4: multistream-select -> "/yamux/1.0.0" (over encrypted channel)
+  muxResult <- negotiate encryptedIO ["/yamux/1.0.0"]
   case muxResult of
     Accepted _ -> pure ()
-    NoProtocol -> fail "upgradeOutbound: /yamux/1.0.0 negotiation failed"
+    NoProtocol -> fail (role <> ": /yamux/1.0.0 negotiation failed")
 
-  -- Step 5: Initialize Yamux session (client = odd IDs)
+  -- Step 5: Initialize Yamux session (client = odd IDs, server = even)
   let yamuxWrite = streamWrite encryptedIO
       yamuxRead  = \n -> readExact encryptedIO n
-  yamuxSess <- newSession RoleClient yamuxWrite yamuxRead
+  yamuxSess <- newSession (if isServer then RoleServer else RoleClient) yamuxWrite yamuxRead
   muxer <- yamuxToMuxerSession yamuxSess (rcClose rawConn)
 
-  -- Build Connection
   stateVar <- newTVarIO ConnOpen
   pure Connection
     { connPeerId     = remotePeerId
-    , connDirection  = Outbound
+    , connDirection  = dir
     , connLocalAddr  = rcLocalAddr rawConn
     , connRemoteAddr = rcRemoteAddr rawConn
     , connSecurity   = "/noise"
@@ -389,50 +398,11 @@ upgradeOutbound identityKP rawConn = do
     , connSession    = muxer
     , connState      = stateVar
     }
+
+-- | Upgrade an outbound (dialer) raw connection.
+upgradeOutbound :: KeyPair -> RawConnection -> IO Connection
+upgradeOutbound = upgradeAs Outbound
 
 -- | Upgrade an inbound (listener) raw connection.
--- Pipeline: mss(/noise) → Noise XX → mss(/yamux/1.0.0) → Yamux server
 upgradeInbound :: KeyPair -> RawConnection -> IO Connection
-upgradeInbound identityKP rawConn = do
-  let rawIO = rcStreamIO rawConn
-
-  -- Step 1: multistream-select → "/noise"
-  secResult <- negotiateResponder rawIO ["/noise"]
-  case secResult of
-    Accepted _ -> pure ()
-    NoProtocol -> fail "upgradeInbound: /noise negotiation failed"
-
-  -- Step 2: Noise XX handshake (responder)
-  (noiseSess, HandshakeResult remotePeerId _remotePK) <-
-    performStreamHandshake identityKP Inbound rawIO
-
-  -- Step 3: Create encrypted StreamIO
-  sendRef <- newIORef noiseSess
-  recvRef <- newIORef noiseSess
-  bufRef  <- newIORef BS.empty
-  let encryptedIO = noiseSessionToStreamIO sendRef recvRef bufRef rawIO
-
-  -- Step 4: multistream-select → "/yamux/1.0.0" (over encrypted channel)
-  muxResult <- negotiateResponder encryptedIO ["/yamux/1.0.0"]
-  case muxResult of
-    Accepted _ -> pure ()
-    NoProtocol -> fail "upgradeInbound: /yamux/1.0.0 negotiation failed"
-
-  -- Step 5: Initialize Yamux session (server = even IDs)
-  let yamuxWrite = streamWrite encryptedIO
-      yamuxRead  = \n -> readExact encryptedIO n
-  yamuxSess <- newSession RoleServer yamuxWrite yamuxRead
-  muxer <- yamuxToMuxerSession yamuxSess (rcClose rawConn)
-
-  -- Build Connection
-  stateVar <- newTVarIO ConnOpen
-  pure Connection
-    { connPeerId     = remotePeerId
-    , connDirection  = Inbound
-    , connLocalAddr  = rcLocalAddr rawConn
-    , connRemoteAddr = rcRemoteAddr rawConn
-    , connSecurity   = "/noise"
-    , connMuxer      = "/yamux/1.0.0"
-    , connSession    = muxer
-    , connState      = stateVar
-    }
+upgradeInbound = upgradeAs Inbound

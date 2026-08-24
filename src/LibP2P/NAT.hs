@@ -19,17 +19,28 @@ module LibP2P.NAT
   , registerRelayStopHandler
   , registerDCUtRHandler
   , registerReservationCleanup
+    -- * DCUtR production integration
+  , registerDCUtRUpgrade
+  , upgradeRelayedConnection
+  , holePunchTargets
+  , DCUtRUpgradeConfig (..)
+  , defaultDCUtRUpgradeConfig
     -- * Circuit client
   , CircuitState
   , ReservationRefreshConfig (..)
   , defaultReservationRefreshConfig
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar')
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (async)
+import Control.Concurrent.STM (atomically, modifyTVar', readTVar)
+import Control.Monad (filterM, unless, void)
+import Data.Maybe (fromMaybe)
+import System.Timeout (timeout)
 import qualified Data.Map.Strict as Map
 import Control.Exception (SomeException, catch, try)
 import LibP2P.Crypto.PeerId (PeerId, peerIdBytes)
-import LibP2P.Multiaddr (Multiaddr (..), encapsulate)
+import LibP2P.Multiaddr (Multiaddr (..), encapsulate, fromBytes, isPublicAddr, isRelayedAddr)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
@@ -38,7 +49,7 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.NAT.AutoNAT (AutoNATConfig (..), handleAutoNAT)
 import LibP2P.NAT.AutoNAT.Message (autoNATProtocolId)
-import LibP2P.NAT.DCUtR (DCUtRConfig (..), handleDCUtR)
+import LibP2P.NAT.DCUtR (DCUtRConfig (..), DCUtRResult (..), handleDCUtR, initiateDCUtR)
 import LibP2P.NAT.DCUtR.Message (dcutrProtocolId)
 import LibP2P.NAT.Relay
   ( HopContext (..)
@@ -70,12 +81,16 @@ import LibP2P.NAT.Relay.Transport
   , newCircuitState
   )
 import LibP2P.Switch (addTransport, selectTransport, setStreamHandler)
-import LibP2P.Switch.ConnPool (lookupConn)
-import LibP2P.Switch.Connection (newStream)
-import LibP2P.Switch.Dial (dial)
+import LibP2P.Switch.ConnPool (lookupAllConns, lookupConn)
+import LibP2P.Switch.Connection (closeConnection, newStream)
+import LibP2P.Switch.Dial (DialOpts (..), dialWith)
 import LibP2P.Switch.Listen (switchListenAddrs)
+import LibP2P.Protocol.Identify (identifyPeer)
+import LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
 import LibP2P.Switch.Types
-  ( Connection (..)
+  ( ConnState (..)
+  , Connection (..)
+  , Direction (..)
   , MuxerSession (..)
   , Switch (..)
   )
@@ -88,6 +103,43 @@ data NATConfig = NATConfig
     -- ^ Resource limits for the Circuit Relay v2 server side
   , ncReservationRefresh :: ReservationRefreshConfig
     -- ^ Tuning for the circuit client's reservation refresh loop
+  , ncDCUtRUpgrade      :: DCUtRUpgradeConfig
+    -- ^ Tuning for the DCUtR direct-connection upgrade
+  }
+
+-- | Tuning for the DCUtR upgrade that runs on an inbound relayed
+-- connection.
+data DCUtRUpgradeConfig = DCUtRUpgradeConfig
+  { ducMaxAttempts :: !Int
+    -- ^ Hole punch attempts, each re-running the CONNECT/SYNC exchange
+    -- so RTT is re-measured. specs/relay/DCUtR: inbound peers "SHOULD
+    -- retry twice (thus a total of 3 attempts)".
+  , ducDirectDialTimeoutMicros :: !Int
+    -- ^ Bound on one hole punch dial. Without it a dial whose peer never
+    -- answers the handshake pins a socket and a thread forever: a
+    -- simultaneous connect that fails to collide lands on the peer's
+    -- ordinary listener, leaving both ends running the responder side.
+    -- go-libp2p bounds the same dial with @defaultDirectDialTimeout@.
+  , ducStreamTimeoutMicros :: !Int
+    -- ^ Bound on the whole @\/libp2p\/dcutr@ coordination exchange. The
+    -- relay carrying it can vanish mid-exchange. go-libp2p sets the same
+    -- bound as a stream deadline (@StreamTimeout@).
+  , ducRelayCloseGraceMicros :: !Int
+    -- ^ How long the relay connection is kept after a successful
+    -- upgrade. specs/relay/DCUtR: "the relay connection should be closed
+    -- after a grace period". go-libp2p's holepunch package leaves this
+    -- to its connection manager, which this implementation does not
+    -- have, so the delay is applied here.
+  }
+
+-- | Three hole punch attempts and a 15s grace period before the relay
+-- connection is dropped.
+defaultDCUtRUpgradeConfig :: DCUtRUpgradeConfig
+defaultDCUtRUpgradeConfig = DCUtRUpgradeConfig
+  { ducMaxAttempts             = 3
+  , ducDirectDialTimeoutMicros = 10000000  -- go-libp2p: defaultDirectDialTimeout
+  , ducStreamTimeoutMicros     = 60000000  -- go-libp2p: StreamTimeout
+  , ducRelayCloseGraceMicros   = 15000000
   }
 
 -- | Default NAT configuration: default relay limits and refresh tuning.
@@ -95,6 +147,7 @@ defaultNATConfig :: NATConfig
 defaultNATConfig = NATConfig
   { ncRelayConfig        = defaultRelayConfig
   , ncReservationRefresh = defaultReservationRefreshConfig
+  , ncDCUtRUpgrade       = defaultDCUtRUpgradeConfig
   }
 
 -- | Register the NAT protocol handlers and the circuit client transport
@@ -112,7 +165,8 @@ registerNATHandlers sw config = do
   registerAutoNATHandler sw
   registerRelayHopHandler sw relayState
   registerRelayStopHandler sw circuitState
-  registerDCUtRHandler sw
+  registerDCUtRHandler sw (ncDCUtRUpgrade config)
+  registerDCUtRUpgrade sw (ncDCUtRUpgrade config)
   registerReservationCleanup sw relayState
   pure (relayState, circuitState)
 
@@ -140,6 +194,179 @@ registerReservationCleanup sw relayState =
       case remaining of
         Just _  -> pure ()
         Nothing -> modifyTVar' (rsReservations relayState) (Map.delete peerId)
+
+-- | Subscribe the DCUtR direct-connection upgrade to new connections.
+--
+-- specs/relay/DCUtR: "The protocol starts with the completion of a relay
+-- connection from @A@ to @B@. Upon observing the new connection, the
+-- inbound peer (here @B@) checks the addresses advertised by @A@ via
+-- identify." The trigger is therefore an *inbound* connection over a
+-- circuit, the same condition go-libp2p's hole punch notifiee applies
+-- (@Direction == DirInbound && isRelayAddress(RemoteMultiaddr())@).
+registerDCUtRUpgrade :: Switch -> DCUtRUpgradeConfig -> IO ()
+registerDCUtRUpgrade sw config =
+  atomically $ modifyTVar' (swNotifiers sw) (notifier :)
+  where
+    notifier conn
+      | connDirection conn == Inbound && isRelayedAddr (connRemoteAddr conn) =
+          void (upgradeRelayedConnection sw config conn)
+      | otherwise = pure ()
+
+-- | Upgrade a relayed connection to a direct one (specs/relay/DCUtR).
+--
+-- Tries the unilateral upgrade first, falling back to the @\/libp2p\/dcutr@
+-- exchange, and on success schedules the relay connection to close after
+-- the grace period. Exposed so it can be driven directly instead of
+-- through the notifier.
+upgradeRelayedConnection
+  :: Switch -> DCUtRUpgradeConfig -> Connection -> IO DCUtRResult
+upgradeRelayedConnection sw config relayConn = do
+  outcome <- try (upgradeRelayedConnection' sw config relayConn)
+  pure $ case outcome of
+    Left (e :: SomeException) -> DCUtRFailed (show e)
+    Right r -> r
+
+-- | The upgrade proper. Total only through 'upgradeRelayedConnection':
+-- the relay connection can die at any point, and 'newStream' surfaces a
+-- dead muxer as an exception rather than a 'Left'.
+upgradeRelayedConnection'
+  :: Switch -> DCUtRUpgradeConfig -> Connection -> IO DCUtRResult
+upgradeRelayedConnection' sw config relayConn = do
+  -- Learn the remote's advertised addresses. Identify also runs from its
+  -- own on-connect notifier, but the two are unordered, so this waits on
+  -- its own exchange rather than racing the peer store. storeIdentify
+  -- merges, so the duplicate is harmless.
+  _ <- identifyPeer sw relayConn
+  publicAddrs <- holePunchTargets sw (connPeerId relayConn)
+  outcome <-
+    if null publicAddrs
+      then pure (DCUtRFailed "no public address advertised")
+      else unilateralUpgrade sw config relayConn publicAddrs
+  result <- case outcome of
+    DCUtRSuccess -> pure DCUtRSuccess
+    DCUtRFailed _ -> initiateOverRelay sw config relayConn
+  case result of
+    DCUtRSuccess -> scheduleRelayClose sw config relayConn
+    DCUtRFailed _ -> pure ()
+  pure result
+
+-- | The peer's advertised addresses that are worth a unilateral direct
+-- dial: decodable, not relayed, and publicly routable.
+--
+-- specs/relay/DCUtR: "@B@ checks the addresses advertised by @A@ via
+-- identify. If that set includes public addresses, then @A@ may be
+-- reachable by a direct connection". go-libp2p applies the same pair of
+-- filters (@!isRelayAddress(a) && manet.IsPublicAddr(a)@).
+--
+-- A circuit address is never a target: dialling it would go back through
+-- the relay we are trying to get off.
+holePunchTargets :: Switch -> PeerId -> IO [Multiaddr]
+holePunchTargets sw peerId = do
+  store <- atomically $ readTVar (swPeerStore sw)
+  let raw = maybe [] idListenAddrs (Map.lookup peerId store)
+  pure [ addr
+       | Right addr <- map fromBytes raw
+       , not (isRelayedAddr addr)
+       , isPublicAddr addr
+       ]
+
+-- | Attempt a direct connection without any signalling.
+--
+-- specs/relay/DCUtR: "If that set includes public addresses, then @A@
+-- may be reachable by a direct connection, in which case @B@ attempts a
+-- unilateral connection upgrade by initiating a direct connection to
+-- @A@." go-libp2p guards this the same way
+-- (@!isRelayAddress(a) && manet.IsPublicAddr(a)@).
+unilateralUpgrade
+  :: Switch -> DCUtRUpgradeConfig -> Connection -> [Multiaddr] -> IO DCUtRResult
+unilateralUpgrade sw config relayConn addrs = do
+  dialed <- holePunchDial sw config True (connPeerId relayConn) addrs
+  pure $ either DCUtRFailed (const DCUtRSuccess) dialed
+
+-- | Run the CONNECT/CONNECT/SYNC exchange over the relayed connection.
+--
+-- We are peer @B@: the initiator of the exchange, and the server of the
+-- resulting TCP simultaneous connect.
+initiateOverRelay :: Switch -> DCUtRUpgradeConfig -> Connection -> IO DCUtRResult
+initiateOverRelay sw config relayConn = do
+  streamOrErr <- try (newStream sw relayConn)
+  case streamOrErr of
+    Left (e :: SomeException) ->
+      pure (DCUtRFailed ("dcutr: cannot open stream: " ++ show e))
+    Right (Left err) -> pure (DCUtRFailed ("dcutr: cannot open stream: " ++ show err))
+    Right (Right stream) -> do
+      negotiated <- negotiateInitiator stream [dcutrProtocolId]
+      case negotiated of
+        NoProtocol -> do
+          closeQuietly stream
+          pure (DCUtRFailed "remote does not support /libp2p/dcutr")
+        Accepted _ -> do
+          ownAddrs <- dialableListenAddrs sw
+          let dcConfig = DCUtRConfig
+                { dcMaxAttempts = ducMaxAttempts config
+                , dcDialer = \addr ->
+                    holePunchDial sw config False (connPeerId relayConn) [addr]
+                }
+          result <- handleOrFail
+            (bounded (ducStreamTimeoutMicros config) (initiateDCUtR dcConfig stream ownAddrs))
+          closeQuietly stream
+          pure result
+  where
+    handleOrFail action = do
+      outcome <- try action
+      pure $ case outcome of
+        Left (e :: SomeException) -> DCUtRFailed (show e)
+        Right r -> r
+    bounded limit action = do
+      r <- timeout limit action
+      pure (fromMaybe (DCUtRFailed "dcutr exchange timed out") r)
+
+-- | Dial for a hole punch: never reuse the pooled relay connection, and
+-- take the security and muxer roles the spec assigns.
+--
+-- specs/relay/DCUtR: "For the purpose of all protocols run on top of
+-- this TCP connection, @A@ is assumed to be the client and @B@ the
+-- server." We are @B@, so we upgrade as the responder even though we
+-- called connect(). The unilateral attempt has no counterpart dialling
+-- back, so it stays the client.
+holePunchDial
+  :: Switch -> DCUtRUpgradeConfig -> Bool -> PeerId -> [Multiaddr]
+  -> IO (Either String ())
+holePunchDial sw config asClient peerId addrs = do
+  let opts = DialOpts { doForceDirect = True, doUpgradeAsClient = asClient }
+  dialed <- try (timeout (ducDirectDialTimeoutMicros config) (dialWith sw opts peerId addrs))
+  pure $ case dialed of
+    Left (e :: SomeException) -> Left (show e)
+    Right Nothing -> Left "hole punch dial timed out"
+    Right (Just (Left err)) -> Left (show err)
+    Right (Just (Right _conn)) -> Right ()
+
+-- | Our own listen addresses that a peer could hole punch to.
+dialableListenAddrs :: Switch -> IO [Multiaddr]
+dialableListenAddrs sw = filter (not . isRelayedAddr) <$> switchListenAddrs sw
+
+-- | Close the relay connection after the grace period, provided a direct
+-- connection to the peer is still up.
+--
+-- specs/relay/DCUtR: "All new streams should be opened in the direct
+-- connection, while the relay connection should be closed after a grace
+-- period." The re-check matters because the direct connection can die
+-- inside the grace window; dropping the relay as well would leave the
+-- peer unreachable, and the spec keeps the relay as the fallback.
+scheduleRelayClose :: Switch -> DCUtRUpgradeConfig -> Connection -> IO ()
+scheduleRelayClose sw config relayConn = void . async $ do
+  threadDelay (ducRelayCloseGraceMicros config)
+  conns <- atomically $ lookupAllConns (swConnPool sw) (connPeerId relayConn)
+  direct <- atomically $ filterM openAndDirect conns
+  unless (null direct) $ closeConnection sw relayConn
+  where
+    openAndDirect c = do
+      st <- readTVar (connState c)
+      pure (st == ConnOpen && not (isRelayedAddr (connRemoteAddr c)))
+
+-- | Close a stream, ignoring failures from an already-dead session.
+closeQuietly :: StreamIO -> IO ()
+closeQuietly stream = streamClose stream `catch` \(_ :: SomeException) -> pure ()
 
 -- | Register the AutoNAT server handler (/libp2p/autonat/1.0.0).
 --
@@ -270,15 +497,17 @@ registerRelayStopHandler sw circuitState =
 --
 -- Answers the CONNECT/SYNC exchange with our listen addresses and dials
 -- the initiator's addresses through the Switch for the hole punch.
-registerDCUtRHandler :: Switch -> IO ()
-registerDCUtRHandler sw =
+registerDCUtRHandler :: Switch -> DCUtRUpgradeConfig -> IO ()
+registerDCUtRHandler sw upgradeConfig =
   setStreamHandler sw dcutrProtocolId $ \conn stream -> do
-    addrs <- switchListenAddrs sw
+    addrs <- dialableListenAddrs sw
     let config = DCUtRConfig
-          { dcMaxAttempts = 3
-          , dcDialer = \addr -> do
-              dialed <- dial sw (connPeerId conn) [addr]
-              pure $ either (Left . show) (const (Right ())) dialed
+          { dcMaxAttempts = ducMaxAttempts upgradeConfig
+            -- We are peer A: the spec makes us the client of the
+            -- simultaneous connect, and the dial must not be satisfied by
+            -- the relay connection we are running this exchange over.
+          , dcDialer = \addr ->
+              holePunchDial sw upgradeConfig True (connPeerId conn) [addr]
           }
-    _ <- handleDCUtR config stream addrs
+    _ <- timeout (ducStreamTimeoutMicros upgradeConfig) (handleDCUtR config stream addrs)
     pure ()

@@ -42,8 +42,7 @@ import qualified Data.Map.Strict as Map
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32, Word64)
 import LibP2P.NAT.Relay.Message
-import LibP2P.Multiaddr (Multiaddr (..), fromBytes, toBytes)
-import LibP2P.Multiaddr.Protocol (Protocol (..))
+import LibP2P.Multiaddr (Multiaddr (..), fromBytes, isRelayedAddr, toBytes)
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import LibP2P.Crypto.Key (KeyPair (..))
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
@@ -345,10 +344,6 @@ buildRelayAddrBytes relayAddr relayIdBytes targetIdBytes =
     -- P2PCircuit protocol: code 290 (0xa202), no address
     p2pCircuitBytes :: ByteString
     p2pCircuitBytes = encodeUvarint 290
-
--- | Check whether a multiaddr contains a p2p-circuit component.
-isRelayedAddr :: Multiaddr -> Bool
-isRelayedAddr (Multiaddr ps) = P2PCircuit `elem` ps
 
 -- | Check whether raw multiaddr bytes describe a relayed connection.
 -- Decodes the bytes structurally: the p2p-circuit byte pattern occurring
