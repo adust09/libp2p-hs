@@ -27,6 +27,7 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.NAT
   ( NATConfig (..)
+  , defaultDCUtRUpgradeConfig
   , defaultNATConfig
   , defaultReservationRefreshConfig
   , registerNATHandlers
@@ -141,6 +142,7 @@ spec = describe "relay reservation lifecycle" $ do
     let config = NATConfig
           { ncRelayConfig        = defaultRelayConfig { rcMaxReservations = 1 }
           , ncReservationRefresh = defaultReservationRefreshConfig
+              , ncDCUtRUpgrade = defaultDCUtRUpgradeConfig
           }
     (swR, pidR, addrR, relayState) <- newRelaySwitch config
     (swC1, pidC1, _) <- newListeningSwitch

@@ -13,6 +13,10 @@
 module LibP2P.Switch.Dial
   ( -- * Main entry point
     dial
+    -- * Dial options
+  , DialOpts (..)
+  , defaultDialOpts
+  , dialWith
     -- * Backoff management
   , checkBackoff
   , recordBackoff
@@ -57,7 +61,7 @@ import LibP2P.Switch.Types
   , Switch (..)
   , SwitchEvent (..)
   )
-import LibP2P.Switch.Upgrade (upgradeOutbound)
+import LibP2P.Switch.Upgrade (upgradeAs)
 import LibP2P.Transport (Transport (..))
 
 -- | Initial backoff duration after first failure: 5 seconds.
@@ -120,6 +124,34 @@ data PendingCheck
   = JoinExisting !(TMVar (Either DialError Connection))
   | StartNew     !(TMVar (Either DialError Connection))
 
+-- | Per-dial options.
+--
+-- Mirrors the two orthogonal context values go-libp2p threads through a
+-- dial: @network.WithForceDirectDial@ and @network.WithSimultaneousConnect@,
+-- which its hole puncher sets together.
+data DialOpts = DialOpts
+  { doForceDirect :: !Bool
+    -- ^ Bypass connection reuse, dial backoff and dial deduplication,
+    -- and always establish a new transport connection. Hole punching
+    -- needs this: reusing a pooled connection emits no packet at all, so
+    -- the TCP simultaneous connect the DCUtR spec relies on cannot
+    -- happen. go-libp2p likewise consults backoff only when the dial is
+    -- not force-direct.
+  , doUpgradeAsClient :: !Bool
+    -- ^ Whether to run the client side of the security handshake and the
+    -- muxer. False upgrades as the responder over a connection we
+    -- dialled, which specs/relay/DCUtR requires of peer @B@: "For the
+    -- purpose of all protocols run on top of this TCP connection, @A@ is
+    -- assumed to be the client and @B@ the server."
+  }
+
+-- | Ordinary dial: reuse pooled connections, honour backoff, act as client.
+defaultDialOpts :: DialOpts
+defaultDialOpts = DialOpts
+  { doForceDirect     = False
+  , doUpgradeAsClient = True
+  }
+
 -- | Dial a peer, reusing existing connections or establishing new ones.
 --
 -- Implements the full dial flow:
@@ -130,35 +162,48 @@ data PendingCheck
 --   5. First success: upgrade, add to pool, return
 --   6. All fail: record backoff, return error
 dial :: Switch -> PeerId -> [Multiaddr] -> IO (Either DialError Connection)
-dial sw remotePeerId addrs = do
+dial sw = dialWith sw defaultDialOpts
+
+-- | Dial a peer under explicit options.
+--
+-- A force-direct dial skips steps 1-3 entirely. Skipping deduplication
+-- is required, not incidental: DCUtR calls its dialer once per address
+-- so that every address is attempted at the same moment, and a shared
+-- pending-dial TMVar carries one result for all waiters, so joining it
+-- would collapse those attempts into a single address. Backoff is still
+-- *recorded* on failure, as go-libp2p does.
+dialWith :: Switch -> DialOpts -> PeerId -> [Multiaddr] -> IO (Either DialError Connection)
+dialWith sw opts remotePeerId addrs = do
   -- 0. Check switch is open
   closed <- atomically $ readTVar (swClosed sw)
   if closed
     then pure (Left DialSwitchClosed)
-    else do
-      -- 1. Check connection pool for existing Open connection
-      existing <- atomically $ lookupConn (swConnPool sw) remotePeerId
-      case existing of
-        Just conn -> pure (Right conn)
-        Nothing -> do
-          -- 2. Check backoff
-          backoffResult <- checkBackoff (swDialBackoffs sw) remotePeerId
-          case backoffResult of
-            Left err -> pure (Left err)
-            Right () -> do
-              -- 3. Deduplication: check for pending dial
-              joinOrCreate <- atomically $ checkPendingDial sw remotePeerId
-              case joinOrCreate of
-                JoinExisting tmvar ->
-                  -- Another thread is already dialing; wait for its result
-                  atomically $ readTMVar tmvar
-                StartNew tmvar ->
-                  -- We own this dial; execute and broadcast result.
-                  -- If the dial throws, fill the TMVar and drop the
-                  -- pending entry so waiters and future dials never
-                  -- wedge on a stale pending dial.
-                  dialNewAndBroadcast sw remotePeerId addrs tmvar
-                    `onException` abortPendingDial sw remotePeerId tmvar
+    else if doForceDirect opts
+      then establishAndRegister sw opts remotePeerId addrs
+      else do
+        -- 1. Check connection pool for existing Open connection
+        existing <- atomically $ lookupConn (swConnPool sw) remotePeerId
+        case existing of
+          Just conn -> pure (Right conn)
+          Nothing -> do
+            -- 2. Check backoff
+            backoffResult <- checkBackoff (swDialBackoffs sw) remotePeerId
+            case backoffResult of
+              Left err -> pure (Left err)
+              Right () -> do
+                -- 3. Deduplication: check for pending dial
+                joinOrCreate <- atomically $ checkPendingDial sw remotePeerId
+                case joinOrCreate of
+                  JoinExisting tmvar ->
+                    -- Another thread is already dialing; wait for its result
+                    atomically $ readTMVar tmvar
+                  StartNew tmvar ->
+                    -- We own this dial; execute and broadcast result.
+                    -- If the dial throws, fill the TMVar and drop the
+                    -- pending entry so waiters and future dials never
+                    -- wedge on a stale pending dial.
+                    dialNewAndBroadcast sw opts remotePeerId addrs tmvar
+                      `onException` abortPendingDial sw remotePeerId tmvar
 
 -- | Clean up a pending dial whose worker threw an exception.
 -- Fills the TMVar (if still empty) so joined waiters are released,
@@ -180,44 +225,53 @@ checkPendingDial sw pid = do
       writeTVar (swPendingDials sw) (Map.insert pid tmvar pending)
       pure (StartNew tmvar)
 
--- | Execute the dial, broadcast the result, and clean up.
+-- | Execute the dial, broadcast the result to joined waiters, and drop
+-- the pending-dial entry.
 dialNewAndBroadcast
-  :: Switch -> PeerId -> [Multiaddr]
+  :: Switch -> DialOpts -> PeerId -> [Multiaddr]
   -> TMVar (Either DialError Connection)
   -> IO (Either DialError Connection)
-dialNewAndBroadcast sw remotePeerId addrs tmvar = do
-  -- Check resource limits before attempting dial
-  resCheck <- atomically $ reserveConnection (swResourceMgr sw) remotePeerId Outbound
+dialNewAndBroadcast sw opts remotePeerId addrs tmvar = do
+  result <- establishAndRegister sw opts remotePeerId addrs
+  atomically $ do
+    putTMVar tmvar result
+    pending <- readTVar (swPendingDials sw)
+    writeTVar (swPendingDials sw) (Map.delete remotePeerId pending)
+  pure result
+
+-- | Reserve resources, dial, verify the peer id, and register the
+-- resulting connection.
+--
+-- Shared by the ordinary dial path and the force-direct one, which
+-- reaches it without touching the pool, backoff or pending-dial state.
+--
+-- The direction is taken from 'doUpgradeAsClient' and used for the
+-- resource reservation, the upgrade roles and 'connDirection' alike, so
+-- the release in 'closeConnection' -- which reads 'connDirection' --
+-- always matches what was reserved.
+establishAndRegister
+  :: Switch -> DialOpts -> PeerId -> [Multiaddr]
+  -> IO (Either DialError Connection)
+establishAndRegister sw opts remotePeerId addrs = do
+  let dir = if doUpgradeAsClient opts then Outbound else Inbound
+  resCheck <- atomically $ reserveConnection (swResourceMgr sw) remotePeerId dir
   case resCheck of
-    Left resErr -> do
-      let result = Left (DialResourceLimit resErr)
-      atomically $ putTMVar tmvar result
-      atomically $ do
-        pending <- readTVar (swPendingDials sw)
-        writeTVar (swPendingDials sw) (Map.delete remotePeerId pending)
-      pure result
+    Left resErr -> pure (Left (DialResourceLimit resErr))
     Right () -> do
-      result <- dialNewInner sw addrs
-      -- Verify remote PeerId matches expected target before broadcasting
+      result <- dialNewInner sw dir addrs
+      -- Verify remote PeerId matches expected target
       let verified = case result of
             Right conn
               | connPeerId conn /= remotePeerId ->
                   Left (DialPeerIdMismatch remotePeerId (connPeerId conn))
             _ -> result
-      -- Broadcast verified result to any waiting threads
-      atomically $ putTMVar tmvar verified
-      -- Clean up pending dials map
-      atomically $ do
-        pending <- readTVar (swPendingDials sw)
-        writeTVar (swPendingDials sw) (Map.delete remotePeerId pending)
-      -- Record backoff on failure, clear on success, add to pool
       case verified of
         Right conn -> do
           clearBackoff (swDialBackoffs sw) remotePeerId
           atomically $ do
             addConn (swConnPool sw) conn
             writeTChan (swEvents sw)
-              (Connected (connPeerId conn) Outbound (connRemoteAddr conn))
+              (Connected (connPeerId conn) dir (connRemoteAddr conn))
           -- Start accepting inbound streams on the dialer side; tear the
           -- connection down when the session dies (pool removal,
           -- resource release, muxer + transport close).
@@ -232,14 +286,14 @@ dialNewAndBroadcast sw remotePeerId addrs tmvar = do
             Right conn -> muxClose (connSession conn)
             Left _     -> pure ()
           -- Release the reserved connection since dial failed
-          atomically $ releaseConnection (swResourceMgr sw) remotePeerId Outbound
+          atomically $ releaseConnection (swResourceMgr sw) remotePeerId dir
           recordBackoff (swDialBackoffs sw) remotePeerId
           pure verified
 
 -- | Inner dial logic: transport selection and staggered parallel dial.
-dialNewInner :: Switch -> [Multiaddr] -> IO (Either DialError Connection)
-dialNewInner _sw [] = pure (Left DialNoAddresses)
-dialNewInner sw addrs = do
+dialNewInner :: Switch -> Direction -> [Multiaddr] -> IO (Either DialError Connection)
+dialNewInner _sw _dir [] = pure (Left DialNoAddresses)
+dialNewInner sw dir addrs = do
   transports <- atomically $ readTVar (swTransports sw)
   -- Find a transport for each address
   let dialable = filterMap (\addr ->
@@ -248,7 +302,7 @@ dialNewInner sw addrs = do
           Nothing -> Nothing) addrs
   case dialable of
     []    -> pure (Left (DialNoTransport (Prelude.head addrs)))
-    pairs -> staggeredDial sw pairs
+    pairs -> staggeredDial sw dir pairs
 
 -- | Filter and map a list, keeping only Just results.
 filterMap :: (a -> Maybe b) -> [a] -> [b]
@@ -261,14 +315,14 @@ filterMap f (x:xs) = case f x of
 --
 -- Addresses are tried with 250ms delay between each attempt.
 -- The first successful connection wins; remaining attempts are cancelled.
-staggeredDial :: Switch -> [(Multiaddr, Transport)] -> IO (Either DialError Connection)
-staggeredDial sw pairs = do
+staggeredDial :: Switch -> Direction -> [(Multiaddr, Transport)] -> IO (Either DialError Connection)
+staggeredDial sw dir pairs = do
   -- Spawn workers with staggered delays: 0ms, 250ms, 500ms, ...
   workers <- forM (zip [0 :: Int ..] pairs) $ \(i, (addr, transport)) ->
     async $ do
       when (i > 0) $ threadDelay (i * staggerDelayUs)
       rawConn <- transportDial transport addr
-      upgradeOutbound (swIdentityKey sw) rawConn
+      upgradeAs dir (swIdentityKey sw) rawConn
   -- Wait for first success or collect all failures
   collectResults workers []
 

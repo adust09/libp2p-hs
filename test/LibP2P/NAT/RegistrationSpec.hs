@@ -6,13 +6,11 @@
 module LibP2P.NAT.RegistrationSpec (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import qualified Data.ByteString as BS
 import Data.Maybe (isJust)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair, publicKey)
 import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey, peerIdBytes)
-import LibP2P.Multiaddr (Multiaddr (..), fromBytes, toBytes)
+import LibP2P.Multiaddr (Multiaddr (..), toBytes)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
@@ -39,12 +37,11 @@ import LibP2P.NAT.DCUtR.Message
   , readHolePunchMessage
   , writeHolePunchMessage
   )
-import LibP2P.NAT.Relay.Client (connectViaRelay, makeReservation)
+import LibP2P.NAT.Relay.Client (makeReservation)
 import LibP2P.NAT.Relay.Message
   ( HopMessage (..)
   , RelayPeer (..)
   , RelayStatus (..)
-  , Reservation (..)
   , StopMessage (..)
   , StopMessageType (..)
   , hopProtocolId

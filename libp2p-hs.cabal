@@ -155,6 +155,7 @@ test-suite libp2p-hs-test
     LibP2P.Core.MultihashSpec
     LibP2P.Multiaddr.MultiaddrSpec
     LibP2P.Multiaddr.ProtocolSpec
+    LibP2P.Multiaddr.PublicAddrSpec
     LibP2P.Crypto.PeerIdSpec
     LibP2P.Crypto.RSASpec
     LibP2P.Crypto.Secp256k1Spec
@@ -207,6 +208,7 @@ test-suite libp2p-hs-test
     LibP2P.NAT.Relay.ReservationRefreshSpec
     LibP2P.NAT.DCUtR.MessageSpec
     LibP2P.NAT.DCUtR.DCUtRSpec
+    LibP2P.NAT.DCUtR.UpgradeSpec
     LibP2P.NAT.RegistrationSpec
     LibP2P.Protocol.GossipSub.TypesSpec
     LibP2P.Protocol.GossipSub.MessageSpec
