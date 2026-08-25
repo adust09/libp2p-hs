@@ -83,6 +83,13 @@ module LibP2P
   , PingResult (..)
   , PingError (..)
 
+    -- * Perf protocol
+  , registerPerfHandler
+  , runPerf
+  , perfProtocolId
+  , PerfResult (..)
+  , PerfError (..)
+
     -- * NAT traversal (AutoNAT, Circuit Relay v2, DCUtR)
   , NATConfig (..)
   , defaultNATConfig
@@ -151,6 +158,13 @@ import LibP2P.Protocol.Identify
   , pushIdentify
   , registerIdentifyHandlers
   , requestIdentify
+  )
+import LibP2P.Protocol.Perf
+  ( PerfError (..)
+  , PerfResult (..)
+  , perfProtocolId
+  , registerPerfHandler
+  , runPerf
   )
 import LibP2P.Protocol.Ping
   ( PingError (..)

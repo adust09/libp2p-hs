@@ -1,0 +1,110 @@
+# Cross-implementation perf test: libp2p-hs <-> nim-libp2p.
+#
+# nim-libp2p is the reference perf test app for the unified-testing
+# submission (perf/images.yaml: nim-v1.15) and implements the canonical
+# /perf/1.0.0 wire protocol from libp2p/specs. The unified-testing go
+# image (images/go/v0.45) is a placeholder that opens no perf streams,
+# so nim is the cross-implementation partner that actually exercises
+# the wire format.
+#
+# Prerequisites: `make -C interop nim-libp2p` clones nim-libp2p at the
+# commit perf/images.yaml pins for nim-v1.15 (NIM_LIBP2P_COMMIT in
+# interop/Makefile is the single source of truth).
+#
+# Both sides speak the modern perf contract (uppercase env vars, Redis
+# SET/GET on `{TEST_KEY}_listener_multiaddr`), so no key-translation
+# shims are needed. Directions use distinct TEST_KEYs so a lingering
+# SET from one direction can never satisfy the other's poll.
+#
+# Test 1: nim listener, hs dialer
+#   docker compose -f docker-compose.perf-cross.yml up --build --exit-code-from hs-perf-dialer redis nim-perf-listener hs-perf-dialer
+#
+# Test 2: hs listener, nim dialer
+#   docker compose -f docker-compose.perf-cross.yml up --build --exit-code-from nim-perf-dialer redis hs-perf-listener nim-perf-dialer
+x-hs-dial-key: &hs-dial-key "cafe0131"
+x-nim-dial-key: &nim-dial-key "cafe0132"
+
+x-perf-sizes: &perf-sizes
+  UPLOAD_BYTES: "10485760"
+  DOWNLOAD_BYTES: "10485760"
+  UPLOAD_ITERATIONS: "3"
+  DOWNLOAD_ITERATIONS: "3"
+  LATENCY_ITERATIONS: "10"
+
+x-perf-env: &perf-env
+  REDIS_ADDR: "redis:6379"
+  TRANSPORT: tcp
+  SECURE_CHANNEL: noise
+  MUXER: yamux
+  LISTENER_IP: "0.0.0.0"
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Disable persistence so a stale listener address never survives across runs.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  # --- Test 1: nim listener, hs dialer ---
+  nim-perf-listener:
+    build:
+      context: ./nim-libp2p
+      dockerfile: interop/perf/Dockerfile
+    image: nim-libp2p-perf:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *perf-env
+      TEST_KEY: *hs-dial-key
+      IS_DIALER: "false"
+
+  hs-perf-dialer:
+    build:
+      context: .
+      dockerfile: interop/perf/Dockerfile
+    image: libp2p-hs-perf:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+      nim-perf-listener:
+        condition: service_started
+    environment:
+      <<: [*perf-env, *perf-sizes]
+      TEST_KEY: *hs-dial-key
+      IS_DIALER: "true"
+
+  # --- Test 2: hs listener, nim dialer ---
+  hs-perf-listener:
+    build:
+      context: .
+      dockerfile: interop/perf/Dockerfile
+    image: libp2p-hs-perf:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *perf-env
+      TEST_KEY: *nim-dial-key
+      IS_DIALER: "false"
+
+  nim-perf-dialer:
+    build:
+      context: ./nim-libp2p
+      dockerfile: interop/perf/Dockerfile
+    image: nim-libp2p-perf:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+      hs-perf-listener:
+        condition: service_started
+    environment:
+      <<: [*perf-env, *perf-sizes]
+      TEST_KEY: *nim-dial-key
+      IS_DIALER: "true"

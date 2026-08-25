@@ -1,0 +1,64 @@
+# Perf self-test: libp2p-hs listener + libp2p-hs dialer.
+#
+# Speaks the unified-testing perf contract: the listener SETs
+# `{TEST_KEY}_listener_multiaddr` in Redis and the dialer polls GET
+# (the perf contract uses a plain string, unlike the transport
+# contract's RPUSH/BLPOP list).
+#
+# Sizes are kept small so the self-test finishes quickly; the upstream
+# perf harness supplies its own (much larger) values.
+#
+#   docker compose -f docker-compose.perf.yml up --build --exit-code-from hs-perf-dialer redis hs-perf-listener hs-perf-dialer
+x-test-key: &test-key "cafe0130"
+
+x-perf-env: &perf-env
+  REDIS_ADDR: "redis:6379"
+  TEST_KEY: *test-key
+  TRANSPORT: tcp
+  SECURE_CHANNEL: noise
+  MUXER: yamux
+  LISTENER_IP: "0.0.0.0"
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Disable persistence so a stale listener address never survives across runs.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  hs-perf-listener:
+    build:
+      context: .
+      dockerfile: interop/perf/Dockerfile
+    image: libp2p-hs-perf:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *perf-env
+      IS_DIALER: "false"
+
+  hs-perf-dialer:
+    build:
+      context: .
+      dockerfile: interop/perf/Dockerfile
+    image: libp2p-hs-perf:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+      hs-perf-listener:
+        condition: service_started
+    environment:
+      <<: *perf-env
+      IS_DIALER: "true"
+      UPLOAD_BYTES: "10485760"
+      DOWNLOAD_BYTES: "10485760"
+      UPLOAD_ITERATIONS: "3"
+      DOWNLOAD_ITERATIONS: "3"
+      LATENCY_ITERATIONS: "10"

@@ -53,6 +53,63 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.cross.yml down -v
 
+  perf-interop:
+    name: perf-interop (hs <-> nim, tcp+noise+yamux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # nim-libp2p pinned to the commit unified-testing's perf/images.yaml
+      # registers for nim-v1.15 (single source of truth: NIM_LIBP2P_COMMIT
+      # in interop/Makefile); docker-compose.perf-cross.yml builds its
+      # interop/perf/Dockerfile. The unified-testing go perf image is a
+      # placeholder that opens no perf streams, so nim is the partner that
+      # actually exercises the /perf/1.0.0 wire format.
+      - name: Clone nim-libp2p (pinned)
+        run: make -C interop nim-libp2p
+
+      - name: Build libp2p-hs perf image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: interop/perf/Dockerfile
+          load: true
+          tags: libp2p-hs-perf:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Self-test — hs listener, hs dialer
+        run: >
+          docker compose -f docker-compose.perf.yml up
+          --exit-code-from hs-perf-dialer
+          redis hs-perf-listener hs-perf-dialer
+
+      - name: Reset after self-test
+        run: docker compose -f docker-compose.perf.yml down -v
+
+      - name: Direction 1 — nim listener, hs dialer
+        run: >
+          docker compose -f docker-compose.perf-cross.yml up
+          --exit-code-from hs-perf-dialer
+          redis nim-perf-listener hs-perf-dialer
+
+      - name: Reset between directions
+        run: docker compose -f docker-compose.perf-cross.yml down
+
+      - name: Direction 2 — hs listener, nim dialer
+        run: >
+          docker compose -f docker-compose.perf-cross.yml up
+          --exit-code-from nim-perf-dialer
+          redis hs-perf-listener nim-perf-dialer
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.perf-cross.yml down -v
+
   kad-dht-interop:
     name: kad-dht-interop (hs bootstrap → provider → querier)
     runs-on: ubuntu-latest
