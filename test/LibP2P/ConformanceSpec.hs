@@ -24,6 +24,7 @@ import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
+  , mkByteStreamIO
   , mkMemoryStreamPair
   , negotiateInitiator
   , negotiateResponder
@@ -55,15 +56,15 @@ mkScriptedStream :: ByteString -> IO (StreamIO, IO ByteString)
 mkScriptedStream canned = do
   writtenRef <- newIORef BS.empty
   readRef <- newIORef canned
-  let stream = StreamIO
-        { streamWrite = \bs -> modifyIORef' writtenRef (`BS.append` bs)
-        , streamReadByte = do
-            buf <- readIORef readRef
-            case BS.uncons buf of
-              Nothing -> ioError (userError "scripted stream: EOF")
-              Just (b, rest) -> writeIORef readRef rest >> pure b
-        , streamClose = pure ()
-        }
+  let readB = do
+        buf <- readIORef readRef
+        case BS.uncons buf of
+          Nothing -> ioError (userError "scripted stream: EOF")
+          Just (b, rest) -> writeIORef readRef rest >> pure b
+      stream = mkByteStreamIO
+        (\bs -> modifyIORef' writtenRef (`BS.append` bs))
+        readB
+        (pure ())
   pure (stream, readIORef writtenRef)
 
 -- multistream-select messages, hand-derived from the spec:

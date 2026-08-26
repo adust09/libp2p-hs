@@ -43,9 +43,10 @@ mkEofStreamPair = do
   pure (mkEnd aToB bToA, mkEnd bToA aToB)
   where
     mkEnd outgoing incoming = StreamIO
-      { streamWrite    = writeHalf outgoing
-      , streamReadByte = readHalf incoming
-      , streamClose    = atomically (writeTVar (hdClosed outgoing) True)
+      { streamWrite     = writeHalf outgoing
+      , streamReadByte  = readHalf incoming
+      , streamReadChunk = readChunkHalf incoming
+      , streamClose     = atomically (writeTVar (hdClosed outgoing) True)
       }
 
     writeHalf hd bs = do
@@ -70,3 +71,28 @@ mkEofStreamPair = do
       case r of
         Just b  -> pure b
         Nothing -> ioError (mkIOError eofErrorType "end of stream" Nothing Nothing)
+
+    -- Chunk read with the same drain-first EOF semantics: block for the
+    -- first byte, take whatever else is already queued (up to n).
+    readChunkHalf hd n = do
+      r <- atomically $
+        (Just <$> drainUpTo hd n)
+          `orElse` (do
+            closed <- readTVar (hdClosed hd)
+            check closed
+            pure Nothing)
+      case r of
+        Just bs -> pure bs
+        Nothing -> ioError (mkIOError eofErrorType "end of stream" Nothing Nothing)
+
+    drainUpTo hd n = do
+      b <- readTQueue (hdQueue hd)
+      let go k
+            | k <= (0 :: Int) = pure []
+            | otherwise = do
+                mb <- tryReadTQueue (hdQueue hd)
+                case mb of
+                  Nothing -> pure []
+                  Just b' -> (b' :) <$> go (k - 1)
+      rest <- go (n - 1)
+      pure (BS.pack (b : rest))

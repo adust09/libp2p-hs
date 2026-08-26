@@ -214,6 +214,7 @@ noiseSessionToStreamIO
 noiseSessionToStreamIO sendRef recvRef bufRef rawIO = StreamIO
   { streamWrite = encryptAndWrite sendRef rawIO
   , streamReadByte = decryptAndReadByte recvRef bufRef rawIO
+  , streamReadChunk = decryptAndReadChunk recvRef bufRef rawIO
   , streamClose = pure ()  -- Encryption layer does not own the connection
   }
 
@@ -233,37 +234,47 @@ encryptAndWrite sendRef rawIO plaintext =
           writeIORef sendRef sess'
           writeFramedMessage rawIO ct
 
--- | Read and decrypt a byte from the Noise channel.
--- If the buffer has bytes, return the first. Otherwise, read Noise
--- frames from the raw stream until one decrypts to a non-empty
--- plaintext, and buffer the result. A transport message with an empty
--- plaintext (a frame carrying only the AEAD tag) is legal — some
--- implementations send it as a keepalive — and a zero-length frame
--- carries no Noise message at all; both yield zero application bytes,
--- so reading continues at the next frame.
+-- | Read Noise frames from the raw stream until one decrypts to a
+-- non-empty plaintext, and return that plaintext. A transport message
+-- with an empty plaintext (a frame carrying only the AEAD tag) is
+-- legal — some implementations send it as a keepalive — and a
+-- zero-length frame carries no Noise message at all; both yield zero
+-- application bytes, so reading continues at the next frame.
+nextPlaintext :: IORef NoiseSession -> StreamIO -> IO ByteString
+nextPlaintext recvRef rawIO = do
+  ct <- readFramedMessage rawIO
+  if BS.null ct
+    then nextPlaintext recvRef rawIO -- zero-length frame: no message to decrypt
+    else do
+      sess <- readIORef recvRef
+      case decryptMessage sess ct of
+        Left err -> fail $ "nextPlaintext: decrypt failed: " <> err
+        Right (pt, sess') -> do
+          writeIORef recvRef sess'
+          if BS.null pt
+            then nextPlaintext recvRef rawIO -- empty transport message (keepalive)
+            else pure pt
+
+-- | Read and decrypt a byte from the Noise channel: pop the buffer if
+-- it has bytes, otherwise decrypt the next frame and buffer the rest.
 decryptAndReadByte :: IORef NoiseSession -> IORef ByteString -> StreamIO -> IO Word8
 decryptAndReadByte recvRef bufRef rawIO = do
   buf <- readIORef bufRef
-  if BS.null buf
-    then fillFromNextFrame
-    else popByte buf
-  where
-    popByte bs = do
-      writeIORef bufRef (BS.tail bs)
-      pure (BS.head bs)
-    fillFromNextFrame = do
-      ct <- readFramedMessage rawIO
-      if BS.null ct
-        then fillFromNextFrame -- zero-length frame: no message to decrypt
-        else do
-          sess <- readIORef recvRef
-          case decryptMessage sess ct of
-            Left err -> fail $ "decryptAndReadByte: " <> err
-            Right (pt, sess') -> do
-              writeIORef recvRef sess'
-              if BS.null pt
-                then fillFromNextFrame -- empty transport message (keepalive)
-                else popByte pt
+  bs <- if BS.null buf then nextPlaintext recvRef rawIO else pure buf
+  writeIORef bufRef (BS.tail bs)
+  pure (BS.head bs)
+
+-- | Chunk-level read from the Noise channel: hand back up to @n@ bytes
+-- of the buffered plaintext (a decrypted frame is already a chunk),
+-- decrypting the next frame only when the buffer is empty. Bytes
+-- beyond @n@ stay buffered for the next read.
+decryptAndReadChunk :: IORef NoiseSession -> IORef ByteString -> StreamIO -> Int -> IO ByteString
+decryptAndReadChunk recvRef bufRef rawIO n = do
+  buf <- readIORef bufRef
+  bs <- if BS.null buf then nextPlaintext recvRef rawIO else pure buf
+  let (front, rest) = BS.splitAt n bs
+  writeIORef bufRef rest
+  pure front
 
 -- | Bounded window given to the send loop to flush the GoAway frame
 -- before the transport is closed underneath it.
@@ -312,18 +323,13 @@ yamuxToMuxerSession yamuxSess closeTransport = do
     }
 
 -- | Convert a YamuxStream to StreamIO with a read buffer.
--- Yamux delivers data in chunks via streamRead, but StreamIO requires
--- byte-by-byte reads. An IORef buffer bridges this gap.
+-- Yamux delivers data in chunks via streamRead; an IORef buffer holds
+-- the bytes a byte- or chunk-level read did not consume.
 yamuxStreamToStreamIO :: YamuxStream -> IO StreamIO
 yamuxStreamToStreamIO yamuxStream = do
   readBuf <- newIORef BS.empty
-  pure StreamIO
-    { streamWrite = \bs -> do
-        result <- YS.streamWrite yamuxStream bs
-        case result of
-          Right () -> pure ()
-          Left err -> fail $ "yamuxStreamWrite: " <> show err
-    , streamReadByte = do
+  let -- Buffered bytes if any, otherwise the next yamux chunk.
+      nextChunk = do
         buf <- readIORef readBuf
         if BS.null buf
           then do
@@ -332,13 +338,23 @@ yamuxStreamToStreamIO yamuxStream = do
               Left err -> fail $ "yamuxStreamRead: " <> show err
               Right chunk
                 | BS.null chunk -> fail "yamuxStreamRead: empty chunk"
-                | BS.length chunk == 1 -> pure (BS.head chunk)
-                | otherwise -> do
-                    writeIORef readBuf (BS.tail chunk)
-                    pure (BS.head chunk)
-          else do
-            writeIORef readBuf (BS.tail buf)
-            pure (BS.head buf)
+                | otherwise -> pure chunk
+          else pure buf
+  pure StreamIO
+    { streamWrite = \bs -> do
+        result <- YS.streamWrite yamuxStream bs
+        case result of
+          Right () -> pure ()
+          Left err -> fail $ "yamuxStreamWrite: " <> show err
+    , streamReadByte = do
+        chunk <- nextChunk
+        writeIORef readBuf (BS.tail chunk)
+        pure (BS.head chunk)
+    , streamReadChunk = \n -> do
+        chunk <- nextChunk
+        let (front, rest) = BS.splitAt n chunk
+        writeIORef readBuf rest
+        pure front
     , streamClose = do
         _ <- YS.streamClose yamuxStream  -- Sends FIN flag
         pure ()

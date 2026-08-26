@@ -163,6 +163,36 @@ spec = do
       received3 <- readExact encA 11
       received3 `shouldBe` "still alive"
 
+    it "streamReadChunk hands back a whole decrypted frame at once (#276)" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      ((sessA, _), (sessB, _)) <-
+        concurrently
+          (performStreamHandshake kpA Outbound rawA)
+          (performStreamHandshake kpB Inbound rawB)
+      sendRefA <- newIORef sessA
+      recvRefA <- newIORef sessA
+      bufRefA  <- newIORef BS.empty
+      sendRefB <- newIORef sessB
+      recvRefB <- newIORef sessB
+      bufRefB  <- newIORef BS.empty
+      let encA = noiseSessionToStreamIO sendRefA recvRefA bufRefA rawA
+          encB = noiseSessionToStreamIO sendRefB recvRefB bufRefB rawB
+      -- A single write fits one Noise frame; the decrypted plaintext
+      -- must come back as one chunk, not byte-at-a-time.
+      streamWrite encA "hello world"
+      chunk <- streamReadChunk encB 1024
+      chunk `shouldBe` "hello world"
+      -- Byte- and chunk-level reads share the buffer without loss.
+      streamWrite encA "abcdef"
+      b <- streamReadByte encB
+      b `shouldBe` 0x61
+      front <- streamReadChunk encB 2
+      front `shouldBe` "bc"
+      rest <- streamReadChunk encB 1024
+      rest `shouldBe` "def"
+
   describe "Full upgrade pipeline" $ do
     it "upgradeOutbound + upgradeInbound exchange data on muxed stream" $ do
       (_pidA, kpA) <- mkTestIdentity
@@ -234,5 +264,35 @@ spec = do
       recv2 <- readExact stream2B 8
       recv1 `shouldBe` "stream-1"
       recv2 `shouldBe` "stream-2"
+      muxClose (connSession connA)
+      muxClose (connSession connB)
+
+    it "drains a bulk payload through streamReadChunk on a muxed stream (#276)" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      rawConnA <- mkMockRawConn rawA localAddr remoteAddr
+      rawConnB <- mkMockRawConn rawB remoteAddr localAddr
+      (connA, connB) <-
+        concurrently
+          (upgradeOutbound kpA rawConnA)
+          (upgradeInbound kpB rawConnB)
+      (streamA, streamB) <-
+        concurrently
+          (muxOpenStream (connSession connA))
+          (muxAcceptStream (connSession connB))
+      -- Larger than the yamux flow-control window, so the writer only
+      -- makes progress while the reader drains — the perf download
+      -- path in miniature.
+      let total = 300000 :: Int
+          payload = BS.pack (take total (cycle [0 .. 255]))
+          drain acc
+            | BS.length acc >= total = pure acc
+            | otherwise = do
+                chunk <- streamReadChunk streamB 65536
+                drain (acc <> chunk)
+      (received, ()) <-
+        concurrently (drain BS.empty) (streamWrite streamA payload)
+      received `shouldBe` payload
       muxClose (connSession connA)
       muxClose (connSession connB)

@@ -37,6 +37,7 @@ import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
+  , mkByteStreamIO
   , negotiateResponder
   )
 import LibP2P.Protocol.Identify
@@ -103,16 +104,8 @@ mkClosableStreamPair = do
       closeWriter q closed = atomically $ do
         putTMVar closed ()
         writeTQueue q Nothing  -- sentinel for EOF
-      streamA = StreamIO
-        { streamWrite    = writeQ qAtoB closedA
-        , streamReadByte = readQ qBtoA
-        , streamClose    = closeWriter qAtoB closedA
-        }
-      streamB = StreamIO
-        { streamWrite    = writeQ qBtoA closedB
-        , streamReadByte = readQ qAtoB
-        , streamClose    = closeWriter qBtoA closedB
-        }
+      streamA = mkByteStreamIO (writeQ qAtoB closedA) (readQ qBtoA) (closeWriter qAtoB closedA)
+      streamB = mkByteStreamIO (writeQ qBtoA closedB) (readQ qAtoB) (closeWriter qBtoA closedB)
   pure (streamA, streamB)
 
 -- | Wrap a StreamIO so closing it flips the flag (before delegating).
@@ -258,18 +251,15 @@ spec = do
           closeWriter q closed = atomically $ do
             putTMVar closed ()
             writeTQueue q Nothing
-          testStream = StreamIO
-            { streamWrite    = writeQ qAtoB closedA
-            , streamReadByte = fail "not used in this test"
-            , streamClose    = do
-                writeIORef closeCalledRef True
-                closeWriter qAtoB closedA
-            }
-          readerStream = StreamIO
-            { streamWrite    = \_ -> fail "not used"
-            , streamReadByte = readQ qAtoB
-            , streamClose    = pure ()
-            }
+          testStream = mkByteStreamIO
+            (writeQ qAtoB closedA)
+            (fail "not used in this test")
+            (do writeIORef closeCalledRef True
+                closeWriter qAtoB closedA)
+          readerStream = mkByteStreamIO
+            (\_ -> fail "not used")
+            (readQ qAtoB)
+            (pure ())
       -- handleIdentify should write + close the stream
       conn <- mkTestConnection (PeerId "remote") (Multiaddr [IP4 0x7f000001, TCP 4001])
       writer <- async $ handleIdentify sw conn testStream
