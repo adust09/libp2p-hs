@@ -10,10 +10,11 @@ module LibP2P.MultistreamSelect.Negotiation
   , negotiateResponder
   , mkMemoryStreamPair
   , readExactBounded
+  , closeQuietly
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (IOException, catch)
+import Control.Exception (IOException, SomeException, catch)
 import Control.Monad (replicateM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -97,6 +98,12 @@ readExactBounded stream maxLen n
       let m = min readChunkSize remaining
       chunk <- BS.pack <$> replicateM m (streamReadByte stream)
       (chunk :) <$> go (remaining - m)
+
+-- | Close a stream, swallowing any exception (best-effort EOF signal).
+-- Shared by protocol handlers that must release a stream on every exit
+-- path without letting a close-time error mask the real outcome.
+closeQuietly :: StreamIO -> IO ()
+closeQuietly stream = streamClose stream `catch` \(_ :: SomeException) -> pure ()
 
 -- | Read a complete multistream-select message from a stream.
 -- Reads varint length byte-by-byte, then reads the full payload.

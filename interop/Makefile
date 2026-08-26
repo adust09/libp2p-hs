@@ -6,7 +6,11 @@
 IMAGE_NAME := libp2p-hs-interop
 
 .PHONY: build image self-test cross-test-go-listener cross-test-hs-listener \
-        cross-gossipsub-rust-listener cross-gossipsub-hs-listener cross-gossipsub kad-dht
+        cross-gossipsub-rust-listener cross-gossipsub-hs-listener cross-gossipsub kad-dht \
+        perf-self-test perf-cross-nim-listener perf-cross-hs-listener perf-cross nim-libp2p
+
+# nim-libp2p commit pinned by unified-testing perf/images.yaml (nim-v1.15).
+NIM_LIBP2P_COMMIT := 1bdf2f67971529e8bee01252230bdb00ab785ef7
 
 image:
 	docker build -t $(IMAGE_NAME) ..
@@ -39,3 +43,23 @@ cross-gossipsub-hs-listener:
 
 # GossipSub cross-test: both directions
 cross-gossipsub: cross-gossipsub-rust-listener cross-gossipsub-hs-listener
+
+# Perf self-test: hs listener + hs dialer
+perf-self-test:
+	cd .. && docker compose -f docker-compose.perf.yml up --build --exit-code-from hs-perf-dialer redis hs-perf-listener hs-perf-dialer
+
+# Clone nim-libp2p at the commit unified-testing pins for perf (nim-v1.15)
+nim-libp2p:
+	cd .. && test -d nim-libp2p || git clone https://github.com/vacp2p/nim-libp2p.git nim-libp2p
+	cd ../nim-libp2p && git checkout $(NIM_LIBP2P_COMMIT)
+
+# Perf cross-test: nim listener, hs dialer
+perf-cross-nim-listener: nim-libp2p
+	cd .. && docker compose -f docker-compose.perf-cross.yml up --build --exit-code-from hs-perf-dialer redis nim-perf-listener hs-perf-dialer
+
+# Perf cross-test: hs listener, nim dialer
+perf-cross-hs-listener: nim-libp2p
+	cd .. && docker compose -f docker-compose.perf-cross.yml up --build --exit-code-from nim-perf-dialer redis hs-perf-listener nim-perf-dialer
+
+# Perf cross-test: both directions
+perf-cross: perf-cross-nim-listener perf-cross-hs-listener
