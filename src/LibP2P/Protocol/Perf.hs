@@ -84,19 +84,25 @@ writeZeros stream = go
       go (n - chunk)
 
 -- | Read and discard bytes until EOF (the initiator's half-close).
+-- Chunk-level reads (#276) keep the drain off the byte-at-a-time path
+-- that bounded download throughput.
 drainUntilEof :: StreamIO -> IO ()
 drainUntilEof stream = loop `catch` \(_ :: SomeException) -> pure ()
   where
-    loop = streamReadByte stream >> loop
+    loop = streamReadChunk stream perfBlockSize >> loop
 
--- | Read and discard exactly @n@ bytes. The payload carries no meaning,
--- so no ByteString is built; premature EOF throws.
+-- | Read and discard exactly @n@ bytes at chunk granularity (#276). The
+-- payload carries no meaning, so the chunks are dropped; premature EOF
+-- throws. A chunk request never exceeds the bytes still owed, so no
+-- byte beyond @n@ is consumed from the stream.
 discardExactly :: StreamIO -> Word64 -> IO ()
 discardExactly stream = go
   where
     go :: Word64 -> IO ()
     go 0 = pure ()
-    go !n = streamReadByte stream >> go (n - 1)
+    go !n = do
+      chunk <- streamReadChunk stream (fromIntegral (min n (fromIntegral perfBlockSize)))
+      go (n - fromIntegral (BS.length chunk))
 
 -- | Handle an inbound perf request (responder).
 --
