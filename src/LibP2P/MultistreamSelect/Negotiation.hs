@@ -8,6 +8,7 @@ module LibP2P.MultistreamSelect.Negotiation
   , StreamIO (..)
   , negotiateInitiator
   , negotiateResponder
+  , mkByteStreamIO
   , mkMemoryStreamPair
   , readExactBounded
   , closeQuietly
@@ -15,7 +16,6 @@ module LibP2P.MultistreamSelect.Negotiation
 
 import Control.Concurrent.STM
 import Control.Exception (IOException, SomeException, catch)
-import Control.Monad (replicateM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Text (Text)
@@ -42,9 +42,28 @@ data NegotiationResult
 
 -- | Abstraction for stream I/O to enable testing with in-memory buffers.
 data StreamIO = StreamIO
-  { streamWrite    :: ByteString -> IO ()
-  , streamReadByte :: IO Word8   -- ^ Read exactly one byte (blocks until available)
-  , streamClose    :: IO ()      -- ^ Close/half-close the stream (signals EOF to remote)
+  { streamWrite     :: ByteString -> IO ()
+  , streamReadByte  :: IO Word8   -- ^ Read exactly one byte (blocks until available)
+  , streamReadChunk :: Int -> IO ByteString
+    -- ^ Read between 1 and @n@ bytes (@n >= 1@): whatever is already
+    -- buffered or arrives next, without waiting for the full @n@.
+    -- Blocks until at least one byte is available and never returns an
+    -- empty ByteString; EOF and failures surface as 'IOException',
+    -- exactly like 'streamReadByte'. Bulk readers use this to move
+    -- data at chunk granularity instead of byte-at-a-time (#276).
+  , streamClose     :: IO ()      -- ^ Close/half-close the stream (signals EOF to remote)
+  }
+
+-- | Build a 'StreamIO' from byte-level primitives: 'streamReadChunk'
+-- falls back to one byte per call. Correct for any consumer (chunk
+-- reads promise at least one byte, not @n@), just not fast — intended
+-- for tests and mocks built on byte queues.
+mkByteStreamIO :: (ByteString -> IO ()) -> IO Word8 -> IO () -> StreamIO
+mkByteStreamIO write readByte close = StreamIO
+  { streamWrite     = write
+  , streamReadByte  = readByte
+  , streamReadChunk = \_ -> BS.singleton <$> readByte
+  , streamClose     = close
   }
 
 -- | Create an in-memory stream pair for testing using STM TQueue.
@@ -55,13 +74,28 @@ mkMemoryStreamPair = do
   queueBtoA <- newTQueueIO :: IO (TQueue Word8)
   let writeToQueue q bs = mapM_ (atomically . writeTQueue q) (BS.unpack bs)
       readFromQueue q = atomically (readTQueue q)
+      -- Chunk read: block for the first byte, then drain whatever else
+      -- is already queued (up to the requested length) in the same
+      -- transaction.
+      drainUpTo q k
+        | k <= (0 :: Int) = pure []
+        | otherwise = do
+            mb <- tryReadTQueue q
+            case mb of
+              Nothing -> pure []
+              Just b  -> (b :) <$> drainUpTo q (k - 1)
+      readChunkFromQueue q n = atomically $ do
+        b <- readTQueue q
+        rest <- drainUpTo q (n - 1)
+        pure (BS.pack (b : rest))
   pure
-    ( StreamIO (writeToQueue queueAtoB) (readFromQueue queueBtoA) (pure ())
-    , StreamIO (writeToQueue queueBtoA) (readFromQueue queueAtoB) (pure ())
+    ( StreamIO (writeToQueue queueAtoB) (readFromQueue queueBtoA) (readChunkFromQueue queueBtoA) (pure ())
+    , StreamIO (writeToQueue queueBtoA) (readFromQueue queueAtoB) (readChunkFromQueue queueAtoB) (pure ())
     )
 
--- | Chunk size for 'readExactBounded'. Bounds the transient boxed-list
--- allocation per read step regardless of the requested length.
+-- | Maximum bytes requested per 'streamReadChunk' call in
+-- 'readExactBounded'. Bounds transient allocation per read step
+-- regardless of the requested length.
 readChunkSize :: Int
 readChunkSize = 32768
 
@@ -71,8 +105,10 @@ readChunkSize = 32768
 -- #169): the declared length is validated against the caller's
 -- protocol-defined cap before a single byte is read or allocated, so a
 -- hostile length prefix cannot trigger an unbounded allocation. Bytes
--- are accumulated in chunks of at most 'readChunkSize', keeping
--- transient memory use proportional to the chunk size, not to @n@.
+-- are read via 'streamReadChunk' in requests of at most
+-- 'readChunkSize', keeping transient memory use proportional to the
+-- chunk size, not to @n@. A chunk request never exceeds the bytes
+-- still owed, so no byte beyond @n@ is consumed from the stream.
 --
 -- I/O failures during the read (stream reset, EOF) are returned as
 -- 'Left' instead of propagating as 'IOException's.
@@ -93,11 +129,13 @@ readExactBounded stream maxLen n
         pure (Left ("readExactBounded: read failed: " <> show e))
   where
     go :: Int -> IO [ByteString]
-    go 0 = pure []
-    go remaining = do
-      let m = min readChunkSize remaining
-      chunk <- BS.pack <$> replicateM m (streamReadByte stream)
-      (chunk :) <$> go (remaining - m)
+    go remaining
+      | remaining <= 0 = pure []
+      | otherwise = do
+          chunk <- streamReadChunk stream (min readChunkSize remaining)
+          if BS.null chunk
+            then fail "readExactBounded: streamReadChunk returned no bytes"
+            else (chunk :) <$> go (remaining - BS.length chunk)
 
 -- | Close a stream, swallowing any exception (best-effort EOF signal).
 -- Shared by protocol handlers that must release a stream on every exit

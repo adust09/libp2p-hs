@@ -4,7 +4,7 @@ import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
 import LibP2P.Crypto.PeerId (PeerId (..))
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Protocol (Protocol (..))
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
+import LibP2P.MultistreamSelect.Negotiation (StreamIO, mkByteStreamIO)
 import LibP2P.Switch.ConnPool
 import LibP2P.Switch.Types
 import Test.Hspec
@@ -19,11 +19,7 @@ mockMuxerSession = MuxerSession
 
 -- | Create a mock StreamIO for testing.
 mockStreamIO :: StreamIO
-mockStreamIO = StreamIO
-  { streamWrite    = \_ -> pure ()
-  , streamReadByte = pure 0
-  , streamClose    = pure ()
-  }
+mockStreamIO = mkByteStreamIO (\_ -> pure ()) (pure 0) (pure ())
 
 -- | Create a mock connection with the given PeerId and direction.
 mkMockConn :: PeerId -> Direction -> Multiaddr -> IO Connection

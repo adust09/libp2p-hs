@@ -312,20 +312,22 @@ bridgeStreams mLimit streamA streamB = do
       streamClose streamB
 
 -- | Forward bytes from source to destination with a byte limit.
--- The limit is checked before each read, so the circuit terminates as soon
--- as exactly @limit@ bytes have been forwarded — no byte beyond the limit
--- is consumed from the source.
+-- Data moves at chunk granularity ('streamReadChunk'), but a chunk
+-- request never exceeds the bytes still allowed, so the circuit
+-- terminates as soon as exactly @limit@ bytes have been forwarded —
+-- no byte beyond the limit is consumed from the source.
 forwardWithLimit :: StreamIO -> StreamIO -> IORef Int -> Int -> IO ()
 forwardWithLimit src dst countRef limit = go
   where
+    forwardChunkSize = 32768
     go = do
       count <- readIORef countRef
       if count >= limit
         then pure ()  -- limit reached, stop forwarding
         else do
-          b <- streamReadByte src
-          modifyIORef' countRef (+ 1)
-          streamWrite dst (BS.singleton b)
+          chunk <- streamReadChunk src (min forwardChunkSize (limit - count))
+          modifyIORef' countRef (+ BS.length chunk)
+          streamWrite dst chunk
           go
 
 -- | Build a relay multiaddr in binary format.

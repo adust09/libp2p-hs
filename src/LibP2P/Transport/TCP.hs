@@ -134,13 +134,16 @@ tcpListen _ = fail "tcpListen: unsupported multiaddr"
 socketToStreamIO :: NS.Socket -> StreamIO
 socketToStreamIO sock = StreamIO
   { streamWrite = NSB.sendAll sock
-  , streamReadByte = do
-      bs <- NSB.recv sock 1
-      if BS.null bs
-        then fail "socketToStreamIO: connection closed"
-        else pure (BS.head bs)
+  , streamReadByte = BS.head <$> recvChunk 1
+  , streamReadChunk = recvChunk
   , streamClose = NS.close sock
   }
+  where
+    recvChunk n = do
+      bs <- NSB.recv sock n
+      if BS.null bs
+        then fail "socketToStreamIO: connection closed"
+        else pure bs
 
 -- | Convert a SockAddr to a Multiaddr.
 sockAddrToMultiaddr :: NS.SockAddr -> IO Multiaddr

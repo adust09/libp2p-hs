@@ -278,15 +278,13 @@ spec = do
     it "returns Left instead of throwing when the stream fails mid-read" $ do
       -- A stream that yields 5 bytes and then fails (EOF).
       remaining <- newIORef (5 :: Int)
-      let failingStream = StreamIO
-            { streamWrite = \_ -> pure ()
-            , streamReadByte = do
-                left <- atomicModifyIORef' remaining (\k -> (k - 1, k))
+      let failingStream = mkByteStreamIO
+            (\_ -> pure ())
+            (do left <- atomicModifyIORef' remaining (\k -> (k - 1, k))
                 if left > 0
                   then pure (0x2a :: Word8)
-                  else fail "connection reset"
-            , streamClose = pure ()
-            }
+                  else fail "connection reset")
+            (pure ())
       result <- readExactBounded failingStream 1024 10
       case result of
         Left err -> err `shouldContain` "read failed"
@@ -302,6 +300,60 @@ spec = do
       streamWrite streamA payload
       result <- readExactBounded streamB 131072 70000
       result `shouldBe` Right payload
+
+    it "consumes exactly n bytes, leaving the rest readable (#276)" $ do
+      -- Chunk-level reads must not overshoot a message boundary: a
+      -- second length-delimited payload queued right behind the first
+      -- must still be readable byte-for-byte.
+      (streamA, streamB) <- mkMemoryStreamPair
+      streamWrite streamA "aaabbb"
+      first <- readExactBounded streamB 1024 3
+      first `shouldBe` Right "aaa"
+      second <- readExactBounded streamB 1024 3
+      second `shouldBe` Right "bbb"
+
+  describe "streamReadChunk" $ do
+    it "returns buffered bytes in a single chunk read" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      streamWrite streamA "hello world"
+      chunk <- streamReadChunk streamB 1024
+      chunk `shouldBe` "hello world"
+
+    it "caps a chunk read at the requested length and keeps the rest" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      streamWrite streamA "hello"
+      front <- streamReadChunk streamB 3
+      front `shouldBe` "hel"
+      rest <- streamReadChunk streamB 1024
+      rest `shouldBe` "lo"
+
+    it "interleaves with byte-level reads without losing data" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      streamWrite streamA "abcdef"
+      b <- streamReadByte streamB
+      b `shouldBe` 0x61
+      chunk <- streamReadChunk streamB 2
+      chunk `shouldBe` "bc"
+      rest <- streamReadChunk streamB 1024
+      rest `shouldBe` "def"
+
+    it "mkByteStreamIO derives chunk reads from the byte reader" $ do
+      (streamA, streamB) <- mkMemoryStreamPair
+      let byteOnlyB = mkByteStreamIO (streamWrite streamB) (streamReadByte streamB) (pure ())
+      streamWrite streamA "xyz"
+      -- The fallback hands back one byte per call regardless of n.
+      c1 <- streamReadChunk byteOnlyB 1024
+      c1 `shouldBe` "x"
+      c2 <- streamReadChunk byteOnlyB 1024
+      c2 `shouldBe` "y"
+
+    it "EOF pair: drains buffered bytes, then raises EOF (#276)" $ do
+      (streamA, streamB) <- mkEofStreamPair
+      streamWrite streamA "abc"
+      streamClose streamA
+      chunk <- streamReadChunk streamB 1024
+      chunk `shouldBe` "abc"
+      streamReadChunk streamB 1024 `shouldThrow` isEOFError
 
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True

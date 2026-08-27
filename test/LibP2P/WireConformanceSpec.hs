@@ -26,6 +26,7 @@ import LibP2P.DHT.Types (ConnectionType (..))
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
+  , mkByteStreamIO
   , negotiateInitiator
   , negotiateResponder
   )
@@ -44,15 +45,15 @@ mkScriptedStream :: ByteString -> IO (StreamIO, IO ByteString)
 mkScriptedStream canned = do
   writtenRef <- newIORef BS.empty
   readRef <- newIORef canned
-  let stream = StreamIO
-        { streamWrite = \bs -> modifyIORef' writtenRef (`BS.append` bs)
-        , streamReadByte = do
-            buf <- readIORef readRef
-            case BS.uncons buf of
-              Nothing -> ioError (userError "scripted stream: EOF")
-              Just (b, rest) -> writeIORef readRef rest >> pure b
-        , streamClose = pure ()
-        }
+  let readB = do
+        buf <- readIORef readRef
+        case BS.uncons buf of
+          Nothing -> ioError (userError "scripted stream: EOF")
+          Just (b, rest) -> writeIORef readRef rest >> pure b
+      stream = mkByteStreamIO
+        (\bs -> modifyIORef' writtenRef (`BS.append` bs))
+        readB
+        (pure ())
   pure (stream, readIORef writtenRef)
 
 -- | Like 'mkScriptedStream', but additionally snapshots everything the
@@ -65,19 +66,19 @@ mkScriptedStreamSnapshottingFirstRead canned = do
   writtenRef <- newIORef BS.empty
   readRef <- newIORef canned
   firstReadRef <- newIORef Nothing
-  let stream = StreamIO
-        { streamWrite = \bs -> modifyIORef' writtenRef (`BS.append` bs)
-        , streamReadByte = do
-            snapshot <- readIORef firstReadRef
-            case snapshot of
-              Just _ -> pure ()
-              Nothing -> readIORef writtenRef >>= writeIORef firstReadRef . Just
-            buf <- readIORef readRef
-            case BS.uncons buf of
-              Nothing -> ioError (userError "scripted stream: EOF")
-              Just (b, rest) -> writeIORef readRef rest >> pure b
-        , streamClose = pure ()
-        }
+  let readB = do
+        snapshot <- readIORef firstReadRef
+        case snapshot of
+          Just _ -> pure ()
+          Nothing -> readIORef writtenRef >>= writeIORef firstReadRef . Just
+        buf <- readIORef readRef
+        case BS.uncons buf of
+          Nothing -> ioError (userError "scripted stream: EOF")
+          Just (b, rest) -> writeIORef readRef rest >> pure b
+      stream = mkByteStreamIO
+        (\bs -> modifyIORef' writtenRef (`BS.append` bs))
+        readB
+        (pure ())
   pure (stream, readIORef firstReadRef)
 
 -- multistream-select vectors (multiformats/multistream-select README:

@@ -27,7 +27,7 @@ import LibP2P.DHT.Message
 import LibP2P.DHT.RoutingTable (allPeers, bucketForPeer, insertPeer, newRoutingTable)
 import LibP2P.DHT.Types
 import LibP2P.Multiaddr (Multiaddr, fromText, toBytes)
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), negotiateResponder)
+import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkByteStreamIO, negotiateResponder)
 import LibP2P.Switch.ConnPool (addConn)
 import LibP2P.Switch.Types
   ( ConnState (..)
@@ -151,16 +151,14 @@ mkStreamPair = do
           Nothing -> do
             closed <- readTVar closedVar
             if closed then throwSTM (userError "stream closed") else retry
-      streamA = StreamIO
-        { streamWrite = writeAll q1
-        , streamReadByte = readOrEOF q2 closedBtoA
-        , streamClose = atomically (writeTVar closedAtoB True)
-        }
-      streamB = StreamIO
-        { streamWrite = writeAll q2
-        , streamReadByte = readOrEOF q1 closedAtoB
-        , streamClose = atomically (writeTVar closedBtoA True)
-        }
+      streamA = mkByteStreamIO
+        (writeAll q1)
+        (readOrEOF q2 closedBtoA)
+        (atomically (writeTVar closedAtoB True))
+      streamB = mkByteStreamIO
+        (writeAll q2)
+        (readOrEOF q1 closedAtoB)
+        (atomically (writeTVar closedBtoA True))
   pure (streamA, streamB)
 
 -- | A mock Connection that hands out the given stream on the first

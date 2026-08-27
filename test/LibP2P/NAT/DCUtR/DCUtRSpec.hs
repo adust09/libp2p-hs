@@ -16,7 +16,7 @@ import Data.Word (Word8)
 import LibP2P.Core.Varint (encodeUvarint)
 import LibP2P.NAT.DCUtR.Message
 import LibP2P.NAT.DCUtR
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
+import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkByteStreamIO)
 import LibP2P.Multiaddr (Multiaddr (..), toBytes)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 
@@ -25,16 +25,14 @@ mkStreamPair :: IO (StreamIO, StreamIO)
 mkStreamPair = do
   q1 <- newTQueueIO :: IO (TQueue Word8)
   q2 <- newTQueueIO :: IO (TQueue Word8)
-  let streamA = StreamIO
-        { streamWrite = \bs -> mapM_ (\b -> atomically (writeTQueue q1 b)) (BS.unpack bs)
-        , streamReadByte = atomically (readTQueue q2)
-        , streamClose = pure ()
-        }
-      streamB = StreamIO
-        { streamWrite = \bs -> mapM_ (\b -> atomically (writeTQueue q2 b)) (BS.unpack bs)
-        , streamReadByte = atomically (readTQueue q1)
-        , streamClose = pure ()
-        }
+  let streamA = mkByteStreamIO
+        (\bs -> mapM_ (\b -> atomically (writeTQueue q1 b)) (BS.unpack bs))
+        (atomically (readTQueue q2))
+        (pure ())
+      streamB = mkByteStreamIO
+        (\bs -> mapM_ (\b -> atomically (writeTQueue q2 b)) (BS.unpack bs))
+        (atomically (readTQueue q1))
+        (pure ())
   pure (streamA, streamB)
 
 -- Test addresses

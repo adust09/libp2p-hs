@@ -135,7 +135,7 @@ spec :: Spec
 spec = do
   describe "force-direct dial" $ do
     it "establishes a new connection instead of returning the pooled relay one" $
-      withCircuitTrio defaultNATConfig $ \c -> do
+      withCircuitTrio noPunchConfig $ \c -> do
         let swA = cDialerSw c
             pidB = cTargetId c
         -- Before: only the relayed connection is pooled
@@ -156,7 +156,7 @@ spec = do
 
   describe "connection selection" $
     it "prefers the direct connection once one exists, and falls back to the relay" $
-      withCircuitTrio defaultNATConfig $ \c -> do
+      withCircuitTrio noPunchConfig $ \c -> do
         let swA = cDialerSw c
             pidB = cTargetId c
         -- Only the relay exists: it is what lookupConn returns
@@ -267,6 +267,23 @@ spec = do
         concurrently (upgradeAs Inbound kpA rawConnA) (upgradeAs Inbound kpB rawConnB)
       -- Connection has no Show instance, so assert on the shape
       isNothing settled `shouldBe` True
+
+-- | Automatic DCUtR upgrade disabled: 'System.Timeout.timeout' with a
+-- zero-length window returns immediately without running the action, so
+-- neither the initiator's exchange nor the handler's dial ever runs. On
+-- loopback the handler-side dial is an ordinary client dial that lands
+-- on a real listener and succeeds, so with chunked stream reads (#276)
+-- the automatic upgrade can pool a direct connection within the settle
+-- delay — these tests assert on pool preconditions and must not race it.
+noPunchConfig :: NATConfig
+noPunchConfig = defaultNATConfig
+  { ncDCUtRUpgrade = defaultDCUtRUpgradeConfig
+      { ducMaxAttempts             = 1
+      , ducDirectDialTimeoutMicros = 0
+      , ducStreamTimeoutMicros     = 0
+      , ducRelayCloseGraceMicros   = 200000
+      }
+  }
 
 -- | Short timeouts so a punch that cannot succeed in-process settles
 -- quickly instead of burning the default 10s per dial.

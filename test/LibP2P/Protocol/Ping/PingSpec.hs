@@ -28,6 +28,7 @@ import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
+  , mkByteStreamIO
   , negotiateResponder
   )
 import LibP2P.Protocol.Ping
@@ -68,8 +69,8 @@ mkClosableStreamPair = do
       closeWriter q closed = atomically $ do
         putTMVar closed ()
         writeTQueue q Nothing
-      streamA = StreamIO (writeQ qAtoB closedA) (readQ qBtoA) (closeWriter qAtoB closedA)
-      streamB = StreamIO (writeQ qBtoA closedB) (readQ qAtoB) (closeWriter qBtoA closedB)
+      streamA = mkByteStreamIO (writeQ qAtoB closedA) (readQ qBtoA) (closeWriter qAtoB closedA)
+      streamB = mkByteStreamIO (writeQ qBtoA closedB) (readQ qAtoB) (closeWriter qBtoA closedB)
   pure (streamA, closeWriter qAtoB closedA, streamB)
 
 -- | Wrap a StreamIO so every write chunk is recorded (most recent first).
