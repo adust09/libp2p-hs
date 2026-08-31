@@ -10,6 +10,7 @@ module LibP2P.DHT
   ( -- * Types
     DHTNode (..)
   , DHTMode (..)
+  , PeerSession
   , ProviderEntry (..)
   , Validator (..)
     -- * Validators
@@ -36,8 +37,9 @@ module LibP2P.DHT
   , providerRecordTTL
   ) where
 
+import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
-import Control.Exception (SomeException, catch, try)
+import Control.Exception (SomeException, catch, mask, onException, try)
 import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -67,6 +69,7 @@ import LibP2P.Multiaddr (Multiaddr, fromBytes, toBytes)
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
+  , closeQuietly
   , negotiateInitiator
   )
 import LibP2P.Switch (setStreamHandler)
@@ -93,6 +96,21 @@ data ProviderEntry = ProviderEntry
 providerRecordTTL :: NominalDiffTime
 providerRecordTTL = 48 * 3600
 
+-- | A cached outbound @/ipfs/kad/1.0.0@ stream together with its
+-- exchange lock, held as a single 'MVar' that is both.
+--
+-- Kademlia RPC messages carry no request identifier, so two exchanges
+-- interleaved on one stream cannot be reassociated afterwards: a caller
+-- reads whichever response arrives next, not necessarily its own. The
+-- complete write + read exchange therefore has to be serialized per
+-- peer. go-libp2p pairs its per-peer cached stream with exactly this
+-- kind of exchange-wide lock (@peerMessageSender.lk@).
+--
+-- Making the 'MVar' hold the stream slot rather than guard a separate
+-- one means replacing a dead stream is, by construction, something only
+-- the caller currently holding the exchange can do.
+type PeerSession = MVar (Maybe StreamIO)
+
 -- | Top-level DHT node state.
 data DHTNode = DHTNode
   { dhtSwitch        :: !Switch
@@ -106,8 +124,8 @@ data DHTNode = DHTNode
     -- ^ Record validator applied to PUT_VALUE records before storage
     -- (and available to GET_VALUE conflict resolution). Defaults to
     -- 'defaultValidator' (the @/pk/@ namespace).
-  , dhtStreams       :: !(TVar (Map PeerId StreamIO))
-    -- ^ Cached outbound @/ipfs/kad/1.0.0@ streams, one per peer
+  , dhtStreams       :: !(TVar (Map PeerId PeerSession))
+    -- ^ Cached outbound @/ipfs/kad/1.0.0@ sessions, one per peer
     -- (go-libp2p reuses a single long-lived stream per peer)
   , dhtSendRequest   :: !(PeerId -> DHTMessage -> IO (Either String DHTMessage))
     -- ^ Outbound RPC sender. Wired to the Switch by 'newDHTNode';
@@ -338,41 +356,78 @@ refreshPeer pid now rt =
 -- | Send a DHT request to a peer over the Switch.
 --
 -- Reuses a cached @/ipfs/kad/1.0.0@ stream per peer when one exists
--- (go-libp2p pipelines all requests to a peer over one stream); otherwise
--- opens a new muxer stream on an existing connection and negotiates the
+-- (go-libp2p also keeps one long-lived stream per peer); otherwise opens
+-- a new muxer stream on an existing connection and negotiates the
 -- protocol. A failed exchange on a cached stream evicts it and retries
 -- once on a fresh stream.
+--
+-- Requests to one peer are serialized, not pipelined: the caller holds
+-- the peer's 'PeerSession' for the whole write + read exchange. Requests
+-- to different peers stay concurrent.
 sendRequestViaSwitch
   :: Switch
-  -> TVar (Map PeerId StreamIO)
+  -> TVar (Map PeerId PeerSession)
   -> PeerId
   -> DHTMessage
   -> IO (Either String DHTMessage)
-sendRequestViaSwitch sw streamsVar pid request = do
-  mCached <- Map.lookup pid <$> readTVarIO streamsVar
-  case mCached of
-    Nothing -> openAndExchange
-    Just stream -> do
+sendRequestViaSwitch sw sessionsVar pid request = do
+  session <- peerSession sessionsVar pid
+  -- Taking the session out for the duration of the exchange is what keeps
+  -- a second caller from reading this caller's response. If the exchange
+  -- is interrupted (a query deadline, say) the stream may be left holding
+  -- a partial request or an unread reply, so it is closed and the slot
+  -- put back empty rather than handed to the next caller.
+  mask $ \restore -> do
+    cached <- takeMVar session
+    let abandon = do
+          mapM_ closeQuietly cached
+          putMVar session Nothing
+    (slot, result) <- restore (exchange cached) `onException` abandon
+    putMVar session slot
+    pure result
+  where
+    exchange Nothing = openAndExchange
+    exchange (Just stream) = do
       result <- exchangeFramed stream request
       case result of
-        Right resp -> pure (Right resp)
+        Right resp -> pure (Just stream, Right resp)
         Left _ -> do
-          -- Cached stream is dead: evict it and retry on a fresh one.
-          atomically $ modifyTVar' streamsVar (Map.delete pid)
+          -- Cached stream is dead: close it and retry once on a fresh one.
+          closeQuietly stream
           openAndExchange
-  where
+
     openAndExchange = do
       opened <- openDHTStream sw pid
       case opened of
-        Left err -> pure (Left err)
-        Right stream -> do
-          atomically $ modifyTVar' streamsVar (Map.insert pid stream)
-          result <- exchangeFramed stream request
-          case result of
-            Left err -> do
-              atomically $ modifyTVar' streamsVar (Map.delete pid)
-              pure (Left err)
-            ok -> pure ok
+        Left err -> pure (Nothing, Left err)
+        Right stream ->
+          (`onException` closeQuietly stream) $ do
+            result <- exchangeFramed stream request
+            case result of
+              Left err -> do
+                closeQuietly stream
+                pure (Nothing, Left err)
+              ok -> pure (Just stream, ok)
+
+-- | Look up the peer's session, creating an empty one on first contact.
+--
+-- Two callers racing to create the same session agree on one: the loser
+-- discards the 'MVar' it just allocated, so the exchange lock is never
+-- split in two.
+peerSession :: TVar (Map PeerId PeerSession) -> PeerId -> IO PeerSession
+peerSession sessionsVar pid = do
+  existing <- Map.lookup pid <$> readTVarIO sessionsVar
+  case existing of
+    Just session -> pure session
+    Nothing -> do
+      fresh <- newMVar Nothing
+      atomically $ do
+        sessions <- readTVar sessionsVar
+        case Map.lookup pid sessions of
+          Just winner -> pure winner
+          Nothing -> do
+            writeTVar sessionsVar (Map.insert pid fresh sessions)
+            pure fresh
 
 -- | Write a framed request and read the framed response, capturing IO errors.
 exchangeFramed :: StreamIO -> DHTMessage -> IO (Either String DHTMessage)

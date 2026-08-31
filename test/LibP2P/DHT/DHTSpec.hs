@@ -7,8 +7,11 @@ module LibP2P.DHT.DHTSpec
 
 import Test.Hspec
 
-import Control.Concurrent.Async (async, wait)
+import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent.Async (async, concurrently, wait)
+import Control.Concurrent.MVar (newMVar)
 import Control.Concurrent.STM
+import Control.Monad (when)
 import Crypto.Hash (Digest, SHA256, hash)
 import Data.ByteArray (convert)
 import qualified Data.ByteString as BS
@@ -606,6 +609,47 @@ spec = do
         Left _ -> pure ()
         Right _ -> expectationFailure "expected failure without a connection"
 
+  -- Issue #253: Kademlia RPC messages carry no request identifier, so
+  -- two exchanges interleaved on one cached stream cannot be
+  -- reassociated afterwards. The full write + read exchange must be
+  -- serialized per peer, and only per peer.
+  describe "cached stream exchange serialization" $ do
+    it "gives each concurrent caller the response to its own request over a shared cached stream" $ do
+      sw <- mkMockSwitch localPid
+      node <- newDHTNode sw DHTServer
+      stream <- mkCrossingProbeStream
+      session <- newMVar (Just stream)
+      atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
+      let ask key = dhtSendRequest node remotePid (probeRequest key)
+      outcome <- timeout 5000000 $
+        concurrently (ask (BSC.pack "key-a")) (ask (BSC.pack "key-b"))
+      case outcome of
+        Nothing -> expectationFailure "concurrent exchanges deadlocked"
+        Just (ra, rb) -> do
+          fmap msgKey ra `shouldBe` Right (BSC.pack "key-a")
+          fmap msgKey rb `shouldBe` Right (BSC.pack "key-b")
+
+    it "keeps exchanges with different peers concurrent" $ do
+      sw <- mkMockSwitch localPid
+      node <- newDHTNode sw DHTServer
+      -- Each stream refuses to answer until both peers have been written
+      -- to, so a lock any coarser than per-peer cannot make progress.
+      arrived <- newTVarIO (0 :: Int)
+      streamA <- mkRendezvousStream arrived
+      streamB <- mkRendezvousStream arrived
+      sessionA <- newMVar (Just streamA)
+      sessionB <- newMVar (Just streamB)
+      atomically $ writeTVar (dhtStreams node) $
+        Map.fromList [(remotePid, sessionA), (thirdPid, sessionB)]
+      let ask peer key = dhtSendRequest node peer (probeRequest key)
+      outcome <- timeout 2000000 $
+        concurrently (ask remotePid (BSC.pack "key-a")) (ask thirdPid (BSC.pack "key-b"))
+      case outcome of
+        Nothing -> expectationFailure "exchanges with distinct peers were serialized against each other"
+        Just (ra, rb) -> do
+          fmap msgKey ra `shouldBe` Right (BSC.pack "key-a")
+          fmap msgKey rb `shouldBe` Right (BSC.pack "key-b")
+
   describe "Store operations" $ do
     it "storeRecord + lookupRecord round-trip" $ do
       node <- mkTestNode localPid
@@ -803,3 +847,96 @@ spec = do
       registerDHTHandler node
       protos <- readTVarIO (swProtocols sw)
       Map.member dhtProtocolId protos `shouldBe` True
+
+-- | Third peer, for asserting that serialization stays per peer.
+thirdPid :: PeerId
+thirdPid = mkPeerId (BS.pack [2])
+
+-- | Request/response pair used by the cached-stream probes: the response
+-- echoes the request key, so a caller can tell its own response from
+-- somebody else\'s.
+probeRequest :: BS.ByteString -> DHTMessage
+probeRequest key = emptyDHTMessage { msgType = GetValue, msgKey = key }
+
+probeResponse :: BS.ByteString -> BS.ByteString
+probeResponse key = encodeFramed (emptyDHTMessage { msgType = GetValue, msgKey = key })
+
+-- | Size of one framed probe response. All probe keys have the same
+-- length, so this is how many bytes a caller consumes for a full reply.
+probeResponseSize :: Int
+probeResponseSize = BS.length (probeResponse (BSC.pack "key-a"))
+
+-- | How long the first caller is held at its first read waiting for a
+-- second caller to overtake it. Serialized, nobody can, and this is
+-- simply the (one-off) cost of the test.
+crossingBarrierMicros :: Int
+crossingBarrierMicros = 200000
+
+-- | A mock cached DHT stream that reproduces the response-crossing
+-- window deterministically.
+--
+-- Responses queue on one shared FIFO, exactly as they do on a real
+-- stream. The first caller to write is then held at its first read until
+-- a second caller has consumed a whole response, which is the only
+-- ordering that crosses the two replies. Serialized, the second caller
+-- cannot reach the stream at all, the barrier expires, and each caller
+-- reads its own response.
+mkCrossingProbeStream :: IO StreamIO
+mkCrossingProbeStream = do
+  wire     <- newTVarIO BS.empty
+  roles    <- newTVarIO (Map.empty :: Map.Map ThreadId Int)
+  consumed <- newTVarIO (Map.empty :: Map.Map ThreadId Int)
+  overtaken <- newTVarIO False
+  let write bs = do
+        tid <- myThreadId
+        reply <- either (fail . ("probe got an undecodable request: " ++)) (pure . probeResponse . msgKey)
+                   (decodeFramed maxDHTMessageSize bs)
+        atomically $ do
+          assigned <- readTVar roles
+          writeTVar roles (Map.insertWith (\_ old -> old) tid (Map.size assigned) assigned)
+          modifyTVar' wire (<> reply)
+
+      readByte = do
+        tid <- myThreadId
+        (role, alreadyRead) <- atomically $ do
+          r <- Map.findWithDefault 0 tid <$> readTVar roles
+          c <- Map.findWithDefault 0 tid <$> readTVar consumed
+          pure (r, c)
+        when (role == 0 && alreadyRead == 0) $ do
+          expired <- registerDelay crossingBarrierMicros
+          atomically $ do
+            crossed <- readTVar overtaken
+            timedOut <- readTVar expired
+            check (crossed || timedOut)
+        atomically $ do
+          buf <- readTVar wire
+          check (not (BS.null buf))
+          writeTVar wire (BS.drop 1 buf)
+          let taken = alreadyRead + 1
+          modifyTVar' consumed (Map.insert tid taken)
+          when (role /= 0 && taken >= probeResponseSize) $ writeTVar overtaken True
+          pure (BS.head buf)
+
+  pure (mkByteStreamIO write readByte (pure ()))
+
+-- | A mock cached DHT stream that answers only once @arrived@ reports
+-- that every participating peer has been written to.
+mkRendezvousStream :: TVar Int -> IO StreamIO
+mkRendezvousStream arrived = do
+  wire <- newTVarIO BS.empty
+  let write bs = do
+        reply <- either (fail . ("rendezvous got an undecodable request: " ++)) (pure . probeResponse . msgKey)
+                   (decodeFramed maxDHTMessageSize bs)
+        atomically $ do
+          modifyTVar' wire (<> reply)
+          modifyTVar' arrived (+ 1)
+
+      readByte = atomically $ do
+        both <- readTVar arrived
+        check (both >= 2)
+        buf <- readTVar wire
+        check (not (BS.null buf))
+        writeTVar wire (BS.drop 1 buf)
+        pure (BS.head buf)
+
+  pure (mkByteStreamIO write readByte (pure ()))
