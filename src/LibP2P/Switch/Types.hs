@@ -22,6 +22,7 @@ import Control.Concurrent.STM (TChan, TMVar, TVar)
 import Data.Map.Strict (Map)
 import Data.Time.Clock (UTCTime)
 import LibP2P.Crypto.Key (KeyPair)
+import LibP2P.Switch.CertifiedRecords (CertifiedRecord)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO)
@@ -119,6 +120,7 @@ data Switch = Switch
   , swPendingDials :: !(TVar (Map PeerId (TMVar (Either DialError Connection)))) -- ^ In-flight dials for dedup
   , swResourceMgr  :: !ResourceManager                                   -- ^ Hierarchical resource manager
   , swPeerStore    :: !(TVar (Map PeerId IdentifyInfo))                  -- ^ Identify info per peer
+  , swCertifiedRecords :: !(TVar (Map PeerId CertifiedRecord))           -- ^ Accepted RFC 0003 records per peer
   , swNotifiers    :: !(TVar [Connection -> IO ()])                      -- ^ Callbacks on new connection
   , swDisconnectNotifiers :: !(TVar [Connection -> IO ()])               -- ^ Callbacks on connection teardown
   , swListeners    :: !(TVar [ActiveListener])                           -- ^ Active listeners

@@ -59,6 +59,7 @@ library
     LibP2P.Switch.Listen
     LibP2P.Switch.Upgrade
     LibP2P.Switch.ResourceManager
+    LibP2P.Switch.CertifiedRecords
     LibP2P.Protocol.Identify.Message
     LibP2P.Protocol.Identify
     LibP2P.Protocol.Ping
@@ -202,6 +203,7 @@ test-suite libp2p-hs-test
     LibP2P.Switch.ListenImplSpec
     LibP2P.Switch.UpgradeSpec
     LibP2P.Switch.ResourceManagerSpec
+    LibP2P.Switch.CertifiedRecordsSpec
     LibP2P.Protocol.Identify.MessageSpec
     LibP2P.Protocol.Identify.IdentifySpec
     LibP2P.Protocol.Identify.IdentifyOnConnectSpec

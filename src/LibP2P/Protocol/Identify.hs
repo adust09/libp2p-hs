@@ -34,7 +34,7 @@ module LibP2P.Protocol.Identify
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, writeTVar)
+import Control.Concurrent.STM (atomically, modifyTVar', readTVar, writeTVar)
 import Control.Exception (SomeException, bracket, catch, try)
 import Control.Monad (void)
 import System.Timeout (timeout)
@@ -44,13 +44,17 @@ import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes)
 import LibP2P.Crypto.PeerRecord
   ( PeerRecord (..)
-  , openPeerRecordEnvelope
   , sealPeerRecord
   , timestampSeq
   )
+import LibP2P.Switch.CertifiedRecords
+  ( CertifiedRecord (..)
+  , consumeCertifiedRecord
+  , verifyPeerRecord
+  )
 import LibP2P.Crypto.Protobuf (decodePublicKey, encodePublicKey)
 import LibP2P.Crypto.Key (kpPublic)
-import LibP2P.Crypto.SignedEnvelope (SignedEnvelope (..), encodeSignedEnvelope)
+import LibP2P.Crypto.SignedEnvelope (encodeSignedEnvelope)
 import LibP2P.Multiaddr.Codec (encodeProtocols)
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.MultistreamSelect.Negotiation
@@ -149,7 +153,7 @@ identifyPeer sw conn = do
   case result of
     Left err -> pure (Left err)
     Right info -> do
-      atomically $ storeIdentify sw (connPeerId conn) info
+      storeIdentify sw (connPeerId conn) info
       pure (Right ())
 
 -- | Handle an inbound Identify Push (responder side).
@@ -167,19 +171,42 @@ handleIdentifyPush sw conn stream = do
   case infoOrErr of
     Left _ -> pure ()
     Right rawInfo ->
-      atomically $ storeIdentify sw (connPeerId conn) (validateIdentify (connPeerId conn) rawInfo)
+      storeIdentify sw (connPeerId conn) (validateIdentify (connPeerId conn) rawInfo)
 
--- | Merge validated Identify info into the peer store.
+-- | Merge validated Identify info into the peer store, enforcing RFC
+-- 0003 record freshness on the way in.
 --
 -- Shared by the push responder and by 'identifyPeer' so both follow the
 -- same rule: an update is merged into what is already known via
 -- 'mergeIdentify' rather than replacing it, because a push may be a
 -- partial update and must not erase fields it omits.
-storeIdentify :: Switch -> PeerId -> IdentifyInfo -> STM ()
+--
+-- A signed peer record that is not strictly newer than the one already
+-- retained for this peer is refused (see 'consumeCertifiedRecord'). Its
+-- addresses have already been applied to 'idListenAddrs' by
+-- 'validateSignedPeerRecord', so a refused record has to have that
+-- undone: both the address list and the envelope are cleared from the
+-- update, which leaves 'mergeIdentify' holding on to the certified
+-- addresses and envelope already known. A replay therefore changes
+-- nothing, which is the point of the rule.
+--
+-- The envelope is opened out here rather than inside the transaction so
+-- an STM retry cannot make us re-verify a signature.
+storeIdentify :: Switch -> PeerId -> IdentifyInfo -> IO ()
 storeIdentify sw peerId info = do
-  store <- readTVar (swPeerStore sw)
-  let merged = maybe info (`mergeIdentify` info) (Map.lookup peerId store)
-  writeTVar (swPeerStore sw) (Map.insert peerId merged store)
+  let offered = do
+        envBytes <- idSignedPeerRecord info
+        either (const Nothing) Just (verifyPeerRecord peerId envBytes)
+  atomically $ do
+    fresh <- case offered of
+      Nothing     -> pure True
+      Just record -> consumeCertifiedRecord (swCertifiedRecords sw) peerId record
+    let update
+          | fresh = info
+          | otherwise = info { idSignedPeerRecord = Nothing, idListenAddrs = [] }
+    store <- readTVar (swPeerStore sw)
+    let merged = maybe update (`mergeIdentify` update) (Map.lookup peerId store)
+    writeTVar (swPeerStore sw) (Map.insert peerId merged store)
 
 -- | Validate the identity-bound fields of a received Identify message
 -- against the peer id authenticated by the security handshake.
@@ -214,14 +241,17 @@ validatePublicKey remotePeer info = case idPublicKey info of
 -- addresses over unsigned ones). A record that fails verification is
 -- dropped, keeping the unsigned listenAddrs as the fallback for peers
 -- whose record we cannot trust.
+--
+-- Verification alone does not make a record current: a correctly signed
+-- older record can be replayed. The sequence-number check that decides
+-- whether it may replace what is already retained needs the peer store,
+-- so it lives in 'storeIdentify'.
 validateSignedPeerRecord :: PeerId -> IdentifyInfo -> IdentifyInfo
 validateSignedPeerRecord remotePeer info = case idSignedPeerRecord info of
   Nothing -> info
-  Just envBytes -> case openPeerRecordEnvelope envBytes of
-    Right (env, record)
-      | fromPublicKey (sePublicKey env) == remotePeer ->
-          info { idListenAddrs = prAddresses record }
-    _ -> info { idSignedPeerRecord = Nothing }
+  Just envBytes -> case verifyPeerRecord remotePeer envBytes of
+    Right record -> info { idListenAddrs = crAddresses record }
+    Left _       -> info { idSignedPeerRecord = Nothing }
 
 -- | Merge a received (possibly partial) Identify update into the
 -- previously known info for a peer.
