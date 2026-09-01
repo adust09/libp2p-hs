@@ -21,7 +21,7 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
-import LibP2P.Crypto.Key (kpPublic)
+import LibP2P.Crypto.Key (KeyPair, kpPublic)
 import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey, peerIdBytes)
 import LibP2P.Crypto.PeerRecord
   ( PeerRecord (..)
@@ -43,6 +43,7 @@ import LibP2P.MultistreamSelect.Negotiation
 import LibP2P.Protocol.Identify
 import LibP2P.Protocol.Identify.Message (IdentifyInfo (..), decodeIdentify, encodeIdentify, maxIdentifySize)
 import LibP2P.Switch (newSwitch, setStreamHandler)
+import LibP2P.Switch.CertifiedRecords (CertifiedRecord (..), lookupCertifiedRecord)
 import LibP2P.Switch.Types
   ( ConnState (..)
   , Connection (..)
@@ -50,7 +51,7 @@ import LibP2P.Switch.Types
   , MuxerSession (..)
   , Switch (..)
   )
-import Data.Word (Word8)
+import Data.Word (Word8, Word64)
 import System.IO.Error (mkIOError, eofErrorType)
 import Test.Hspec
 
@@ -832,3 +833,101 @@ spec = do
         Right info -> do
           idListenAddrs info `shouldBe` [signedAddr]
           idSignedPeerRecord info `shouldBe` Just (encodeSignedEnvelope env)
+
+  -- Issue #248 / specs/RFC/0003-routing-records.md: a receiving peer
+  -- "MUST keep track of the latest seq value received for each peer and
+  -- reject incoming records unless they contain a greater seq value than
+  -- the last received". A valid signature only proves the peer authored
+  -- the record at some point, so without this an older envelope replayed
+  -- at us rolls certified addresses back to stale state.
+  describe "signed peer record freshness (RFC 0003)" $ do
+    it "accepts a pushed record with a greater sequence number" $ do
+      sw <- mkTestSwitch
+      Right kp <- generateKeyPair
+      let peer = fromPublicKey (kpPublic kp)
+      pushRecord sw kp peer 1 4001
+      pushRecord sw kp peer 2 9999
+      addrs <- storedListenAddrs sw peer
+      addrs `shouldBe` [addrAt 9999]
+      retained <- atomically (lookupCertifiedRecord (swCertifiedRecords sw) peer)
+      fmap crSeq retained `shouldBe` Just 2
+
+    it "ignores a pushed record replayed with an equal sequence number" $ do
+      sw <- mkTestSwitch
+      Right kp <- generateKeyPair
+      let peer = fromPublicKey (kpPublic kp)
+      pushRecord sw kp peer 3 4001
+      pushRecord sw kp peer 3 9999
+      addrs <- storedListenAddrs sw peer
+      addrs `shouldBe` [addrAt 4001]
+
+    it "ignores a pushed record with a lower sequence number" $ do
+      sw <- mkTestSwitch
+      Right kp <- generateKeyPair
+      let peer = fromPublicKey (kpPublic kp)
+      pushRecord sw kp peer 5 4001
+      pushRecord sw kp peer 4 9999
+      addrs <- storedListenAddrs sw peer
+      addrs `shouldBe` [addrAt 4001]
+
+    it "keeps the newer envelope when a stale record is pushed" $ do
+      sw <- mkTestSwitch
+      Right kp <- generateKeyPair
+      let peer = fromPublicKey (kpPublic kp)
+          newer = sealedRecord kp peer 5 4001
+      pushRecord sw kp peer 5 4001
+      pushRecord sw kp peer 1 9999
+      store <- atomically (readTVar (swPeerStore sw))
+      fmap idSignedPeerRecord (Map.lookup peer store) `shouldBe` Just (Just newer)
+      retained <- atomically (lookupCertifiedRecord (swCertifiedRecords sw) peer)
+      fmap crSeq retained `shouldBe` Just 5
+
+    it "does not let a stale record erase addresses learned since" $ do
+      sw <- mkTestSwitch
+      Right kp <- generateKeyPair
+      let peer = fromPublicKey (kpPublic kp)
+      pushRecord sw kp peer 5 4001
+      -- An unsigned update arriving in between is ordinary identify
+      -- traffic and is stored as usual.
+      pushInfo sw peer (emptyInfo { idProtocols = ["/test/1.0.0"] })
+      pushRecord sw kp peer 2 9999
+      addrs <- storedListenAddrs sw peer
+      addrs `shouldBe` [addrAt 4001]
+      store <- atomically (readTVar (swPeerStore sw))
+      fmap idProtocols (Map.lookup peer store) `shouldBe` Just ["/test/1.0.0"]
+
+-- | A loopback multiaddr on @port@, in the binary form peer records and
+-- identify both carry.
+addrAt :: Int -> BS.ByteString
+addrAt port = encodeProtocols [IP4 0x7f000001, TCP (fromIntegral port)]
+
+-- | Seal a peer record for @peer@ advertising a single address.
+sealedRecord :: KeyPair -> PeerId -> Word64 -> Int -> BS.ByteString
+sealedRecord kp peer seqNo port =
+  let record = PeerRecord
+        { prPeerId    = peerIdBytes peer
+        , prSeq       = seqNo
+        , prAddresses = [addrAt port]
+        }
+  in either (error . ("sealPeerRecord failed: " ++)) encodeSignedEnvelope
+       (sealPeerRecord kp record)
+
+-- | Deliver an Identify Push carrying @info@ from @peer@.
+pushInfo :: Switch -> PeerId -> IdentifyInfo -> IO ()
+pushInfo sw peer info = do
+  (streamA, streamB) <- mkClosableStreamPair
+  streamWrite streamA (frame (encodeIdentify info))
+  streamClose streamA
+  conn <- mkTestConnection peer (Multiaddr [IP4 0x7f000001, TCP 4001])
+  handleIdentifyPush sw conn streamB
+
+-- | Deliver an Identify Push whose only content is a signed peer record.
+pushRecord :: Switch -> KeyPair -> PeerId -> Word64 -> Int -> IO ()
+pushRecord sw kp peer seqNo port =
+  pushInfo sw peer (emptyInfo { idSignedPeerRecord = Just (sealedRecord kp peer seqNo port) })
+
+-- | The listen addresses currently held for a peer.
+storedListenAddrs :: Switch -> PeerId -> IO [BS.ByteString]
+storedListenAddrs sw peer = do
+  store <- atomically (readTVar (swPeerStore sw))
+  pure (maybe [] idListenAddrs (Map.lookup peer store))

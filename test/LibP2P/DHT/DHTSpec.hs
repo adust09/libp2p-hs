@@ -72,6 +72,7 @@ mkMockSwitch pid = do
   pendingDials <- newTVarIO Map.empty
   resMgr <- mkMockResourceMgr
   peerStore <- newTVarIO Map.empty
+  certifiedRecords <- newTVarIO Map.empty
   notifiers <- newTVarIO []
   disconnectNotifiers <- newTVarIO []
   listeners <- newTVarIO []
@@ -87,6 +88,7 @@ mkMockSwitch pid = do
     , swPendingDials = pendingDials
     , swResourceMgr  = resMgr
     , swPeerStore    = peerStore
+    , swCertifiedRecords = certifiedRecords
     , swNotifiers    = notifiers
     , swDisconnectNotifiers = disconnectNotifiers
     , swListeners    = listeners

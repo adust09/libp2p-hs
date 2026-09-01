@@ -45,6 +45,7 @@ newSwitch pid kp = do
     , dlPeerLimits   = defaultPeerLimits
     }
   peerStoreVar <- newTVarIO Map.empty
+  certifiedRecordsVar <- newTVarIO Map.empty
   notifiersVar <- newTVarIO []
   disconnectNotifiersVar <- newTVarIO []
   listenersVar <- newTVarIO []
@@ -60,6 +61,7 @@ newSwitch pid kp = do
     , swPendingDials = pendingDialsVar
     , swResourceMgr  = resMgr
     , swPeerStore    = peerStoreVar
+    , swCertifiedRecords = certifiedRecordsVar
     , swNotifiers    = notifiersVar
     , swDisconnectNotifiers = disconnectNotifiersVar
     , swListeners    = listenersVar
