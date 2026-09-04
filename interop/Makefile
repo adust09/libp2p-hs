@@ -7,7 +7,8 @@ IMAGE_NAME := libp2p-hs-interop
 
 .PHONY: build image self-test cross-test-go-listener cross-test-hs-listener \
         cross-gossipsub-rust-listener cross-gossipsub-hs-listener cross-gossipsub kad-dht \
-        perf-self-test perf-cross-nim-listener perf-cross-hs-listener perf-cross nim-libp2p
+        perf-self-test perf-cross-nim-listener perf-cross-hs-listener perf-cross nim-libp2p \
+        hole-punch-self-test
 
 # nim-libp2p commit pinned by unified-testing perf/images.yaml (nim-v1.15).
 NIM_LIBP2P_COMMIT := 1bdf2f67971529e8bee01252230bdb00ab785ef7
@@ -63,3 +64,8 @@ perf-cross-hs-listener: nim-libp2p
 
 # Perf cross-test: both directions
 perf-cross: perf-cross-nim-listener perf-cross-hs-listener
+
+# Hole-punch self-test: hs relay + hs listener + hs dialer (no NAT routers)
+hole-punch-self-test:
+	cd .. && docker compose -f docker-compose.hole-punch.yml up --build \
+		--exit-code-from hs-hp-dialer redis hs-hp-relay hs-hp-listener hs-hp-dialer

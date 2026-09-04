@@ -69,7 +69,15 @@ mkDummyConnection pid = do
 -- the in-memory stream pair.
 mkMockDialTransport :: KeyPair -> IO Transport
 mkMockDialTransport responderKP = pure Transport
-  { transportDial = \addr -> do
+  { transportDial = dialFn
+  , transportDialFrom = \_ -> dialFn
+  , transportListen = \_ -> error "mock: listen not supported"
+  , transportCanDial = \(Multiaddr ps) -> case ps of
+      (IP4 _ : TCP _ : _) -> True
+      _ -> False
+  }
+  where
+    dialFn addr = do
       (streamA, streamB) <- mkMemoryStreamPair
       let rawConnB = RawConnection
             { rcStreamIO   = streamB
@@ -86,17 +94,20 @@ mkMockDialTransport responderKP = pure Transport
         , rcRemoteAddr = addr
         , rcClose      = pure ()
         }
-  , transportListen = \_ -> error "mock: listen not supported"
-  , transportCanDial = \(Multiaddr ps) -> case ps of
-      (IP4 _ : TCP _ : _) -> True
-      _ -> False
-  }
 
 -- | Create a counting mock transport to verify dial deduplication.
 -- Records the number of transportDial calls in the IORef.
 mkCountingMockTransport :: KeyPair -> IORef Int -> IO Transport
 mkCountingMockTransport responderKP counterRef = pure Transport
-  { transportDial = \addr -> do
+  { transportDial = dialFn
+  , transportDialFrom = \_ -> dialFn
+  , transportListen = \_ -> error "mock: listen not supported"
+  , transportCanDial = \(Multiaddr ps) -> case ps of
+      (IP4 _ : TCP _ : _) -> True
+      _ -> False
+  }
+  where
+    dialFn addr = do
       atomicModifyIORef' counterRef (\n -> (n + 1, ()))
       (streamA, streamB) <- mkMemoryStreamPair
       let rawConnB = RawConnection
@@ -114,16 +125,12 @@ mkCountingMockTransport responderKP counterRef = pure Transport
         , rcRemoteAddr = addr
         , rcClose      = pure ()
         }
-  , transportListen = \_ -> error "mock: listen not supported"
-  , transportCanDial = \(Multiaddr ps) -> case ps of
-      (IP4 _ : TCP _ : _) -> True
-      _ -> False
-  }
 
 -- | Create a mock transport that always fails to dial.
 mkFailingTransport :: IO Transport
 mkFailingTransport = pure Transport
   { transportDial = \_ -> fail "connection refused"
+  , transportDialFrom = \_ _ -> fail "connection refused"
   , transportListen = \_ -> error "mock: listen not supported"
   , transportCanDial = \_ -> True
   }

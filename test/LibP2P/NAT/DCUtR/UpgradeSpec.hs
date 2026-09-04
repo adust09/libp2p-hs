@@ -25,6 +25,7 @@ import LibP2P.NAT
   , NATConfig (..)
   , defaultDCUtRUpgradeConfig
   , defaultNATConfig
+  , dcutrOwnAddrs
   , holePunchTargets
   , registerNATHandlers
   , upgradeRelayedConnection
@@ -168,6 +169,21 @@ spec = do
         after' <- atomically $ lookupConn (swConnPool swA) pidB
         fmap (isRelayedAddr . connRemoteAddr) after' `shouldBe` Just False
 
+  describe "DCUtR CONNECT addresses" $ do
+    it "should include Identify observed addresses" $
+      withCircuitTrio fastConfig $ \c -> do
+        let observed = Multiaddr [IP4 0xCB007101, TCP 4001]
+        seedObservedAddr (cTargetSw c) (cRelayId c) observed
+        addrs <- dcutrOwnAddrs (cTargetSw c)
+        addrs `shouldContain` [observed]
+
+    it "should fall back to listen addresses when no observed address is known" $ do
+      (sw, _pid) <- newNode fastConfig
+      bound <- switchListen sw defaultConnectionGater [loopbackAddr]
+      addrs <- dcutrOwnAddrs sw
+      addrs `shouldBe` bound
+      switchClose sw
+
   describe "hole punch target selection" $ do
     it "keeps only public, non-relayed advertised addresses" $
       withCircuitTrio fastConfig $ \c -> do
@@ -308,6 +324,21 @@ seedListenAddrs sw pid addrs = atomically $
       , idPublicKey        = Nothing
       , idListenAddrs      = map toBytes addrs
       , idObservedAddr     = Nothing
+      , idProtocols        = []
+      , idSignedPeerRecord = Nothing
+      }
+
+-- | Record how a peer has observed us (Identify observedAddr).
+seedObservedAddr :: Switch -> PeerId -> Multiaddr -> IO ()
+seedObservedAddr sw pid addr = atomically $
+  modifyTVar' (swPeerStore sw) (Map.insert pid info)
+  where
+    info = IdentifyInfo
+      { idProtocolVersion  = Nothing
+      , idAgentVersion     = Nothing
+      , idPublicKey        = Nothing
+      , idListenAddrs      = []
+      , idObservedAddr     = Just (toBytes addr)
       , idProtocols        = []
       , idSignedPeerRecord = Nothing
       }

@@ -23,6 +23,7 @@ module LibP2P.NAT
   , registerDCUtRUpgrade
   , upgradeRelayedConnection
   , holePunchTargets
+  , dcutrOwnAddrs
   , DCUtRUpgradeConfig (..)
   , defaultDCUtRUpgradeConfig
     -- * Circuit client
@@ -35,6 +36,7 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async)
 import Control.Concurrent.STM (atomically, modifyTVar', readTVar)
 import Control.Monad (filterM, unless, void)
+import Data.List (nub)
 import Data.Maybe (fromMaybe)
 import System.Timeout (timeout)
 import qualified Data.Map.Strict as Map
@@ -301,7 +303,7 @@ initiateOverRelay sw config relayConn = do
           closeQuietly stream
           pure (DCUtRFailed "remote does not support /libp2p/dcutr")
         Accepted _ -> do
-          ownAddrs <- dialableListenAddrs sw
+          ownAddrs <- dcutrOwnAddrs sw
           let dcConfig = DCUtRConfig
                 { dcMaxAttempts = ducMaxAttempts config
                 , dcDialer = \addr ->
@@ -341,9 +343,28 @@ holePunchDial sw config asClient peerId addrs = do
     Right (Just (Left err)) -> Left (show err)
     Right (Just (Right _conn)) -> Right ()
 
--- | Our own listen addresses that a peer could hole punch to.
-dialableListenAddrs :: Switch -> IO [Multiaddr]
-dialableListenAddrs sw = filter (not . isRelayedAddr) <$> switchListenAddrs sw
+-- | Addresses we put in DCUtR CONNECT: Identify observed addresses
+-- (how other peers see us, i.e. NAT mappings) plus any public listen
+-- address. Falls back to non-relayed listen addresses when nothing
+-- observed or public is known, so loopback tests still have a target.
+dcutrOwnAddrs :: Switch -> IO [Multiaddr]
+dcutrOwnAddrs sw = do
+  observed <- observedAddrs sw
+  listen <- filter (not . isRelayedAddr) <$> switchListenAddrs sw
+  let preferred = nub (observed ++ filter isPublicAddr listen)
+  pure $ if null preferred then listen else preferred
+
+-- | How other peers have observed us, collected from Identify replies.
+observedAddrs :: Switch -> IO [Multiaddr]
+observedAddrs sw = do
+  store <- atomically $ readTVar (swPeerStore sw)
+  pure
+    [ addr
+    | info <- Map.elems store
+    , Just raw <- [idObservedAddr info]
+    , Right addr <- [fromBytes raw]
+    , not (isRelayedAddr addr)
+    ]
 
 -- | Close the relay connection after the grace period, provided a direct
 -- connection to the peer is still up.
@@ -500,7 +521,7 @@ registerRelayStopHandler sw circuitState =
 registerDCUtRHandler :: Switch -> DCUtRUpgradeConfig -> IO ()
 registerDCUtRHandler sw upgradeConfig =
   setStreamHandler sw dcutrProtocolId $ \conn stream -> do
-    addrs <- dialableListenAddrs sw
+    addrs <- dcutrOwnAddrs sw
     let config = DCUtRConfig
           { dcMaxAttempts = ducMaxAttempts upgradeConfig
             -- We are peer A: the spec makes us the client of the

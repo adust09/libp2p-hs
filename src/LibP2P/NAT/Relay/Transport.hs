@@ -130,9 +130,10 @@ defaultReservationRefreshConfig = ReservationRefreshConfig
 -- 'LibP2P.Switch.newSwitch' with 'LibP2P.Switch.addTransport'.
 circuitTransport :: Switch -> CircuitState -> ReservationRefreshConfig -> Transport
 circuitTransport sw st refreshCfg = Transport
-  { transportDial    = dialCircuit sw
-  , transportListen  = listenCircuit sw st refreshCfg
-  , transportCanDial = either (const False) (const True) . parseCircuitAddr
+  { transportDial     = dialCircuit sw
+  , transportDialFrom = \_ -> dialCircuit sw
+  , transportListen   = listenCircuit sw st refreshCfg
+  , transportCanDial  = either (const False) (const True) . parseCircuitAddr
   }
 
 -- Address handling

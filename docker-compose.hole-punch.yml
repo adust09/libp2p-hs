@@ -1,0 +1,66 @@
+# Local hole-punch self-test: hs relay + hs listener + hs dialer.
+# This exercises the unified-testing hole-punch contract (Redis SET/GET,
+# reservation, DCUtR, YAML on stdout) on a shared Docker network. It is
+# not a real NAT; upstream NAT topology lives in libp2p/unified-testing.
+#
+# Usage: docker compose -f docker-compose.hole-punch.yml up --build \
+#          --exit-code-from hs-hp-dialer
+x-hs-env: &hs-env
+  REDIS_ADDR: "redis:6379"
+  TEST_KEY: "cafe0131"
+  TRANSPORT: tcp
+  SECURE_CHANNEL: noise
+  MUXER: yamux
+  PEER_IP: "0.0.0.0"
+  RELAY_IP: "0.0.0.0"
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  hs-hp-relay:
+    build:
+      context: .
+      dockerfile: interop/hole-punch/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *hs-env
+      IS_RELAY: "true"
+
+  hs-hp-listener:
+    build:
+      context: .
+      dockerfile: interop/hole-punch/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      hs-hp-relay:
+        condition: service_started
+    environment:
+      <<: *hs-env
+      IS_DIALER: "false"
+
+  hs-hp-dialer:
+    build:
+      context: .
+      dockerfile: interop/hole-punch/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      hs-hp-relay:
+        condition: service_started
+      hs-hp-listener:
+        condition: service_started
+    environment:
+      <<: *hs-env
+      IS_DIALER: "true"

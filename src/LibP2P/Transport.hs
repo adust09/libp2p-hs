@@ -30,7 +30,13 @@ data Listener = Listener
 
 -- | Transport provides dial/listen capabilities for a specific protocol.
 data Transport = Transport
-  { transportDial :: !(Multiaddr -> IO RawConnection) -- ^ Dial a remote peer
+  { transportDial :: !(Multiaddr -> IO RawConnection)
+    -- ^ Dial a remote peer from an ephemeral local port
+  , transportDialFrom :: !(Maybe Multiaddr -> Multiaddr -> IO RawConnection)
+    -- ^ Dial a remote peer, optionally binding the local socket first.
+    -- Hole punching needs this: the outgoing SYN must leave from the
+    -- listen port so the NAT mapping matches the address advertised in
+    -- DCUtR CONNECT (specs/relay/DCUtR simultaneous connect).
   , transportListen :: !(Multiaddr -> IO Listener) -- ^ Listen for inbound connections
   , transportCanDial :: !(Multiaddr -> Bool) -- ^ Check if this transport can handle the address
   }
