@@ -170,17 +170,29 @@ spec = do
         fmap (isRelayedAddr . connRemoteAddr) after' `shouldBe` Just False
 
   describe "DCUtR CONNECT addresses" $ do
-    it "should include Identify observed addresses" $
+    it "should include the relevant relay's Identify observed address" $
+      withCircuitTrio fastConfig $ \c -> do
+        (unrelatedId, _unrelatedKey) <- mkTestIdentity
+        let observed = Multiaddr [IP4 0xCB007101, TCP 4001]
+            stale = Multiaddr [IP4 0xCB007102, TCP 4002]
+        seedObservedAddr (cTargetSw c) (cRelayId c) observed
+        seedObservedAddr (cTargetSw c) unrelatedId stale
+        addrs <- dcutrOwnAddrs (cTargetSw c) (Just (cRelayId c))
+        addrs `shouldContain` [observed]
+        addrs `shouldNotContain` [stale]
+
+    it "should retain private listen addresses alongside an observation" $
       withCircuitTrio fastConfig $ \c -> do
         let observed = Multiaddr [IP4 0xCB007101, TCP 4001]
         seedObservedAddr (cTargetSw c) (cRelayId c) observed
-        addrs <- dcutrOwnAddrs (cTargetSw c)
-        addrs `shouldContain` [observed]
+        listen <- switchListenAddrsOf (cTargetSw c)
+        addrs <- dcutrOwnAddrs (cTargetSw c) (Just (cRelayId c))
+        addrs `shouldContain` listen
 
     it "should fall back to listen addresses when no observed address is known" $ do
       (sw, _pid) <- newNode fastConfig
       bound <- switchListen sw defaultConnectionGater [loopbackAddr]
-      addrs <- dcutrOwnAddrs sw
+      addrs <- dcutrOwnAddrs sw Nothing
       addrs `shouldBe` bound
       switchClose sw
 

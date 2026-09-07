@@ -75,12 +75,14 @@ import LibP2P.NAT.Relay.Message
   , writeHopMessage
   )
 import LibP2P.NAT.Relay.Transport
-  ( CircuitState
+  ( CircuitAddr (..)
+  , CircuitState
   , ReservationRefreshConfig (..)
   , acceptStopStream
   , circuitTransport
   , defaultReservationRefreshConfig
   , newCircuitState
+  , parseCircuitAddr
   )
 import LibP2P.Switch (addTransport, selectTransport, setStreamHandler)
 import LibP2P.Switch.ConnPool (lookupAllConns, lookupConn)
@@ -303,7 +305,7 @@ initiateOverRelay sw config relayConn = do
           closeQuietly stream
           pure (DCUtRFailed "remote does not support /libp2p/dcutr")
         Accepted _ -> do
-          ownAddrs <- dcutrOwnAddrs sw
+          ownAddrs <- dcutrOwnAddrs sw (relayObserver relayConn)
           let dcConfig = DCUtRConfig
                 { dcMaxAttempts = ducMaxAttempts config
                 , dcDialer = \addr ->
@@ -343,28 +345,36 @@ holePunchDial sw config asClient peerId addrs = do
     Right (Just (Left err)) -> Left (show err)
     Right (Just (Right _conn)) -> Right ()
 
--- | Addresses we put in DCUtR CONNECT: Identify observed addresses
--- (how other peers see us, i.e. NAT mappings) plus any public listen
--- address. Falls back to non-relayed listen addresses when nothing
--- observed or public is known, so loopback tests still have a target.
-dcutrOwnAddrs :: Switch -> IO [Multiaddr]
-dcutrOwnAddrs sw = do
-  observed <- observedAddrs sw
+-- | Addresses we put in DCUtR CONNECT: the address reported by the relay
+-- that carries this connection, followed by every non-relayed listen
+-- address. Scoping the observation to that relay avoids advertising stale
+-- mappings learned from unrelated peers. Private listen addresses remain
+-- useful to peers on the same LAN and as deterministic test fallbacks.
+dcutrOwnAddrs :: Switch -> Maybe PeerId -> IO [Multiaddr]
+dcutrOwnAddrs sw observer = do
+  observed <- observedAddrs sw observer
   listen <- filter (not . isRelayedAddr) <$> switchListenAddrs sw
-  let preferred = nub (observed ++ filter isPublicAddr listen)
-  pure $ if null preferred then listen else preferred
+  pure (nub (observed ++ listen))
 
--- | How other peers have observed us, collected from Identify replies.
-observedAddrs :: Switch -> IO [Multiaddr]
-observedAddrs sw = do
+-- | How the relevant relay observed us during Identify.
+observedAddrs :: Switch -> Maybe PeerId -> IO [Multiaddr]
+observedAddrs sw observer = do
   store <- atomically $ readTVar (swPeerStore sw)
+  let infos = case observer of
+        Just peerId -> maybe [] pure (Map.lookup peerId store)
+        Nothing -> []
   pure
     [ addr
-    | info <- Map.elems store
+    | info <- infos
     , Just raw <- [idObservedAddr info]
     , Right addr <- [fromBytes raw]
     , not (isRelayedAddr addr)
     ]
+
+-- | The relay encoded in a relayed connection's remote multiaddr.
+relayObserver :: Connection -> Maybe PeerId
+relayObserver conn =
+  either (const Nothing) (Just . caRelayId) (parseCircuitAddr (connRemoteAddr conn))
 
 -- | Close the relay connection after the grace period, provided a direct
 -- connection to the peer is still up.
@@ -521,7 +531,7 @@ registerRelayStopHandler sw circuitState =
 registerDCUtRHandler :: Switch -> DCUtRUpgradeConfig -> IO ()
 registerDCUtRHandler sw upgradeConfig =
   setStreamHandler sw dcutrProtocolId $ \conn stream -> do
-    addrs <- dcutrOwnAddrs sw
+    addrs <- dcutrOwnAddrs sw (relayObserver conn)
     let config = DCUtRConfig
           { dcMaxAttempts = ducMaxAttempts upgradeConfig
             -- We are peer A: the spec makes us the client of the

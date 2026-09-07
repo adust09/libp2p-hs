@@ -20,6 +20,7 @@ import LibP2P
   ( Connection (..)
   , Multiaddr (..)
   , PeerId
+  , PingResult (..)
   , Protocol (..)
   , Switch
   , addTransport
@@ -44,7 +45,10 @@ import LibP2P
   )
 import LibP2P.Crypto.Key (publicKey)
 import LibP2P.Multiaddr (encapsulate, isRelayedAddr)
+import LibP2P.NAT.Relay.Transport (CircuitAddr (..), parseCircuitAddr)
+import LibP2P.Protocol.Identify (identifyPeer)
 import LibP2P.Switch.ConnPool (lookupAllConns)
+import LibP2P.Switch.Dial (DialOpts (..), defaultDialOpts, dialWith)
 import LibP2P.Switch.Types (ConnState (..), swConnPool, swLocalPeerId)
 import Network.Socket
   ( AddrInfo (..)
@@ -57,10 +61,15 @@ import qualified Network.Socket as Socket
 import System.Environment (lookupEnv)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, hPutStrLn, stderr, stdout)
+import System.Timeout (timeout)
 import Text.Printf (printf)
+import Text.Read (readMaybe)
 
-testTimeoutSeconds :: Int
-testTimeoutSeconds = 180
+coordinationTimeoutSeconds :: Int
+coordinationTimeoutSeconds = 150
+
+dialerTimeoutSeconds :: Int
+dialerTimeoutSeconds = 170
 
 main :: IO ()
 main = do
@@ -76,12 +85,14 @@ main = do
   redisConn <- connectRedis redisAddr
   isRelay <- lookupEnv "IS_RELAY"
   isDialer <- lookupEnv "IS_DIALER"
-  case isRelay of
-    Just "true" -> runRelay sw redisConn testKey
-    _ -> case isDialer of
-      Just "true" -> runDialer sw redisConn testKey
-      Just "false" -> runListener sw redisConn testKey
-      other -> dieWith sw ("Invalid IS_DIALER value: " ++ show other)
+  case (isRelay, isDialer) of
+    (Just "true", _) -> runRelay sw redisConn testKey
+    (_, Just "true") -> runDialerBounded sw redisConn testKey
+    (_, Just "false") -> runListener sw redisConn testKey
+    -- The executable harness uses a dedicated relay image and currently
+    -- omits IS_RELAY. Peer containers always receive IS_DIALER.
+    (Nothing, Nothing) -> runRelay sw redisConn testKey
+    other -> dieWith sw ("Invalid role environment: " ++ show other)
 
 newNode :: IO Switch
 newNode = do
@@ -107,16 +118,23 @@ runRelay sw redisConn testKey = do
 
 runListener :: Switch -> Redis.Connection -> String -> IO ()
 runListener sw redisConn testKey = do
-  _ <- listenTcp sw =<< peerIp
+  _ <- listenTcp sw =<< nodeIp "LISTENER_IP"
   relayMA <- waitRelayAddr redisConn testKey sw
   reserveOnRelay sw relayMA
   redisSet redisConn (redisKey testKey "listener_peer_id") (toBase58 (swLocalPeerId sw))
   logInfo $ "Published listener peer id " ++ T.unpack (toBase58 (swLocalPeerId sw))
   forever $ threadDelay 3600000000
 
+runDialerBounded :: Switch -> Redis.Connection -> String -> IO ()
+runDialerBounded sw redisConn testKey = do
+  result <- timeout (dialerTimeoutSeconds * 1000000) (runDialer sw redisConn testKey)
+  case result of
+    Nothing -> dieWith sw "Hole-punch test exceeded the 170 second deadline"
+    Just () -> pure ()
+
 runDialer :: Switch -> Redis.Connection -> String -> IO ()
 runDialer sw redisConn testKey = do
-  _ <- listenTcp sw =<< peerIp
+  _ <- listenTcp sw =<< nodeIp "DIALER_IP"
   relayMA <- waitRelayAddr redisConn testKey sw
   reserveOnRelay sw relayMA
   listenerId <- waitListenerId redisConn testKey sw
@@ -126,24 +144,30 @@ runDialer sw redisConn testKey = do
         encapsulate relayMA (Multiaddr [P2PCircuit, P2P (peerIdBytes listenerId)])
   _ <- dial sw listenerId [circuitAddr]
         >>= either (\err -> dieWith sw ("Circuit dial failed: " ++ show err)) pure
-  direct <- waitDirectConn sw listenerId (testTimeoutSeconds * 5)
+  direct <- waitDirectConn sw listenerId (coordinationTimeoutSeconds * 5)
   case direct of
     Nothing -> dieWith sw "DCUtR failed: no direct connection within timeout"
     Just conn -> finishDial sw conn t0
 
 finishDial :: Switch -> Connection -> UTCTime -> IO ()
 finishDial sw conn t0 = do
-  t1 <- getCurrentTime
   pingResult <- sendPing sw conn
   case pingResult of
     Left err -> dieWith sw ("Ping over direct connection failed: " ++ show err)
-    Right _ -> do
-      let ms = realToFrac (diffUTCTime t1 t0) * 1000 :: Double
-      logInfo "Direct connection established via DCUtR"
-      printf "handshakeTime: %.2f\nunit: ms\n" ms
+    Right result -> do
+      completedAt <- getCurrentTime
+      let handshakePlusRTT = toMilliseconds (diffUTCTime completedAt t0)
+          pingRTTMillis = toMilliseconds (pingRTT result)
+      logInfo "Direct connection established and verified via DCUtR"
+      printf "latency:\n  handshake_plus_one_rtt: %.2f\n  ping_rtt: %.2f\n  unit: ms\n"
+        handshakePlusRTT pingRTTMillis
       hFlush stdout
       switchClose sw
       exitSuccess
+
+-- | Convert a duration in seconds to milliseconds for the harness schema.
+toMilliseconds :: Real a => a -> Double
+toMilliseconds value = realToFrac value * 1000
 
 listenTcp :: Switch -> String -> IO T.Text
 listenTcp sw ip = do
@@ -161,6 +185,15 @@ listenTcp sw ip = do
 reserveOnRelay :: Switch -> Multiaddr -> IO ()
 reserveOnRelay sw relayMA = do
   let circuitListen = encapsulate relayMA (Multiaddr [P2PCircuit])
+  relayId <- either (dieWith sw . ("Invalid relay address: " ++)) (pure . caRelayId)
+    (parseCircuitAddr circuitListen)
+  -- Establish the relay mapping from the TCP listen port. Identify's
+  -- observed address then names the same mapping used by simultaneous open.
+  let opts = defaultDialOpts { doForceDirect = True }
+  relayConn <- dialWith sw opts relayId [relayMA]
+    >>= either (dieWith sw . ("Relay dial failed: " ++) . show) pure
+  identifyPeer sw relayConn
+    >>= either (dieWith sw . ("Relay Identify failed: " ++)) pure
   _ <- switchListen sw defaultConnectionGater [circuitListen]
   logInfo $ "Reserved on relay " ++ T.unpack (toText relayMA)
 
@@ -193,18 +226,18 @@ isOpenDirect c = do
   st <- atomically $ readTVar (connState c)
   pure (st == ConnOpen && not (isRelayedAddr (connRemoteAddr c)))
 
-peerIp :: IO String
-peerIp = do
-  mPeer <- lookupEnv "PEER_IP"
-  mListener <- lookupEnv "LISTENER_IP"
-  pure (fromMaybe "0.0.0.0" (mPeer <|> mListener))
+nodeIp :: String -> IO String
+nodeIp roleVariable = do
+  roleIp <- lookupEnv roleVariable
+  fallback <- lookupEnv "PEER_IP"
+  pure (fromMaybe "0.0.0.0" (roleIp <|> fallback))
 
 redisKey :: String -> String -> BS8.ByteString
 redisKey testKey suffix = BS8.pack (testKey ++ "_" ++ suffix)
 
 connectRedis :: String -> IO Redis.Connection
 connectRedis redisAddr = do
-  let (host, port) = parseHostPort redisAddr
+  (host, port) <- either die pure (parseHostPort redisAddr)
   Redis.checkedConnect Redis.defaultConnectInfo
     { Redis.connectHost = host
     , Redis.connectPort = Redis.PortNumber (fromIntegral port)
@@ -218,7 +251,7 @@ redisSet conn key value = do
     Right _ -> pure ()
 
 pollRedis :: Redis.Connection -> BS8.ByteString -> IO (Maybe BS8.ByteString)
-pollRedis conn key = go (testTimeoutSeconds * 2)
+pollRedis conn key = go (coordinationTimeoutSeconds * 2)
   where
     go 0 = pure Nothing
     go n = do
@@ -241,10 +274,18 @@ validateProtocols transport security muxer = do
     Just other -> Left $ "muxer " ++ other ++ " not supported (only yamux)"
     Nothing -> Left "MUXER not set (required for tcp)"
 
-parseHostPort :: String -> (String, Int)
-parseHostPort s = case break (== ':') s of
-  (host, ':' : portStr) -> (host, read portStr)
-  (host, _) -> (host, 6379)
+parseHostPort :: String -> Either String (String, Int)
+parseHostPort value = case break (== ':') value of
+  (host, [])
+    | null host -> Left "REDIS_ADDR host is empty"
+    | otherwise -> Right (host, 6379)
+  (host, ':' : portText)
+    | null host -> Left "REDIS_ADDR host is empty"
+    | ':' `elem` portText -> Left "REDIS_ADDR must use host:port"
+    | otherwise -> case readMaybe portText of
+        Just port | port >= 1 && port <= 65535 -> Right (host, port)
+        _ -> Left "REDIS_ADDR port must be an integer from 1 to 65535"
+  _ -> Left "Invalid REDIS_ADDR"
 
 resolveListenAddr :: Multiaddr -> String -> IO Multiaddr
 resolveListenAddr addr ip

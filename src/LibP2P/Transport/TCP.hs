@@ -8,6 +8,7 @@ module LibP2P.Transport.TCP
   , socketToStreamIO
   ) where
 
+import Control.Exception (onException)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import qualified Data.ByteString as BS
 import Data.IP (IPv6, fromHostAddress6, toHostAddress6)
@@ -72,10 +73,12 @@ tcpDialFrom mLocal addr = case stripP2P addr of
 connectFrom :: Maybe Multiaddr -> Multiaddr -> NS.Family -> NS.SockAddr -> IO RawConnection
 connectFrom mLocal remoteAddr family sockAddr = do
   sock <- NS.socket family NS.Stream NS.defaultProtocol
-  enableAddrReuse sock
-  mapM_ (bindLocal sock) mLocal
-  NS.connect sock sockAddr
-  mkRawConnection sock remoteAddr
+  (do
+      enableAddrReuse sock
+      mapM_ (bindLocal sock) mLocal
+      NS.connect sock sockAddr
+      mkRawConnection sock remoteAddr
+    ) `onException` NS.close sock
 
 -- | Bind a dial socket to a TCP listen address so the SYN uses that port.
 bindLocal :: NS.Socket -> Multiaddr -> IO ()

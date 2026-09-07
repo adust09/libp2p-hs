@@ -65,7 +65,8 @@ perf-cross-hs-listener: nim-libp2p
 # Perf cross-test: both directions
 perf-cross: perf-cross-nim-listener perf-cross-hs-listener
 
-# Hole-punch self-test: hs relay + hs listener + hs dialer (no NAT routers)
+# Hole-punch self-test: hs peers behind separate NAT routers with a WAN relay
 hole-punch-self-test:
 	cd .. && docker compose -f docker-compose.hole-punch.yml up --build \
-		--exit-code-from hs-hp-dialer redis hs-hp-relay hs-hp-listener hs-hp-dialer
+		--exit-code-from hs-hp-dialer redis dialer-router listener-router \
+		hs-hp-relay hs-hp-listener hs-hp-dialer

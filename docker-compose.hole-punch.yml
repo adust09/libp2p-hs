@@ -1,7 +1,6 @@
-# Local hole-punch self-test: hs relay + hs listener + hs dialer.
-# This exercises the unified-testing hole-punch contract (Redis SET/GET,
-# reservation, DCUtR, YAML on stdout) on a shared Docker network. It is
-# not a real NAT; upstream NAT topology lives in libp2p/unified-testing.
+# Local reproduction of the libp2p/unified-testing hole-punch topology:
+# two peers on isolated LANs, two Linux NAT routers, one WAN relay and Redis
+# coordination on a separate network.
 #
 # Usage: docker compose -f docker-compose.hole-punch.yml up --build \
 #          --exit-code-from hs-hp-dialer
@@ -11,15 +10,37 @@ x-hs-env: &hs-env
   TRANSPORT: tcp
   SECURE_CHANNEL: noise
   MUXER: yamux
-  PEER_IP: "0.0.0.0"
-  RELAY_IP: "0.0.0.0"
+
+x-router: &router
+  build:
+    context: .
+    dockerfile: interop/hole-punch/router/Dockerfile
+  cap_add: [NET_ADMIN]
+  sysctls:
+    net.ipv4.ip_forward: 1
+    net.ipv4.conf.all.forwarding: 1
+    net.ipv4.conf.default.forwarding: 1
+    net.ipv4.conf.all.rp_filter: 0
+    net.ipv4.conf.default.rp_filter: 0
+
+networks:
+  wan:
+    ipam:
+      config: [{subnet: 10.131.49.64/27}]
+  lan-dialer:
+    ipam:
+      config: [{subnet: 10.131.49.96/27}]
+  lan-listener:
+    ipam:
+      config: [{subnet: 10.131.49.128/27}]
+  coordination: {}
 
 services:
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no"]
-    ports:
-      - "6379"
+    networks:
+      - coordination
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
@@ -33,34 +54,85 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    cap_add: [NET_ADMIN]
+    networks:
+      wan:
+        ipv4_address: 10.131.49.68
+        interface_name: wan0
+      coordination:
+        interface_name: redis0
     environment:
       <<: *hs-env
-      IS_RELAY: "true"
+      RELAY_IP: "10.131.49.68"
+      DIALER_LAN_SUBNET: "10.131.49.96/27"
+      DIALER_ROUTER_IP: "10.131.49.66"
+      LISTENER_LAN_SUBNET: "10.131.49.128/27"
+      LISTENER_ROUTER_IP: "10.131.49.67"
+
+  dialer-router:
+    <<: *router
+    networks:
+      wan:
+        ipv4_address: 10.131.49.66
+        interface_name: wan0
+      lan-dialer:
+        ipv4_address: 10.131.49.98
+        interface_name: lan0
+    environment:
+      WAN_IP: "10.131.49.66"
+      WAN_SUBNET: "10.131.49.64/27"
+      LAN_IP: "10.131.49.98"
+      LAN_SUBNET: "10.131.49.96/27"
+
+  listener-router:
+    <<: *router
+    networks:
+      wan:
+        ipv4_address: 10.131.49.67
+        interface_name: wan0
+      lan-listener:
+        ipv4_address: 10.131.49.130
+        interface_name: lan0
+    environment:
+      WAN_IP: "10.131.49.67"
+      WAN_SUBNET: "10.131.49.64/27"
+      LAN_IP: "10.131.49.130"
+      LAN_SUBNET: "10.131.49.128/27"
 
   hs-hp-listener:
     build:
       context: .
       dockerfile: interop/hole-punch/Dockerfile
-    depends_on:
-      redis:
-        condition: service_healthy
-      hs-hp-relay:
-        condition: service_started
+    depends_on: [redis, hs-hp-relay, listener-router]
+    cap_add: [NET_ADMIN]
+    networks:
+      lan-listener:
+        ipv4_address: 10.131.49.131
+        interface_name: lan0
+      coordination:
+        interface_name: redis0
     environment:
       <<: *hs-env
       IS_DIALER: "false"
+      LISTENER_IP: "10.131.49.131"
+      WAN_SUBNET: "10.131.49.64/27"
+      WAN_ROUTER_IP: "10.131.49.130"
 
   hs-hp-dialer:
     build:
       context: .
       dockerfile: interop/hole-punch/Dockerfile
-    depends_on:
-      redis:
-        condition: service_healthy
-      hs-hp-relay:
-        condition: service_started
-      hs-hp-listener:
-        condition: service_started
+    depends_on: [redis, hs-hp-relay, dialer-router, hs-hp-listener]
+    cap_add: [NET_ADMIN]
+    networks:
+      lan-dialer:
+        ipv4_address: 10.131.49.99
+        interface_name: lan0
+      coordination:
+        interface_name: redis0
     environment:
       <<: *hs-env
       IS_DIALER: "true"
+      DIALER_IP: "10.131.49.99"
+      WAN_SUBNET: "10.131.49.64/27"
+      WAN_ROUTER_IP: "10.131.49.98"

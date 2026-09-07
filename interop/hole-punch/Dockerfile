@@ -30,8 +30,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        libgmp10 \
        ca-certificates \
+       iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/libp2p-hole-punch /usr/local/bin/libp2p-hole-punch
+COPY interop/hole-punch/entrypoint.sh /usr/local/bin/hole-punch-entrypoint
+RUN chmod +x /usr/local/bin/hole-punch-entrypoint
 
-ENTRYPOINT ["libp2p-hole-punch"]
+ENTRYPOINT ["/usr/local/bin/hole-punch-entrypoint"]
