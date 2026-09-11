@@ -5,9 +5,10 @@ import Test.Hspec
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
 import Control.Concurrent.Async (withAsync)
+import Control.Exception (SomeException, try)
 import Control.Concurrent.STM (newTQueueIO, atomically, writeTQueue, readTQueue, TQueue)
 import Data.Word (Word8)
-import Data.IORef (newIORef, readIORef, modifyIORef')
+import Data.IORef (IORef, newIORef, readIORef, modifyIORef', writeIORef)
 import LibP2P.NAT.AutoNAT.Message
 import LibP2P.NAT.AutoNAT
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkByteStreamIO)
@@ -30,6 +31,10 @@ mkStreamPair = do
         (atomically (readTQueue q1))
         (pure ())
   pure (streamA, streamB)
+
+-- | Wrap a StreamIO so closing it flips the flag (before delegating).
+recordClose :: IORef Bool -> StreamIO -> StreamIO
+recordClose ref s = s { streamClose = writeIORef ref True >> streamClose s }
 
 -- Test helpers
 
@@ -482,6 +487,70 @@ spec = do
         case result of
           Right dr -> anRespStatus dr `shouldBe` Just EDialError
           Left err -> expectationFailure $ "requestAutoNAT failed: " ++ err
+
+  describe "AutoNAT stream close" $ do
+    it "handleAutoNAT closes the server stream after a successful response" $ do
+      (clientStream, serverStream) <- mkStreamPair
+      closed <- newIORef False
+      let config = AutoNATConfig
+            { natThreshold = 3
+            , natDialBack = \_pid _addrs -> pure (Right ())
+            }
+          dialMsg = mkDialMsg remotePeerId [publicAddr]
+      writeAutoNATMessage clientStream dialMsg
+      handleAutoNAT config (recordClose closed serverStream) remotePeerId remoteObservedAddr
+      readIORef closed `shouldReturn` True
+      result <- readAutoNATMessage clientStream maxAutoNATMessageSize
+      case result of
+        Right resp -> anMsgType resp `shouldBe` Just DIAL_RESPONSE
+        Left err -> expectationFailure $ "Read failed: " ++ err
+
+    it "handleAutoNAT closes the server stream when the request cannot be read" $ do
+      closed <- newIORef False
+      let config = AutoNATConfig
+            { natThreshold = 3
+            , natDialBack = \_pid _addrs -> pure (Right ())
+            }
+          eofStream = recordClose closed $ mkByteStreamIO
+            (\_ -> fail "write unused")
+            (fail "EOF")
+            (pure ())
+      _ <- try (handleAutoNAT config eofStream remotePeerId remoteObservedAddr) :: IO (Either SomeException ())
+      readIORef closed `shouldReturn` True
+
+    it "requestAutoNAT closes the client stream after a successful exchange" $ do
+      (clientStream, serverStream) <- mkStreamPair
+      closed <- newIORef False
+      let serverAction = do
+            _ <- readAutoNATMessage serverStream maxAutoNATMessageSize
+            writeAutoNATMessage serverStream AutoNATMessage
+              { anMsgType = Just DIAL_RESPONSE
+              , anMsgDial = Nothing
+              , anMsgDialResponse = Just AutoNATDialResponse
+                  { anRespStatus = Just StatusOK
+                  , anRespStatusText = Nothing
+                  , anRespAddr = Just (toBytes publicAddr)
+                  }
+              }
+      withAsync serverAction $ \_ -> do
+        result <- requestAutoNAT (recordClose closed clientStream) testPeerId [publicAddr]
+        result `shouldSatisfy` either (const False) (\dr -> anRespStatus dr == Just StatusOK)
+        readIORef closed `shouldReturn` True
+
+    it "requestAutoNAT closes the client stream when the response is malformed" $ do
+      (clientStream, serverStream) <- mkStreamPair
+      closed <- newIORef False
+      let serverAction = do
+            _ <- readAutoNATMessage serverStream maxAutoNATMessageSize
+            writeAutoNATMessage serverStream AutoNATMessage
+              { anMsgType = Just DIAL_RESPONSE
+              , anMsgDial = Nothing
+              , anMsgDialResponse = Nothing
+              }
+      withAsync serverAction $ \_ -> do
+        result <- requestAutoNAT (recordClose closed clientStream) testPeerId [publicAddr]
+        result `shouldSatisfy` either (const True) (const False)
+        readIORef closed `shouldReturn` True
 
   describe "AutoNAT probeNATStatus" $ do
     it "all peers report OK → NATPublic" $ do

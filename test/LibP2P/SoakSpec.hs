@@ -33,9 +33,16 @@ import LibP2P.Crypto.Key (KeyPair, publicKey)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Protocol (Protocol (..))
-import LibP2P.Protocol.Identify (registerIdentifyHandlers)
+import LibP2P.MultistreamSelect.Negotiation
+  ( NegotiationResult (..)
+  , negotiateInitiator
+  )
+import LibP2P.NAT.AutoNAT (AutoNATConfig (..), handleAutoNAT, requestAutoNAT)
+import LibP2P.NAT.AutoNAT.Message (autoNATProtocolId)
+import LibP2P.Protocol.Identify (registerIdentifyHandlers, requestIdentify)
 import LibP2P.Protocol.Ping (registerPingHandler, sendPing)
-import LibP2P.Switch (addTransport, newSwitch, switchClose)
+import LibP2P.Switch (addTransport, newSwitch, setStreamHandler, switchClose)
+import LibP2P.Switch.Connection (newStream)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (defaultConnectionGater, switchListen)
 import LibP2P.Switch.ResourceManager
@@ -59,6 +66,11 @@ import Test.Hspec
 -- one-slot-per-cycle leak is unmistakable, small enough for CI.
 soakCycles :: Int
 soakCycles = 500
+
+-- | One-shot protocol soak: Identify and AutoNAT are heavier than ping
+-- but a leak still shows up as N leftover reservations.
+oneShotCycles :: Int
+oneShotCycles = 50
 
 -- | Generate a test identity (PeerId, KeyPair).
 mkTestIdentity :: IO (PeerId, KeyPair)
@@ -176,6 +188,42 @@ spec = do
         -- The connection is still usable after the soak.
         finalPing <- sendPing swA conn
         finalPing `shouldSatisfy` isRight
+
+  describe "Switch-level soak: repeated Identify over one connection" $
+    it "leaves zero stream reservations after 50 identify exchanges" $
+      withConnectedPair $ \(swA, _) (swB, _) conn -> do
+        forM_ [1 .. oneShotCycles] $ \(i :: Int) -> do
+          result <- requestIdentify conn
+          case result of
+            Right _ -> pure ()
+            Left err -> fail $ "identify cycle " ++ show i ++ " failed: " ++ err
+        waitForZeroStreams swA swB
+
+  describe "Switch-level soak: repeated AutoNAT over one connection" $
+    it "leaves zero stream reservations after 50 autonat exchanges" $
+      withConnectedPair $ \(swA, pidA) (swB, _) conn -> do
+        let config = AutoNATConfig
+              { natThreshold = 3
+              , natDialBack = \_pid _addrs -> pure (Right ())
+              }
+        setStreamHandler swB autoNATProtocolId $ \c stream ->
+          handleAutoNAT config stream (connPeerId c) (connRemoteAddr c)
+        forM_ [1 .. oneShotCycles] $ \(i :: Int) -> do
+          streamOrErr <- newStream swA conn
+          case streamOrErr of
+            Left err ->
+              fail $ "autonat cycle " ++ show i ++ " open failed: " ++ show err
+            Right stream -> do
+              negotiated <- negotiateInitiator stream [autoNATProtocolId]
+              case negotiated of
+                NoProtocol -> fail $ "autonat cycle " ++ show i ++ " not negotiated"
+                Accepted _ -> do
+                  result <- requestAutoNAT stream pidA [connLocalAddr conn]
+                  case result of
+                    Right _ -> pure ()
+                    Left err ->
+                      fail $ "autonat cycle " ++ show i ++ " failed: " ++ err
+        waitForZeroStreams swA swB
 
   describe "Yamux-level soak: repeated stream open/close cycles on one session" $
     it "does not grow the stream maps over 500 full FIN/FIN lifecycles" $

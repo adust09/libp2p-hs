@@ -22,10 +22,11 @@ module LibP2P.NAT.AutoNAT
   , probeNATStatusPure
   ) where
 
+import Control.Exception (finally)
 import Data.ByteString (ByteString)
 import qualified Data.Text as T
 import LibP2P.NAT.AutoNAT.Message
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
+import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), closeQuietly)
 import LibP2P.Multiaddr (Multiaddr (..), toBytes, fromBytes)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.Crypto.PeerId (PeerId (..))
@@ -47,14 +48,19 @@ data AutoNATConfig = AutoNATConfig
 -- Security:
 --   - Rejects requests from relayed connections (P2PCircuit in observed addr)
 --   - Filters dial-back addresses to match observed IP
+--
+-- AutoNAT is a one-shot exchange, so the stream is closed on every exit
+-- path (go-libp2p's handleStream uses defer s.Close()).
 handleAutoNAT :: AutoNATConfig -> StreamIO -> PeerId -> Multiaddr -> IO ()
-handleAutoNAT config stream remotePeerId remoteObservedAddr = do
-  result <- readAutoNATMessage stream maxAutoNATMessageSize
-  case result of
-    Left _err -> pure ()
-    Right msg -> do
-      resp <- processDialRequest config msg remotePeerId remoteObservedAddr
-      writeAutoNATMessage stream resp
+handleAutoNAT config stream remotePeerId remoteObservedAddr =
+  (do
+    result <- readAutoNATMessage stream maxAutoNATMessageSize
+    case result of
+      Left _err -> pure ()
+      Right msg -> do
+        resp <- processDialRequest config msg remotePeerId remoteObservedAddr
+        writeAutoNATMessage stream resp)
+    `finally` closeQuietly stream
 
 -- | Maximum number of addresses dialled back per request.
 -- Bounds the work a single request can trigger (go-libp2p applies a
@@ -111,26 +117,32 @@ mkDialResponse status mText mAddr = AutoNATMessage
   }
 
 -- | Client: send DIAL with local addresses, receive response.
+--
+-- One-shot: the stream is closed after the exchange on every exit path,
+-- matching go-libp2p's AutoNAT client (defer s.Close()).
 requestAutoNAT :: StreamIO -> PeerId -> [Multiaddr] -> IO (Either String AutoNATDialResponse)
-requestAutoNAT stream localPeerId localAddrs = do
-  let PeerId pidBytes = localPeerId
-      dialMsg = AutoNATMessage
-        { anMsgType = Just DIAL
-        , anMsgDial = Just AutoNATDial
-            { anDialPeer = Just AutoNATPeerInfo
-                { anPeerId = pidBytes
-                , anAddrs = map toBytes localAddrs
-                }
-            }
-        , anMsgDialResponse = Nothing
-        }
-  writeAutoNATMessage stream dialMsg
-  result <- readAutoNATMessage stream maxAutoNATMessageSize
-  case result of
-    Left err -> pure (Left err)
-    Right resp -> case anMsgDialResponse resp of
-      Nothing -> pure (Left "response missing dialResponse field")
-      Just dr -> pure (Right dr)
+requestAutoNAT stream localPeerId localAddrs =
+  exchange `finally` closeQuietly stream
+  where
+    PeerId pidBytes = localPeerId
+    dialMsg = AutoNATMessage
+      { anMsgType = Just DIAL
+      , anMsgDial = Just AutoNATDial
+          { anDialPeer = Just AutoNATPeerInfo
+              { anPeerId = pidBytes
+              , anAddrs = map toBytes localAddrs
+              }
+          }
+      , anMsgDialResponse = Nothing
+      }
+    exchange = do
+      writeAutoNATMessage stream dialMsg
+      result <- readAutoNATMessage stream maxAutoNATMessageSize
+      case result of
+        Left err -> pure (Left err)
+        Right resp -> case anMsgDialResponse resp of
+          Nothing -> pure (Left "response missing dialResponse field")
+          Just dr -> pure (Right dr)
 
 -- | Pure aggregation of AutoNAT results into a NAT status.
 -- Counts OK responses as "public" votes, all other results as "private" votes.

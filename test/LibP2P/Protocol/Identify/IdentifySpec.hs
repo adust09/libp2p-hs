@@ -302,6 +302,26 @@ spec = do
           idProtocolVersion storedInfo `shouldBe` Just "test/1.0"
           idAgentVersion storedInfo `shouldBe` Just "test-agent/0.1"
 
+    it "handleIdentifyPush closes the stream after a successful update" $ do
+      sw <- mkTestSwitch
+      (streamA, streamB) <- mkClosableStreamPair
+      closed <- newIORef False
+      streamWrite streamA (frame (encodeIdentify emptyInfo))
+      streamClose streamA
+      conn <- mkTestConnection (PeerId "push-close") (Multiaddr [IP4 0x7f000001, TCP 4001])
+      handleIdentifyPush sw conn (recordClose closed streamB)
+      readIORef closed `shouldReturn` True
+
+    it "handleIdentifyPush closes the stream when the payload is unreadable" $ do
+      sw <- mkTestSwitch
+      (streamA, streamB) <- mkClosableStreamPair
+      closed <- newIORef False
+      -- Close without a framed message so the reader fails immediately.
+      streamClose streamA
+      conn <- mkTestConnection (PeerId "push-bad") (Multiaddr [IP4 0x7f000001, TCP 4001])
+      handleIdentifyPush sw conn (recordClose closed streamB)
+      readIORef closed `shouldReturn` True
+
     it "handleIdentifyPush merges a partial update instead of replacing the entry" $ do
       -- specs/identify: "missing fields should be ignored, as peers may
       -- choose to send partial updates". go-libp2p sends address-only
