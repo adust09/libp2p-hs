@@ -19,6 +19,8 @@ module LibP2P.DHT
   , pkValidator
     -- * Construction
   , newDHTNode
+  , newPeerSession
+  , stopDHTNode
     -- * Handler registration
   , registerDHTHandler
     -- * Inbound RPC handler
@@ -37,10 +39,11 @@ module LibP2P.DHT
   , providerRecordTTL
   ) where
 
-import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar, tryTakeMVar)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch, mask, onException, try)
 import Data.ByteString (ByteString)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -109,7 +112,14 @@ providerRecordTTL = 48 * 3600
 -- Making the 'MVar' hold the stream slot rather than guard a separate
 -- one means replacing a dead stream is, by construction, something only
 -- the caller currently holding the exchange can do.
-type PeerSession = MVar (Maybe StreamIO)
+--
+-- 'psInvalid' is set when the peer's last connection closes so a caller
+-- that still holds the slot cannot put a live stream back into a map
+-- entry that has already been removed (go-libp2p's @invalidate()@).
+data PeerSession = PeerSession
+  { psSlot    :: !(MVar (Maybe StreamIO))
+  , psInvalid :: !(TVar Bool)
+  }
 
 -- | Top-level DHT node state.
 data DHTNode = DHTNode
@@ -130,9 +140,19 @@ data DHTNode = DHTNode
   , dhtSendRequest   :: !(PeerId -> DHTMessage -> IO (Either String DHTMessage))
     -- ^ Outbound RPC sender. Wired to the Switch by 'newDHTNode';
     -- kept as a field so tests can inject mocks.
+  , dhtDisconnectHook :: !(IORef (Maybe (Connection -> IO ())))
+    -- ^ Disconnect notifier; 'stopDHTNode' clears it so a stopped node
+    -- does not keep a callback alive on the Switch.
   }
 
+-- | Create an empty or pre-loaded peer session (tests inject the latter).
+newPeerSession :: Maybe StreamIO -> IO PeerSession
+newPeerSession slot = PeerSession <$> newMVar slot <*> newTVarIO False
+
 -- | Create a new DHT node with the outbound sender wired to the Switch.
+--
+-- Registers a disconnect notifier so a cached session is dropped when
+-- the peer's last connection closes (#279).
 newDHTNode :: Switch -> DHTMode -> IO DHTNode
 newDHTNode sw mode = do
   let localPid = swLocalPeerId sw
@@ -140,18 +160,34 @@ newDHTNode sw mode = do
   records <- newTVarIO Map.empty
   providers <- newTVarIO Map.empty
   streams <- newTVarIO Map.empty
-  pure DHTNode
-    { dhtSwitch        = sw
-    , dhtRoutingTable  = rt
-    , dhtRecordStore   = records
-    , dhtProviderStore = providers
-    , dhtLocalKey      = peerIdToKey localPid
-    , dhtLocalPeerId   = localPid
-    , dhtMode          = mode
-    , dhtValidator     = defaultValidator
-    , dhtStreams       = streams
-    , dhtSendRequest   = sendRequestViaSwitch sw streams
-    }
+  hook <- newIORef Nothing
+  let node = DHTNode
+        { dhtSwitch         = sw
+        , dhtRoutingTable   = rt
+        , dhtRecordStore    = records
+        , dhtProviderStore  = providers
+        , dhtLocalKey       = peerIdToKey localPid
+        , dhtLocalPeerId    = localPid
+        , dhtMode           = mode
+        , dhtValidator      = defaultValidator
+        , dhtStreams        = streams
+        , dhtSendRequest    = sendRequestViaSwitch sw streams
+        , dhtDisconnectHook = hook
+        }
+  writeIORef hook (Just (dropCachedSession sw streams))
+  atomically $ modifyTVar' (swDisconnectNotifiers sw) (runDisconnectHook hook :)
+  pure node
+
+-- | Stop the DHT node: drop cached sessions and deregister the disconnect
+-- notifier so a stopped node cannot keep a callback alive on the Switch.
+stopDHTNode :: DHTNode -> IO ()
+stopDHTNode node = do
+  writeIORef (dhtDisconnectHook node) Nothing
+  sessions <- atomically $ do
+    m <- readTVar (dhtStreams node)
+    writeTVar (dhtStreams node) Map.empty
+    pure (Map.elems m)
+  mapM_ invalidateHeldSession sessions
 
 -- | Register the DHT handler on the Switch.
 --
@@ -378,12 +414,12 @@ sendRequestViaSwitch sw sessionsVar pid request = do
   -- a partial request or an unread reply, so it is closed and the slot
   -- put back empty rather than handed to the next caller.
   mask $ \restore -> do
-    cached <- takeMVar session
+    cached <- takeMVar (psSlot session)
     let abandon = do
           mapM_ closeQuietly cached
-          putMVar session Nothing
+          putMVar (psSlot session) Nothing
     (slot, result) <- restore (exchange cached) `onException` abandon
-    putMVar session slot
+    commitSession session slot
     pure result
   where
     exchange Nothing = openAndExchange
@@ -420,7 +456,7 @@ peerSession sessionsVar pid = do
   case existing of
     Just session -> pure session
     Nothing -> do
-      fresh <- newMVar Nothing
+      fresh <- newPeerSession Nothing
       atomically $ do
         sessions <- readTVar sessionsVar
         case Map.lookup pid sessions of
@@ -428,6 +464,58 @@ peerSession sessionsVar pid = do
           Nothing -> do
             writeTVar sessionsVar (Map.insert pid fresh sessions)
             pure fresh
+
+-- | Put a stream back only if the session is still valid. An invalidated
+-- session has been removed from the map; caching into it would leak a
+-- live stream that no later caller can close.
+commitSession :: PeerSession -> Maybe StreamIO -> IO ()
+commitSession session slot = do
+  invalid <- readTVarIO (psInvalid session)
+  if invalid
+    then do
+      mapM_ closeQuietly slot
+      putMVar (psSlot session) Nothing
+    else putMVar (psSlot session) slot
+
+-- | Run the DHT disconnect hook if it has not been deregistered.
+runDisconnectHook :: IORef (Maybe (Connection -> IO ())) -> Connection -> IO ()
+runDisconnectHook hook conn = do
+  mfn <- readIORef hook
+  mapM_ ($ conn) mfn
+
+-- | Drop the cached session when this was the peer's last connection.
+dropCachedSession
+  :: Switch -> TVar (Map PeerId PeerSession) -> Connection -> IO ()
+dropCachedSession sw sessionsVar conn = do
+  remaining <- atomically $ lookupConn (swConnPool sw) (connPeerId conn)
+  case remaining of
+    Just _  -> pure ()
+    Nothing -> invalidatePeerSession sessionsVar (connPeerId conn)
+
+-- | Remove the peer's session from the map, mark it invalid, and close
+-- the stream if no exchange currently holds it.
+invalidatePeerSession :: TVar (Map PeerId PeerSession) -> PeerId -> IO ()
+invalidatePeerSession sessionsVar pid = do
+  mSession <- atomically $ do
+    sessions <- readTVar sessionsVar
+    case Map.lookup pid sessions of
+      Nothing -> pure Nothing
+      Just session -> do
+        writeTVar (psInvalid session) True
+        writeTVar sessionsVar (Map.delete pid sessions)
+        pure (Just session)
+  mapM_ invalidateHeldSession mSession
+
+-- | Close a held session's stream unless an in-flight exchange owns the slot.
+invalidateHeldSession :: PeerSession -> IO ()
+invalidateHeldSession session = do
+  atomically $ writeTVar (psInvalid session) True
+  mSlot <- tryTakeMVar (psSlot session)
+  case mSlot of
+    Nothing -> pure ()
+    Just slot -> do
+      mapM_ closeQuietly slot
+      putMVar (psSlot session) Nothing
 
 -- | Write a framed request and read the framed response, capturing IO errors.
 exchangeFramed :: StreamIO -> DHTMessage -> IO (Either String DHTMessage)
