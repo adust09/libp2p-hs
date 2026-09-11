@@ -34,6 +34,7 @@ import LibP2P.Protocol.GossipSub.Score
   , refreshMeshTime
   , markPeerInMesh
   , unmarkPeerInMesh
+  , captureP3b
   )
 
 -- | Run a single heartbeat cycle. Exported for testing.
@@ -44,6 +45,8 @@ heartbeatOnce router = do
   emitGossip router
   expireIWantPromises router
   decayAllScores router
+  expireRetainedScores router
+  expireBackoff router
   cleanSeenCache router
   resetGossipBudgets router
   -- Increment heartbeat counter
@@ -100,7 +103,8 @@ pruneNegativeScore router topic meshPeers now = do
     prn <- buildPrune router pid topic False backoffSecs
     gsSendRPC router pid emptyRPC
       { rpcControl = Just emptyControlMessage { ctrlPrune = [prn] } }
-    -- Start backoff and stop the P1 mesh clock
+    -- Capture P3b before clearing mesh state, then backoff.
+    captureLocalP3b router pid topic now
     atomically $ do
       modifyTVar' (gsBackoff router) $
         Map.insert (pid, topic) (addUTCTime (paramPruneBackoff (gsParams router)) now)
@@ -191,6 +195,7 @@ trimOversubscribed router topic meshPeers = do
       prn <- buildPrune router pid topic True backoffSecs
       gsSendRPC router pid emptyRPC
         { rpcControl = Just emptyControlMessage { ctrlPrune = [prn] } }
+      captureLocalP3b router pid topic now
       atomically $ do
         modifyTVar' (gsBackoff router) $
           Map.insert (pid, topic) (addUTCTime (paramPruneBackoff params) now)
@@ -315,8 +320,49 @@ resetGossipBudgets router = atomically $ do
 decayAllScores :: GossipSubRouter -> IO ()
 decayAllScores router = do
   now <- gsGetTime router
-  atomically $ modifyTVar' (gsPeers router) $
-    Map.map (decayPeerCounters (gsScoreParams router) . refreshMeshTime now)
+  let params = gsScoreParams router
+      interval = pspDecayInterval params
+  steps <- atomically $ do
+    lastTick <- readTVar (gsLastDecay router)
+    let elapsed = diffUTCTime now lastTick
+        n = if interval <= 0 then 0 else floor (elapsed / interval) :: Int
+    when (n > 0) $
+      writeTVar (gsLastDecay router) (addUTCTime (fromIntegral n * interval) lastTick)
+    pure (max 0 n)
+  let decayN 0 ps = ps
+      decayN k ps = decayN (k - 1) (decayPeerCounters params ps)
+  atomically $ do
+    modifyTVar' (gsPeers router) $
+      Map.map (decayN steps . refreshMeshTime now)
+    -- Counters keep decaying while the score is retained (gossipsub-v1.1.md).
+    modifyTVar' (gsRetainedScores router) $
+      Map.map (\(ps, expiry) -> (decayN steps ps, expiry))
+
+-- | Capture P3b on a local prune/removal path.
+captureLocalP3b :: GossipSubRouter -> PeerId -> Topic -> UTCTime -> IO ()
+captureLocalP3b router pid topic now =
+  case Map.lookup topic (pspTopicParams (gsScoreParams router)) of
+    Nothing -> pure ()
+    Just tsp -> atomically $ modifyTVar' (gsPeers router) $
+      Map.adjust (\ps ->
+        let tps = Map.findWithDefault defaultTopicPeerState topic (psTopicState ps)
+            tps' = captureP3b tsp now tps
+        in ps { psTopicState = Map.insert topic tps' (psTopicState ps) }
+      ) pid
+
+-- | Drop retained scores whose RetainScore window has elapsed.
+expireRetainedScores :: GossipSubRouter -> IO ()
+expireRetainedScores router = do
+  now <- gsGetTime router
+  atomically $ modifyTVar' (gsRetainedScores router) $
+    Map.filter (\(_, expiry) -> now < expiry)
+
+-- | Physically remove expired (peer, topic) backoff entries.
+expireBackoff :: GossipSubRouter -> IO ()
+expireBackoff router = do
+  now <- gsGetTime router
+  atomically $ modifyTVar' (gsBackoff router) $
+    Map.filter (\expiry -> now < expiry)
 
 -- Seen cache cleanup
 

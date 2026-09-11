@@ -2,21 +2,22 @@ module LibP2P.DHT.LookupSpec (spec) where
 
 import Test.Hspec
 
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM
-import Control.Monad (unless)
+import Control.Monad (forever, unless)
 import Data.Bits ((.&.))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.Time (getCurrentTime)
+import Data.Time (diffUTCTime, getCurrentTime)
 import Data.Word (Word8)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT
-import LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
+import LibP2P.DHT.Distance (commonPrefixLength, peerIdToKey, sortByDistance)
 import LibP2P.DHT.Lookup
 import LibP2P.DHT.Message
-import LibP2P.DHT.RoutingTable (insertPeer, allPeers)
+import LibP2P.DHT.RoutingTable (bucketForPeer, insertPeer, allPeers, newRoutingTable)
 import LibP2P.DHT.Types
 import LibP2P.Multiaddr (fromText, toBytes)
 
@@ -643,45 +644,75 @@ spec = do
       sentKeys `shouldSatisfy` (not . null)
       -- The self-lookup queries for our own binary peer ID (not its digest).
       take 1 sentKeys `shouldBe` [peerIdBytes localPid]
-      -- Bucket refresh queries also carry raw peer IDs.
-      mapM_ (\k -> k `shouldSatisfy` (`elem` [peerIdBytes localPid, peerIdBytes seedPid]))
-            sentKeys
 
     it "performs self-lookup and populates nearby buckets" $ do
       let seedPid = mkPeerId (BS.pack [10])
           pidB = mkPeerId (BS.pack [20])
           pidC = mkPeerId (BS.pack [30])
-          -- Bootstrap issues FIND_NODE for our own peer ID plus one per
-          -- bucket representative; every request must target one of them.
-          refreshKeys = map peerIdBytes [localPid, seedPid, pidB, pidC]
-          -- Seed returns B and C as closer peers
+          -- Seed returns B and C as closer peers. Refresh keys are random
+          -- kad-ids, so the mock accepts any FIND_NODE.
+          acceptFindNode resp req
+            | msgType req == FindNode = Right resp
+            | otherwise = Left "mock: expected FIND_NODE"
           network = Map.fromList
-            [ (seedPid, expectingOneOf FindNode refreshKeys
+            [ (seedPid, acceptFindNode
                 (findNodeReply [ DHTPeer (peerIdBytes pidB) [] NotConnected
                                , DHTPeer (peerIdBytes pidC) [] NotConnected
                                ]))
-            , (pidB, expectingOneOf FindNode refreshKeys (findNodeReply []))
-            , (pidC, expectingOneOf FindNode refreshKeys (findNodeReply []))
+            , (pidB, acceptFindNode (findNodeReply []))
+            , (pidC, acceptFindNode (findNodeReply []))
             ]
       node <- mkNodeWithMock localPid (mockSendFromNetwork network)
-
       bootstrap node [seedPid]
-
-      -- After bootstrap, routing table should contain the seed + discovered peers
       rt <- readTVarIO (dhtRoutingTable node)
-      let allEntries = allPeers rt
-      -- At minimum, the seed should be in the routing table
-      length allEntries `shouldSatisfy` (>= 1)
+      length (allPeers rt) `shouldSatisfy` (>= 1)
 
-    it "bootstrap respects timeout (completes even with slow peers)" $ do
-      -- All queries return empty → bootstrap completes quickly
+    it "a permanently blocked peer cannot hold bootstrap past the configured deadline" $ do
       let seedPid = mkPeerId (BS.pack [10])
-          network = Map.fromList
-            [ (seedPid, expectingOneOf FindNode
-                (map peerIdBytes [localPid, seedPid]) (findNodeReply []))
-            ]
-      node <- mkNodeWithMock localPid (mockSendFromNetwork network)
-      -- This should complete without hanging
+          mockSend _ _ = forever (threadDelay 1000000) >> pure (Left "unreachable")
+      node0 <- mkNodeWithMock localPid mockSend
+      let node = node0 { dhtQueryTimeout = 100000 }
+      start <- getCurrentTime
       bootstrap node [seedPid]
-      -- If we reach here, timeout behavior is fine
-      pure () :: IO ()
+      elapsed <- diffUTCTime <$> getCurrentTime <*> pure start
+      elapsed `shouldSatisfy` (< 1)
+
+    it "refreshes every non-empty bucket with a key in that bucket's range" $ do
+      sentKeysRef <- newIORef ([] :: [BS.ByteString])
+      let mockSend = recordingSend (recordKeys sentKeysRef)
+                                   (\_ -> Right (findNodeReply []))
+      node <- mkNodeWithMock localPid mockSend
+      now <- getCurrentTime
+      let rt0 = newRoutingTable localPid
+          candidates = [mkPeerId (BS.pack [i]) | i <- [1 .. 40]]
+          tagged = [ (pid, bucketForPeer (peerIdToKey pid) rt0) | pid <- candidates ]
+          (pidA, bucketA) = head tagged
+          (pidB, bucketB) = head (filter (\(_, b) -> b /= bucketA) tagged)
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt ->
+        let eA = BucketEntry pidA (peerIdToKey pidA) [] now NotConnected
+            eB = BucketEntry pidB (peerIdToKey pidB) [] now NotConnected
+        in fst (insertPeer eB (fst (insertPeer eA rt)))
+      bootstrap node []
+      sentKeys <- readIORef sentKeysRef
+      let selfKey = peerIdToKey localPid
+          refreshCpls =
+            [ commonPrefixLength selfKey (DHTKey k) | k <- drop 1 sentKeys ]
+      refreshCpls `shouldSatisfy` (bucketA `elem`)
+      refreshCpls `shouldSatisfy` (bucketB `elem`)
+
+    it "periodic refresh runs more than once under a short test interval" $ do
+      sentKeysRef <- newIORef ([] :: [BS.ByteString])
+      let seedPid = mkPeerId (BS.pack [10])
+          mockSend = recordingSend (recordKeys sentKeysRef)
+                                   (\_ -> Right (findNodeReply []))
+      node <- mkNodeWithMock localPid mockSend
+      startBootstrap node [seedPid] 50000
+      threadDelay 180000
+      stopDHTNode node
+      sentKeys <- readIORef sentKeysRef
+      let selfLookups = filter (== peerIdBytes localPid) sentKeys
+      length selfLookups `shouldSatisfy` (>= 2)
+      threadDelay 80000
+      sentKeysAfter <- readIORef sentKeysRef
+      length (filter (== peerIdBytes localPid) sentKeysAfter)
+        `shouldBe` length selfLookups

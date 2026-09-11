@@ -27,6 +27,7 @@ module LibP2P.Protocol.GossipSub.Score
   , recordMeshDelivery
   , recordInvalidMessage
   , recordMeshFailure
+  , captureP3b
   , addP7Penalty
     -- * Mesh membership marking
   , markPeerInMesh
@@ -196,6 +197,19 @@ recordMeshFailure tsp tps =
       deliveries = tpsMeshMessageDeliveries tps
       deficit = max 0 (threshold - deliveries)
   in tps { tpsMeshFailurePenalty = tpsMeshFailurePenalty tps + deficit * deficit }
+
+-- | Capture P3b only for a peer currently in the mesh whose activation
+-- period has elapsed (gossipsub-v1.1.md). No-op otherwise, so a PRUNE
+-- from a non-mesh or newly-grafted peer does not stick a penalty.
+captureP3b :: TopicScoreParams -> UTCTime -> TopicPeerState -> TopicPeerState
+captureP3b tsp now tps
+  | not (tpsInMesh tps) = tps
+  | not activated = tps
+  | otherwise = recordMeshFailure tsp tps
+  where
+    activated = case tpsGraftTime tps of
+      Nothing -> False
+      Just gt -> diffUTCTime now gt >= tspMeshMessageDeliveriesActivation tsp
 
 -- | Increment P7 behavioral penalty counter by 1.
 addP7Penalty :: PeerState -> PeerState

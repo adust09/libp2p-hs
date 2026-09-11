@@ -21,7 +21,7 @@ module LibP2P.Switch.Listen
 
 import Control.Concurrent.Async (async, cancel)
 import Control.Concurrent.STM (atomically, readTVar, writeTChan, writeTVar)
-import Control.Exception (SomeException, catch, finally)
+import Control.Exception (SomeException, catch, finally, try)
 import Data.List (find, partition)
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.PeerId (PeerId)
@@ -29,6 +29,7 @@ import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
+  , closeQuietly
   , negotiateResponder
   )
 import LibP2P.Protocol.Identify (pushIdentify)
@@ -135,7 +136,7 @@ dispatchStream sw conn stream = do
   case reserved of
     Left _ ->
       -- Over the stream limit: refuse the stream without negotiating
-      streamClose stream `catch` \(_ :: SomeException) -> pure ()
+      closeQuietly stream
     Right () -> negotiateAndDispatch `finally` release
   where
     release = atomically $
@@ -144,16 +145,20 @@ dispatchStream sw conn stream = do
       -- Get the list of supported protocols from the Switch
       supportedProtos <- atomically $
         Map.keys <$> readProtos
-      -- Run multistream-select responder
-      result <- negotiateResponder stream supportedProtos
-      case result of
-        Accepted proto -> do
-          -- Look up the handler for the negotiated protocol
+      -- Run multistream-select responder. A failed or aborted
+      -- negotiation never reaches a handler, so dispatch closes.
+      -- go-libp2p resets on mux negotiation failure for the same reason.
+      negotiated <- try (negotiateResponder stream supportedProtos)
+      case negotiated of
+        Left (_ :: SomeException) -> closeQuietly stream
+        Right NoProtocol -> closeQuietly stream
+        Right (Accepted proto) -> do
           mHandler <- lookupHandler proto
           case mHandler of
             Just handler -> handler conn stream
-            Nothing -> pure ()  -- Should not happen: proto was in supported list
-        NoProtocol -> pure ()  -- No common protocol, stream will be closed
+            -- Protocol vanished from the registry after listing:
+            -- no handler will close, so dispatch must.
+            Nothing -> closeQuietly stream
     readProtos = readTVar (swProtocols sw)
     lookupHandler proto = atomically $
       Map.lookup proto <$> readTVar (swProtocols sw)

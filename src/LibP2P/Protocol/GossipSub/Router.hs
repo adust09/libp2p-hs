@@ -57,7 +57,7 @@ import LibP2P.Protocol.GossipSub.MessageCache (newMessageCache, cachePut, cacheG
 import LibP2P.Protocol.GossipSub.Score
   ( computeScore
   , addP7Penalty
-  , recordMeshFailure
+  , captureP3b
   , recordInvalidMessage
   , recordFirstDelivery
   , recordMeshDelivery
@@ -80,6 +80,9 @@ newRouter params localPid sendRPC getTime = do
   peers    <- newTVarIO Map.empty
   seen     <- newTVarIO Map.empty
   backoff  <- newTVarIO Map.empty
+  retained <- newTVarIO Map.empty
+  now0     <- getTime
+  lastDecay <- newTVarIO now0
   ipCount  <- newTVarIO Map.empty
   mcache   <- newTVarIO (newMessageCache (paramMcacheLen params) (paramMcacheGossip params))
   hbCount  <- newTVarIO 0
@@ -101,6 +104,8 @@ newRouter params localPid sendRPC getTime = do
     , gsPeers          = peers
     , gsSeen           = seen
     , gsBackoff        = backoff
+    , gsRetainedScores = retained
+    , gsLastDecay      = lastDecay
     , gsScoreParams    = defaultPeerScoreParams
     , gsThresholds     = defaultScoreThresholds
     , gsIPPeerCount    = ipCount
@@ -138,35 +143,66 @@ unregisterValidator router topic = atomically $
 -- | Register a connected peer. If the peer already exists, preserves
 -- accumulated state (topics, scores) to avoid overwriting subscriptions.
 addPeer :: GossipSubRouter -> PeerId -> PeerProtocol -> Bool -> UTCTime -> IO ()
-addPeer router pid proto isOutbound now = atomically $
+addPeer router pid proto isOutbound now = atomically $ do
+  retained <- readTVar (gsRetainedScores router)
+  writeTVar (gsRetainedScores router) (Map.delete pid retained)
   modifyTVar' (gsPeers router) $ \m ->
     case Map.lookup pid m of
       Just _existing -> m  -- Peer already registered, keep existing state
-      Nothing -> Map.insert pid PeerState
-        { psProtocol        = proto
-        , psTopics          = Set.empty
-        , psIsOutbound      = isOutbound
-        , psConnectedAt     = now
-        , psTopicState      = Map.empty
-        , psBehaviorPenalty = 0
-        , psIPAddress       = Nothing
-        , psCachedScore     = 0
-        } m
+      Nothing -> Map.insert pid (restoredOrFresh retained) m
+  where
+    restoredOrFresh retained =
+      case Map.lookup pid retained of
+        Just (saved, expiry) | now < expiry ->
+          saved
+            { psProtocol        = proto
+            , psTopics          = Set.empty
+            , psIsOutbound      = isOutbound
+            , psConnectedAt     = now
+            , psIPAddress       = Nothing
+            }
+        _ -> PeerState
+          { psProtocol        = proto
+          , psTopics          = Set.empty
+          , psIsOutbound      = isOutbound
+          , psConnectedAt     = now
+          , psTopicState      = Map.empty
+          , psBehaviorPenalty = 0
+          , psIPAddress       = Nothing
+          , psCachedScore     = 0
+          }
 
 -- | Remove a disconnected peer and clean up mesh/fanout membership,
 -- IP colocation tracking (P6) and outstanding IWANT promises.
+-- Scoring counters are retained for 'pspRetainScore' so a reconnecting
+-- peer cannot reset a negative score (gossipsub-v1.1.md).
 removePeer :: GossipSubRouter -> PeerId -> IO ()
-removePeer router pid = atomically $ do
-  peers <- readTVar (gsPeers router)
-  case Map.lookup pid peers >>= psIPAddress of
-    Just ip -> modifyTVar' (gsIPPeerCount router) (removeIPMember ip pid)
-    Nothing -> pure ()
-  modifyTVar' (gsPeers router) (Map.delete pid)
-  modifyTVar' (gsMesh router) (Map.map (Set.delete pid))
-  modifyTVar' (gsSignedPeerRecords router) (Map.delete pid)
-  modifyTVar' (gsFanout router) (Map.map (Set.delete pid))
-  modifyTVar' (gsIWantPromises router) $
-    Map.filterWithKey (\(p, _) _ -> p /= pid)
+removePeer router pid = do
+  now <- gsGetTime router
+  atomically $ do
+    peers <- readTVar (gsPeers router)
+    case Map.lookup pid peers of
+      Nothing -> pure ()
+      Just ps -> do
+        let expiry = addUTCTime (pspRetainScore (gsScoreParams router)) now
+            snapshot = ps
+              { psTopics = Set.empty
+              , psIPAddress = Nothing
+              , psTopicState = Map.map clearMeshClock (psTopicState ps)
+              }
+        modifyTVar' (gsRetainedScores router) (Map.insert pid (snapshot, expiry))
+        case psIPAddress ps of
+          Just ip -> modifyTVar' (gsIPPeerCount router) (removeIPMember ip pid)
+          Nothing -> pure ()
+    modifyTVar' (gsPeers router) (Map.delete pid)
+    modifyTVar' (gsMesh router) (Map.map (Set.delete pid))
+    modifyTVar' (gsSignedPeerRecords router) (Map.delete pid)
+    modifyTVar' (gsFanout router) (Map.map (Set.delete pid))
+    modifyTVar' (gsIWantPromises router) $
+      Map.filterWithKey (\(p, _) _ -> p /= pid)
+
+clearMeshClock :: TopicPeerState -> TopicPeerState
+clearMeshClock tps = tps { tpsInMesh = False, tpsGraftTime = Nothing, tpsMeshTime = 0 }
 
 -- | Record a peer's IP address for P6 (IP colocation) scoring.
 -- No-op for unknown peers; replaces any previously recorded address.
@@ -341,7 +377,9 @@ leave router topic = do
     modifyTVar' (gsMesh router) (Map.delete topic)
     pure mp
   let backoffSecs = round (paramUnsubBackoff (gsParams router)) :: Word64
+  now <- gsGetTime router
   mapM_ (\pid -> do
+          applyP3b router pid topic now
           atomically $ modifyTVar' (gsPeers router) $
             Map.adjust (unmarkPeerInMesh topic) pid
           prn <- buildPrune router pid topic True backoffSecs
@@ -654,6 +692,18 @@ handleOneGraft router sender now (Graft topic) = do
                 Map.adjust (markPeerInMesh topic now) sender
             pure []
 
+-- | Capture P3b for a mesh peer if the topic is scored and activation elapsed.
+applyP3b :: GossipSubRouter -> PeerId -> Topic -> UTCTime -> IO ()
+applyP3b router pid topic now =
+  case Map.lookup topic (pspTopicParams (gsScoreParams router)) of
+    Nothing -> pure ()
+    Just tsp -> atomically $ modifyTVar' (gsPeers router) $
+      Map.adjust (\ps ->
+        let tps = Map.findWithDefault defaultTopicPeerState topic (psTopicState ps)
+            tps' = captureP3b tsp now tps
+        in ps { psTopicState = Map.insert topic tps' (psTopicState ps) }
+      ) pid
+
 -- | Handle PRUNE: remove from mesh and start backoff.
 handlePrune :: GossipSubRouter -> PeerId -> [Prune] -> IO ()
 handlePrune router sender prunes = do
@@ -663,16 +713,11 @@ handlePrune router sender prunes = do
 handleOnePrune :: GossipSubRouter -> PeerId -> UTCTime -> Prune -> IO ()
 handleOnePrune router sender now prune = do
   let topic = pruneTopic prune
-  -- Record P3b mesh failure: snapshot delivery deficit before removing
-  let scoreParams = gsScoreParams router
-  case Map.lookup topic (pspTopicParams scoreParams) of
-    Just tsp -> atomically $ modifyTVar' (gsPeers router) $
-      Map.adjust (\ps ->
-        let topicSt = Map.findWithDefault defaultTopicPeerState topic (psTopicState ps)
-            topicSt' = recordMeshFailure tsp topicSt
-        in ps { psTopicState = Map.insert topic topicSt' (psTopicState ps) }
-      ) sender
-    Nothing -> pure ()
+  inMesh <- atomically $ do
+    mesh <- readTVar (gsMesh router)
+    pure (Set.member sender (Map.findWithDefault Set.empty topic mesh))
+  -- P3b only for a peer we currently have in this mesh, after activation.
+  when inMesh $ applyP3b router sender topic now
   -- Remove sender from mesh and stop its P1 mesh clock
   atomically $ do
     modifyTVar' (gsMesh router) $

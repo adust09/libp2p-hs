@@ -35,7 +35,7 @@ module LibP2P.Protocol.Identify
 
 import Control.Applicative ((<|>))
 import Control.Concurrent.STM (atomically, modifyTVar', readTVar, writeTVar)
-import Control.Exception (SomeException, bracket, catch, try)
+import Control.Exception (SomeException, bracket, catch, finally, try)
 import Control.Monad (void)
 import System.Timeout (timeout)
 import qualified Data.ByteString as BS
@@ -60,6 +60,7 @@ import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.MultistreamSelect.Negotiation
   ( ProtocolId
   , StreamIO (..)
+  , closeQuietly
   , negotiateInitiator
   , NegotiationResult (..)
   , readExactBounded
@@ -92,10 +93,11 @@ identifyPushProtocolId = "/ipfs/id/push/1.0.0"
 -- then closes the stream (per specs/identify: respond and close).
 -- The connection provides the remote address used for observedAddr.
 handleIdentify :: Switch -> Connection -> StreamIO -> IO ()
-handleIdentify sw conn stream = do
-  info <- buildLocalIdentify sw (Just conn)
-  streamWrite stream (encodeFramedIdentify info)
-  streamClose stream
+handleIdentify sw conn stream =
+  (do
+    info <- buildLocalIdentify sw (Just conn)
+    streamWrite stream (encodeFramedIdentify info))
+    `finally` closeQuietly stream
 
 -- | Timeout for one Identify exchange: 5 seconds.
 --
@@ -132,7 +134,6 @@ requestIdentify conn = do
         Accepted _ ->
           fmap (validateIdentify (connPeerId conn))
             <$> readFramedIdentify stream maxIdentifySize
-    closeQuietly stream = streamClose stream `catch` \(_ :: SomeException) -> pure ()
 
 -- | Run Identify against a freshly established connection and record the
 -- result in the peer store (specs/identify).
@@ -160,18 +161,24 @@ identifyPeer sw conn = do
 --
 -- Reads the pushed varint-length-prefixed IdentifyInfo from the remote
 -- peer. The length prefix is the message boundary — identify push has
--- no stream-close boundary to fall back on.
+-- no stream-close boundary to fall back on. The local stream side is
+-- still closed on every exit path so a one-shot push cannot leak a
+-- half-open Yamux stream (go-libp2p's handleIdentifyResponse does the
+-- same with defer s.Close()).
 --
 -- The pushed info is merged into the existing peer entry via
 -- 'mergeIdentify': pushes may be partial updates, so fields absent
 -- from the message must not erase what we already know.
 handleIdentifyPush :: Switch -> Connection -> StreamIO -> IO ()
-handleIdentifyPush sw conn stream = do
-  infoOrErr <- readFramedIdentify stream maxIdentifySize
-  case infoOrErr of
-    Left _ -> pure ()
-    Right rawInfo ->
-      storeIdentify sw (connPeerId conn) (validateIdentify (connPeerId conn) rawInfo)
+handleIdentifyPush sw conn stream =
+  (do
+    infoOrErr <- readFramedIdentify stream maxIdentifySize
+    case infoOrErr of
+      Left _ -> pure ()
+      Right rawInfo ->
+        storeIdentify sw (connPeerId conn)
+          (validateIdentify (connPeerId conn) rawInfo))
+    `finally` closeQuietly stream
 
 -- | Merge validated Identify info into the peer store, enforcing RFC
 -- 0003 record freshness on the way in.

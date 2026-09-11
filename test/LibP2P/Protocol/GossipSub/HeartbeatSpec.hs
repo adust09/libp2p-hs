@@ -335,7 +335,7 @@ spec = do
 
     describe "Score decay" $ do
       it "decays P2 counter" $ do
-        (router, _, _) <- mkHeartbeatRouter localPid fixedTime
+        (router, _, timeRef) <- mkHeartbeatRouter localPid fixedTime
         let routerWithParams = router
               { gsScoreParams = defaultPeerScoreParams
                   { pspTopicParams = Map.singleton "t"
@@ -349,6 +349,7 @@ spec = do
             { psTopicState = Map.singleton "t"
                 (defaultTopicPeerState { tpsFirstMessageDeliveries = 10 })
             }) pid
+        writeIORef timeRef (addUTCTime 1 fixedTime)
         heartbeatOnce routerWithParams
         peers <- readTVarIO (gsPeers routerWithParams)
         case Map.lookup pid peers of
@@ -358,7 +359,7 @@ spec = do
           Nothing -> expectationFailure "peer not found"
 
       it "decays P7 counter" $ do
-        (router, _, _) <- mkHeartbeatRouter localPid fixedTime
+        (router, _, timeRef) <- mkHeartbeatRouter localPid fixedTime
         let routerWithParams = router
               { gsScoreParams = defaultPeerScoreParams
                   { pspBehaviorPenaltyDecay = 0.5 }
@@ -367,11 +368,43 @@ spec = do
         addPeer routerWithParams pid GossipSubPeer False fixedTime
         atomically $ modifyTVar' (gsPeers routerWithParams) $
           Map.adjust (\ps -> ps { psBehaviorPenalty = 10 }) pid
+        writeIORef timeRef (addUTCTime 1 fixedTime)
         heartbeatOnce routerWithParams
         peers <- readTVarIO (gsPeers routerWithParams)
         case Map.lookup pid peers of
           Just ps -> psBehaviorPenalty ps `shouldBe` 5
           Nothing -> expectationFailure "peer not found"
+
+      it "applies one decay factor per elapsed DecayInterval" $ do
+        (router, _, timeRef) <- mkHeartbeatRouter localPid fixedTime
+        let routerWithParams = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspBehaviorPenaltyDecay = 0.5 }
+              }
+            pid = mkPeerId 1
+        addPeer routerWithParams pid GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsPeers routerWithParams) $
+          Map.adjust (\ps -> ps { psBehaviorPenalty = 8 }) pid
+        writeIORef timeRef (addUTCTime 2 fixedTime)
+        heartbeatOnce routerWithParams
+        peers <- readTVarIO (gsPeers routerWithParams)
+        fmap psBehaviorPenalty (Map.lookup pid peers) `shouldBe` Just 2
+
+      it "does not decay twice at the same wall-clock instant" $ do
+        (router, _, timeRef) <- mkHeartbeatRouter localPid fixedTime
+        let routerWithParams = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspBehaviorPenaltyDecay = 0.5 }
+              }
+            pid = mkPeerId 1
+        addPeer routerWithParams pid GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsPeers routerWithParams) $
+          Map.adjust (\ps -> ps { psBehaviorPenalty = 8 }) pid
+        writeIORef timeRef (addUTCTime 1 fixedTime)
+        heartbeatOnce routerWithParams
+        heartbeatOnce routerWithParams
+        peers <- readTVarIO (gsPeers routerWithParams)
+        fmap psBehaviorPenalty (Map.lookup pid peers) `shouldBe` Just 4
 
     describe "Seen cache cleanup" $ do
       it "cleans expired entries from seen cache" $ do

@@ -18,7 +18,12 @@ import LibP2P.Crypto.Key (KeyPair, publicKey)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Protocol (Protocol (..))
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair, negotiateInitiator)
+import LibP2P.MultistreamSelect.Negotiation
+  ( StreamIO (..)
+  , mkByteStreamIO
+  , mkMemoryStreamPair
+  , negotiateInitiator
+  )
 import LibP2P.Switch (addTransport, newSwitch, setStreamHandler, switchClose)
 import LibP2P.Switch.ConnPool (addConn, lookupConn)
 import LibP2P.Switch.Connection (closeConnection, newStream)
@@ -275,6 +280,36 @@ spec = do
       -- After dispatch completes, the slot is released
       usageAfter <- peerUsage sw remotePid
       fmap ruStreamsInbound usageAfter `shouldBe` Just 0
+
+    it "closes the stream when negotiation finds no common protocol" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      setStreamHandler sw "/test/1.0.0" $ \_conn _stream -> pure ()
+      closed <- newIORef False
+      conn <- mkDummyConnection remotePid (fail "no outbound")
+      -- Immediate EOF: negotiateResponder returns NoProtocol without a
+      -- handler, so dispatch is the only thing that can close.
+      let tracked = mkByteStreamIO (\_ -> pure ()) (fail "EOF") (writeIORef closed True)
+      dispatchResult <- timeout 5000000 $ dispatchStream sw conn tracked
+      dispatchResult `shouldBe` Just ()
+      readIORef closed `shouldReturn` True
+
+    it "does not close a stream the handler returned without closing" $ do
+      -- Circuit Relay STOP hands the stream off as a connection and
+      -- returns; dispatch must not close-on-return (go-libp2p model).
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      setStreamHandler sw "/test/1.0.0" $ \_conn _stream -> pure ()
+      closed <- newIORef False
+      conn <- mkDummyConnection remotePid (fail "no outbound")
+      (clientIO, serverIO) <- mkMemoryStreamPair
+      let tracked = serverIO { streamClose = writeIORef closed True >> streamClose serverIO }
+      _ <- async $ negotiateInitiator clientIO ["/test/1.0.0"]
+      dispatchResult <- timeout 5000000 $ dispatchStream sw conn tracked
+      dispatchResult `shouldBe` Just ()
+      readIORef closed `shouldReturn` False
 
   describe "dial dedup" $ do
     it "removes the pending entry when the dial throws" $ do

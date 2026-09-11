@@ -68,6 +68,13 @@ data Connection = Connection
 -- The connection exposes the remote peer identity ('connPeerId') and
 -- addresses ('connRemoteAddr', 'connLocalAddr'), which protocols like
 -- Identify (observedAddr) and the NAT stack need.
+--
+-- The handler owns the stream, matching go-libp2p: it must close or
+-- reset on every exit path. Dispatch does not close on return, because
+-- some handlers (Circuit Relay STOP) hand the stream off as a connection.
+-- One-shot protocols (Identify, AutoNAT) close after the single exchange;
+-- long-lived protocols (DHT, Ping, GossipSub) close when the remote
+-- half-closes or the session ends.
 type StreamHandler = Connection -> StreamIO -> IO ()
 
 -- | Events emitted by the Switch for observability.

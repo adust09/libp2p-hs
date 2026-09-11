@@ -3,6 +3,7 @@ module LibP2P.DHT.APISpec (spec) where
 import Test.Hspec
 
 import Control.Concurrent.STM
+import Data.IORef (newIORef)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.Time (getCurrentTime)
@@ -40,7 +41,9 @@ mkAPITestNode pid sentLog = do
   rt    <- newTVarIO (newRoutingTable pid)
   recs  <- newTVarIO Map.empty
   provs <- newTVarIO Map.empty
-  ks    <- newTVarIO Map.empty
+  ks     <- newTVarIO Map.empty
+  hook   <- newIORef Nothing
+  worker <- newTVarIO Nothing
   let sendFunc target msg = do
         atomically $ modifyTVar' sentLog ((target, msg) :)
         -- Simulate successful FIND_NODE response returning ourselves
@@ -81,8 +84,11 @@ mkAPITestNode pid sentLog = do
         , dhtLocalPeerId   = pid
         , dhtMode          = DHTServer
         , dhtValidator     = defaultPermissiveValidator
-        , dhtStreams       = ks
-        , dhtSendRequest   = sendFunc
+        , dhtStreams        = ks
+        , dhtSendRequest    = sendFunc
+        , dhtDisconnectHook  = hook
+        , dhtQueryTimeout    = defaultQueryTimeoutMicros
+        , dhtBootstrapWorker = worker
         }
   pure node
 

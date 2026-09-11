@@ -22,10 +22,11 @@ module LibP2P.NAT.AutoNAT
   , probeNATStatusPure
   ) where
 
+import Control.Exception (finally)
 import Data.ByteString (ByteString)
 import qualified Data.Text as T
 import LibP2P.NAT.AutoNAT.Message
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
+import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), closeQuietly)
 import LibP2P.Multiaddr (Multiaddr (..), toBytes, fromBytes)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.Crypto.PeerId (PeerId (..))
@@ -37,9 +38,10 @@ data NATStatus = NATPublic | NATPrivate | NATUnknown
 -- | AutoNAT configuration.
 data AutoNATConfig = AutoNATConfig
   { natThreshold :: !Int
-    -- ^ Number of peers that must agree for a definitive result
-  , natDialBack  :: !(PeerId -> [Multiaddr] -> IO (Either String ()))
-    -- ^ Injectable dial-back function (for testing)
+    -- ^ Need strictly more than this many agreeing votes (specs/autonat:
+    -- "more than 3"). Default 3 therefore requires four valid reports.
+  , natDialBack  :: !(PeerId -> [Multiaddr] -> IO (Either String Multiaddr))
+    -- ^ Injectable dial-back; on success returns the address that worked.
   }
 
 -- | Server handler: receive DIAL, validate, dial back, respond.
@@ -47,14 +49,19 @@ data AutoNATConfig = AutoNATConfig
 -- Security:
 --   - Rejects requests from relayed connections (P2PCircuit in observed addr)
 --   - Filters dial-back addresses to match observed IP
+--
+-- AutoNAT is a one-shot exchange, so the stream is closed on every exit
+-- path (go-libp2p's handleStream uses defer s.Close()).
 handleAutoNAT :: AutoNATConfig -> StreamIO -> PeerId -> Multiaddr -> IO ()
-handleAutoNAT config stream remotePeerId remoteObservedAddr = do
-  result <- readAutoNATMessage stream maxAutoNATMessageSize
-  case result of
-    Left _err -> pure ()
-    Right msg -> do
-      resp <- processDialRequest config msg remotePeerId remoteObservedAddr
-      writeAutoNATMessage stream resp
+handleAutoNAT config stream remotePeerId remoteObservedAddr =
+  (do
+    result <- readAutoNATMessage stream maxAutoNATMessageSize
+    case result of
+      Left _err -> pure ()
+      Right msg -> do
+        resp <- processDialRequest config msg remotePeerId remoteObservedAddr
+        writeAutoNATMessage stream resp)
+    `finally` closeQuietly stream
 
 -- | Maximum number of addresses dialled back per request.
 -- Bounds the work a single request can trigger (go-libp2p applies a
@@ -90,11 +97,8 @@ processDialRequest config msg remotePeerId remoteObservedAddr
               let peerId = PeerId (anPeerId peerInfo)
               dialResult <- natDialBack config peerId filteredAddrs
               case dialResult of
-                Right () ->
-                  let addrBytes = case filteredAddrs of
-                        (a:_) -> Just (toBytes a)
-                        []    -> Nothing
-                  in pure $ mkDialResponse StatusOK Nothing addrBytes
+                Right addr ->
+                  pure $ mkDialResponse StatusOK Nothing (Just (toBytes addr))
                 Left _err ->
                   pure $ mkDialResponse EDialError (Just "dial failed") Nothing
 
@@ -111,43 +115,55 @@ mkDialResponse status mText mAddr = AutoNATMessage
   }
 
 -- | Client: send DIAL with local addresses, receive response.
+--
+-- One-shot: the stream is closed after the exchange on every exit path,
+-- matching go-libp2p's AutoNAT client (defer s.Close()).
 requestAutoNAT :: StreamIO -> PeerId -> [Multiaddr] -> IO (Either String AutoNATDialResponse)
-requestAutoNAT stream localPeerId localAddrs = do
-  let PeerId pidBytes = localPeerId
-      dialMsg = AutoNATMessage
-        { anMsgType = Just DIAL
-        , anMsgDial = Just AutoNATDial
-            { anDialPeer = Just AutoNATPeerInfo
-                { anPeerId = pidBytes
-                , anAddrs = map toBytes localAddrs
-                }
-            }
-        , anMsgDialResponse = Nothing
-        }
-  writeAutoNATMessage stream dialMsg
-  result <- readAutoNATMessage stream maxAutoNATMessageSize
-  case result of
-    Left err -> pure (Left err)
-    Right resp -> case anMsgDialResponse resp of
-      Nothing -> pure (Left "response missing dialResponse field")
-      Just dr -> pure (Right dr)
+requestAutoNAT stream localPeerId localAddrs =
+  exchange `finally` closeQuietly stream
+  where
+    PeerId pidBytes = localPeerId
+    dialMsg = AutoNATMessage
+      { anMsgType = Just DIAL
+      , anMsgDial = Just AutoNATDial
+          { anDialPeer = Just AutoNATPeerInfo
+              { anPeerId = pidBytes
+              , anAddrs = map toBytes localAddrs
+              }
+          }
+      , anMsgDialResponse = Nothing
+      }
+    exchange = do
+      writeAutoNATMessage stream dialMsg
+      result <- readAutoNATMessage stream maxAutoNATMessageSize
+      case result of
+        Left err -> pure (Left err)
+        Right resp -> case anMsgDialResponse resp of
+          Nothing -> pure (Left "response missing dialResponse field")
+          Just dr -> pure (Right dr)
 
 -- | Pure aggregation of AutoNAT results into a NAT status.
--- Counts OK responses as "public" votes, all other results as "private" votes.
+--
+-- Only a remote dial report counts as a vote: 'StatusOK' is public,
+-- 'EDialError' is private. Local failures ('Left'), refusals, and
+-- malformed responses are abstentions (specs/autonat: infer from
+-- successful or unsuccessful *dial reports*). A decision requires
+-- strictly more than @threshold@ agreeing votes.
 probeNATStatusPure :: Int -> [Either String AutoNATDialResponse] -> NATStatus
 probeNATStatusPure _threshold [] = NATUnknown
 probeNATStatusPure threshold results =
   let (okCount, failCount) = foldl' countResult (0 :: Int, 0 :: Int) results
-  in if okCount >= threshold then NATPublic
-     else if failCount >= threshold then NATPrivate
+  in if okCount > threshold then NATPublic
+     else if failCount > threshold then NATPrivate
      else NATUnknown
   where
     countResult :: (Int, Int) -> Either String AutoNATDialResponse -> (Int, Int)
-    countResult (ok, fail') (Left _) = (ok, fail' + 1)
+    countResult acc (Left _) = acc
     countResult (ok, fail') (Right dr) =
       case anRespStatus dr of
-        Just StatusOK -> (ok + 1, fail')
-        _             -> (ok, fail' + 1)
+        Just StatusOK   -> (ok + 1, fail')
+        Just EDialError -> (ok, fail' + 1)
+        _               -> (ok, fail')
 
 -- Helpers
 

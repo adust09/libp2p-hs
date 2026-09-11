@@ -17,15 +17,24 @@ module LibP2P.DHT.Lookup
   , iterativeGetProviders
     -- * Bootstrap
   , bootstrap
+  , startBootstrap
+  , defaultBootstrapIntervalMicros
   ) where
 
-import Control.Concurrent.Async (mapConcurrently)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (async, cancel, mapConcurrently)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
+import Control.Monad (forever, void)
+import Crypto.Random (getRandomBytes)
+import Data.Bits (clearBit, setBit, shiftL, testBit, (.&.), (.|.))
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Time (UTCTime, getCurrentTime)
+import Data.Word (Word8)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT
   ( DHTNode (..)
@@ -36,8 +45,9 @@ import LibP2P.DHT
   )
 import LibP2P.DHT.Distance (keyToDHTKey, peerIdToKey, sortByDistance)
 import LibP2P.DHT.Message
-import LibP2P.DHT.RoutingTable (allPeers, closestPeers)
+import LibP2P.DHT.RoutingTable (closestPeers, occupiedBuckets)
 import LibP2P.DHT.Types
+import System.Timeout (timeout)
 
 -- | Result of an iterative lookup.
 data LookupResult
@@ -46,11 +56,20 @@ data LookupResult
   | FoundProviders ![ProviderEntry] ![BucketEntry]
   deriving (Show)
 
+-- | Run an action with the node's query timeout, returning @fallback@ on expiry.
+withQueryTimeout :: DHTNode -> a -> IO a -> IO a
+withQueryTimeout node fallback action = do
+  m <- timeout (dhtQueryTimeout node) action
+  pure (fromMaybe fallback m)
+
 -- | Iterative FIND_NODE: find the k closest peers to a target peer.
 --
 -- Per specs/kad-dht, the FIND_NODE wire key must be the target's binary
 -- Peer ID; XOR distance is computed over SHA-256 digests, so only local
 -- comparisons use the hashed key.
+--
+-- Bounded by 'dhtQueryTimeout' (default 10s). Outstanding parallel
+-- queries are cancelled when the deadline expires.
 --
 -- Algorithm:
 -- 1. Seed candidates with k closest from local routing table
@@ -58,7 +77,11 @@ data LookupResult
 -- 3. Merge returned closerPeers into candidates
 -- 4. Terminate when top-k candidates all queried or no unqueried remain
 iterativeFindNode :: DHTNode -> PeerId -> IO [BucketEntry]
-iterativeFindNode node targetPid = do
+iterativeFindNode node targetPid =
+  withQueryTimeout node [] (findNodeUncapped node targetPid)
+
+findNodeUncapped :: DHTNode -> PeerId -> IO [BucketEntry]
+findNodeUncapped node targetPid = do
   rt <- readTVarIO (dhtRoutingTable node)
   let wireKey = peerIdBytes targetPid   -- raw peer ID on the wire
       targetKey = peerIdToKey targetPid -- SHA-256 for distance
@@ -165,7 +188,11 @@ queryPeer node wireKey queryType entry = do
 -- Same as FIND_NODE but also tracks the best value found and which peers
 -- returned it. On completion, sends PUT_VALUE to peers with outdated values.
 iterativeGetValue :: DHTNode -> Validator -> ByteString -> IO (Either String DHTRecord)
-iterativeGetValue node validator key = do
+iterativeGetValue node validator key =
+  withQueryTimeout node (Left "query timed out") (getValueUncapped node validator key)
+
+getValueUncapped :: DHTNode -> Validator -> ByteString -> IO (Either String DHTRecord)
+getValueUncapped node validator key = do
   rt <- readTVarIO (dhtRoutingTable node)
   -- The raw record key goes on the wire; distance uses its SHA-256.
   let targetKey = keyToDHTKey key
@@ -313,7 +340,11 @@ processValueResult _ _ _ _ _ _ _ (_, _, Nothing) = pure ()
 
 -- | Iterative GET_PROVIDERS: find providers for a content key.
 iterativeGetProviders :: DHTNode -> ByteString -> IO [ProviderEntry]
-iterativeGetProviders node key = do
+iterativeGetProviders node key =
+  withQueryTimeout node [] (getProvidersUncapped node key)
+
+getProvidersUncapped :: DHTNode -> ByteString -> IO [ProviderEntry]
+getProvidersUncapped node key = do
   rt <- readTVarIO (dhtRoutingTable node)
   -- The raw content key goes on the wire; distance uses its SHA-256.
   let targetKey = keyToDHTKey key
@@ -397,26 +428,85 @@ queryPeerForProviders node wireKey entry = do
     Left err -> (entryPeerId entry, Left err, [])
     Right resp -> (entryPeerId entry, Right (msgCloserPeers resp), msgProviderPeers resp)
 
--- | Bootstrap the DHT: connect to seeds, self-lookup, per-bucket refresh.
+-- | Default periodic bootstrap interval: 10 minutes (specs/kad-dht).
+defaultBootstrapIntervalMicros :: Int
+defaultBootstrapIntervalMicros = 600000000
+
+-- | Bootstrap the DHT: insert seeds, self-lookup, refresh every non-empty bucket.
+--
+-- Startup is explicit: call 'bootstrap' or 'startBootstrap'. 'newDHTNode'
+-- does not start a loop, matching go-libp2p's @IpfsDHT.Bootstrap@.
+-- The whole run is bounded by 'dhtQueryTimeout' (default 10s).
 bootstrap :: DHTNode -> [PeerId] -> IO ()
-bootstrap node seeds = do
+bootstrap node seeds =
+  void $ timeout (dhtQueryTimeout node) (bootstrapRun node seeds)
+
+bootstrapRun :: DHTNode -> [PeerId] -> IO ()
+bootstrapRun node seeds = do
   now <- getCurrentTime
-  -- Step 1: Add seed peers to routing table (with eviction policy)
   let seedEntries = map (\pid -> BucketEntry pid (peerIdToKey pid) [] now NotConnected) seeds
   mapM_ (addPeerToTable node) seedEntries
+  _ <- findNodeUncapped node (dhtLocalPeerId node)
+  rt <- readTVarIO (dhtRoutingTable node)
+  mapM_ (refreshBucket node (dhtLocalKey node)) (occupiedBuckets rt)
 
-  -- Step 2: Self-lookup (FIND_NODE for our own peer ID)
-  _ <- iterativeFindNode node (dhtLocalPeerId node)
+-- | FIND_NODE a random key in the bucket's XOR range (specs/kad-dht).
+refreshBucket :: DHTNode -> DHTKey -> Int -> IO ()
+refreshBucket node selfKey cpl = do
+  target <- randomKadKeyInBucket selfKey cpl
+  let DHTKey wireKey = target
+  void $
+    lookupByKey node wireKey target
+      `catch` (\(_ :: SomeException) -> pure [])
 
-  -- Step 3: Refresh non-empty buckets
-  -- (simplified: just do another lookup for a peer in each occupied bucket)
-  rt'' <- readTVarIO (dhtRoutingTable node)
-  let peers = allPeers rt''
-  -- For each unique bucket, pick a representative peer and do a lookup
-  let bucketReps = take 10 peers  -- limit to avoid excessive lookups during bootstrap
-  mapM_ (\entry -> iterativeFindNode node (entryPeerId entry)
-                     `catch` (\(_ :: SomeException) -> pure []))
-        bucketReps
+-- | FIND_NODE whose local distance uses @targetKey@ as-is (already a
+-- kad-id) so a bucket refresh actually queries that bucket.
+lookupByKey :: DHTNode -> ByteString -> DHTKey -> IO [BucketEntry]
+lookupByKey node wireKey targetKey = do
+  rt <- readTVarIO (dhtRoutingTable node)
+  let seeds = closestPeers targetKey kValue rt
+  now <- getCurrentTime
+  candidatesVar <- newTVarIO (sortByDistance targetKey seeds)
+  queriedVar    <- newTVarIO Set.empty
+  knownVar      <- newTVarIO (Set.fromList (map entryPeerId seeds))
+  lookupLoop node wireKey targetKey candidatesVar queriedVar knownVar now FindNode
+
+-- | Start a periodic bootstrap loop. Runs one refresh immediately, then
+-- every @intervalMicros@. Cancelled by 'stopDHTNode'.
+startBootstrap :: DHTNode -> [PeerId] -> Int -> IO ()
+startBootstrap node seeds intervalMicros = do
+  mPrev <- atomically $ do
+    prev <- readTVar (dhtBootstrapWorker node)
+    writeTVar (dhtBootstrapWorker node) Nothing
+    pure prev
+  mapM_ cancel mPrev
+  worker <- async $ forever $ do
+    bootstrap node seeds
+    threadDelay intervalMicros
+  atomically $ writeTVar (dhtBootstrapWorker node) (Just worker)
+
+-- | A kad-id whose XOR with @self@ has common prefix length @cpl@.
+-- Bit @cpl@ is flipped so the key falls in that bucket; remaining bits
+-- are random so successive refreshes explore the range.
+randomKadKeyInBucket :: DHTKey -> Int -> IO DHTKey
+randomKadKeyInBucket (DHTKey self) cpl = do
+  noise <- getRandomBytes 32
+  let cpl' = max 0 (min 255 cpl)
+      keepBytes = cpl' `div` 8
+      bitInByte = cpl' `mod` 8
+      prefix = BS.take keepBytes self
+      selfByte = BS.index self keepBytes
+      noiseByte = BS.index noise keepBytes
+      keepMask :: Word8
+      keepMask = if bitInByte == 0 then 0 else 0xFF `shiftL` (8 - bitInByte)
+      kept = selfByte .&. keepMask
+      flipBit = 7 - bitInByte
+      flipped = if testBit selfByte flipBit then clearBit kept flipBit else setBit kept flipBit
+      lowerMask :: Word8
+      lowerMask = (1 `shiftL` flipBit) - 1
+      mixed = flipped .|. (noiseByte .&. lowerMask)
+      rest = BS.drop (keepBytes + 1) noise
+  pure (DHTKey (prefix <> BS.singleton mixed <> rest))
 
 -- Helpers
 

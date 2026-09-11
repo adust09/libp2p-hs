@@ -7,15 +7,16 @@ module LibP2P.DHT.DHTSpec
 
 import Test.Hspec
 
-import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent (ThreadId, myThreadId, threadDelay)
 import Control.Concurrent.Async (async, concurrently, wait)
-import Control.Concurrent.MVar (newMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
 import Control.Monad (when)
 import Crypto.Hash (Digest, SHA256, hash)
 import Data.ByteArray (convert)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
+import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import Data.Time (addUTCTime, getCurrentTime)
@@ -31,6 +32,7 @@ import LibP2P.DHT.RoutingTable (allPeers, bucketForPeer, insertPeer, newRoutingT
 import LibP2P.DHT.Types
 import LibP2P.Multiaddr (Multiaddr, fromText, toBytes)
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkByteStreamIO, negotiateResponder)
+import LibP2P.Switch.Connection (closeConnection)
 import LibP2P.Switch.ConnPool (addConn)
 import LibP2P.Switch.Types
   ( ConnState (..)
@@ -620,7 +622,7 @@ spec = do
       sw <- mkMockSwitch localPid
       node <- newDHTNode sw DHTServer
       stream <- mkCrossingProbeStream
-      session <- newMVar (Just stream)
+      session <- newPeerSession (Just stream)
       atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
       let ask key = dhtSendRequest node remotePid (probeRequest key)
       outcome <- timeout 5000000 $
@@ -639,8 +641,8 @@ spec = do
       arrived <- newTVarIO (0 :: Int)
       streamA <- mkRendezvousStream arrived
       streamB <- mkRendezvousStream arrived
-      sessionA <- newMVar (Just streamA)
-      sessionB <- newMVar (Just streamB)
+      sessionA <- newPeerSession (Just streamA)
+      sessionB <- newPeerSession (Just streamB)
       atomically $ writeTVar (dhtStreams node) $
         Map.fromList [(remotePid, sessionA), (thirdPid, sessionB)]
       let ask peer key = dhtSendRequest node peer (probeRequest key)
@@ -651,6 +653,89 @@ spec = do
         Just (ra, rb) -> do
           fmap msgKey ra `shouldBe` Right (BSC.pack "key-a")
           fmap msgKey rb `shouldBe` Right (BSC.pack "key-b")
+
+  -- Issue #279: a cached session must not outlive the peer's last
+  -- connection, and an in-flight exchange must not resurrect it.
+  describe "cached session disconnect" $ do
+    it "removes the session and closes its stream after the last connection closes" $ do
+      node <- mkTestNode localPid
+      closed <- newIORef False
+      (stream, _) <- mkStreamPair
+      let tracked = stream { streamClose = writeIORef closed True >> streamClose stream }
+      session <- newPeerSession (Just tracked)
+      atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
+      openCountVar <- newTVarIO (0 :: Int)
+      conn <- mkMockConnection remotePid tracked openCountVar
+      atomically $ addConn (swConnPool (dhtSwitch node)) conn
+      closeConnection (dhtSwitch node) conn
+      sessions <- readTVarIO (dhtStreams node)
+      Map.member remotePid sessions `shouldBe` False
+      readIORef closed `shouldReturn` True
+
+    it "keeps the session when a second connection to the peer remains" $ do
+      node <- mkTestNode localPid
+      closed <- newIORef False
+      (stream, _) <- mkStreamPair
+      let tracked = stream { streamClose = writeIORef closed True >> streamClose stream }
+      session <- newPeerSession (Just tracked)
+      atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
+      openCountVar <- newTVarIO (0 :: Int)
+      conn1 <- mkMockConnection remotePid tracked openCountVar
+      conn2 <- mkMockConnection remotePid tracked openCountVar
+      atomically $ do
+        addConn (swConnPool (dhtSwitch node)) conn1
+        addConn (swConnPool (dhtSwitch node)) conn2
+      closeConnection (dhtSwitch node) conn1
+      sessionsAfterFirst <- readTVarIO (dhtStreams node)
+      Map.member remotePid sessionsAfterFirst `shouldBe` True
+      readIORef closed `shouldReturn` False
+      closeConnection (dhtSwitch node) conn2
+      sessionsAfterLast <- readTVarIO (dhtStreams node)
+      Map.member remotePid sessionsAfterLast `shouldBe` False
+      readIORef closed `shouldReturn` True
+
+    it "does not resurrect a session removed during an in-flight exchange" $ do
+      node <- mkTestNode localPid
+      closed <- newIORef False
+      (clientEnd, serverEnd) <- mkStreamPair
+      let tracked = clientEnd { streamClose = writeIORef closed True >> streamClose clientEnd }
+          -- Session teardown fails both directions, like muxClose on a
+          -- real Yamux session; half-closing only the local end would
+          -- leave the in-flight read blocked.
+          killSession = streamClose tracked >> streamClose serverEnd
+      session <- newPeerSession (Just tracked)
+      atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
+      openCountVar <- newTVarIO (0 :: Int)
+      conn <- mkMockConnection remotePid tracked openCountVar
+      let conn' = conn { connSession = (connSession conn) { muxClose = killSession } }
+      atomically $ addConn (swConnPool (dhtSwitch node)) conn'
+      started <- newEmptyMVar
+      done <- async $ do
+        putMVar started ()
+        dhtSendRequest node remotePid (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [1] })
+      takeMVar started
+      threadDelay 50000
+      closeConnection (dhtSwitch node) conn'
+      outcome <- timeout 2000000 (wait done)
+      case outcome of
+        Nothing -> expectationFailure "in-flight exchange did not finish after disconnect"
+        Just result -> result `shouldSatisfy` either (const True) (const False)
+      sessions <- readTVarIO (dhtStreams node)
+      Map.member remotePid sessions `shouldBe` False
+      readIORef closed `shouldReturn` True
+
+    it "does not drop a session after stopDHTNode deregisters the notifier" $ do
+      node <- mkTestNode localPid
+      stopDHTNode node
+      (stream, _) <- mkStreamPair
+      session <- newPeerSession (Just stream)
+      atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
+      openCountVar <- newTVarIO (0 :: Int)
+      conn <- mkMockConnection remotePid stream openCountVar
+      atomically $ addConn (swConnPool (dhtSwitch node)) conn
+      closeConnection (dhtSwitch node) conn
+      sessions <- readTVarIO (dhtStreams node)
+      Map.member remotePid sessions `shouldBe` True
 
   describe "Store operations" $ do
     it "storeRecord + lookupRecord round-trip" $ do
