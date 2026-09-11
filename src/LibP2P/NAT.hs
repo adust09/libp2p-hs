@@ -416,12 +416,13 @@ registerAutoNATHandler sw =
     in handleAutoNAT config stream (connPeerId conn) (connRemoteAddr conn)
 
 -- | Dial back a peer on a fresh connection, verify its identity, and close.
-freshDialBack :: Switch -> PeerId -> [Multiaddr] -> IO (Either String ())
+-- Returns the address that actually succeeded, not the first candidate.
+freshDialBack :: Switch -> PeerId -> [Multiaddr] -> IO (Either String Multiaddr)
 freshDialBack _ _ [] = pure (Left "dial-back: no addresses")
 freshDialBack sw pid (addr : rest) = do
   result <- try (probeAddr sw pid addr)
   case result of
-    Right (Right ()) -> pure (Right ())
+    Right (Right ()) -> pure (Right addr)
     Right (Left err)
       | null rest -> pure (Left err)
       | otherwise -> freshDialBack sw pid rest

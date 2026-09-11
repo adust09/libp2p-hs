@@ -104,7 +104,7 @@ spec = do
       (clientStream, serverStream) <- mkStreamPair
       let config = AutoNATConfig
             { natThreshold = 3
-            , natDialBack = \_pid _addrs -> pure (Right ())
+            , natDialBack = \_pid _addrs -> pure (Right publicAddr)
             }
       -- Client sends DIAL request
       let addrBytes = toBytes publicAddr
@@ -163,7 +163,7 @@ spec = do
       (clientStream, serverStream) <- mkStreamPair
       let config = AutoNATConfig
             { natThreshold = 3
-            , natDialBack = \_pid _addrs -> pure (Right ())
+            , natDialBack = \_pid _addrs -> pure (Right publicAddr)
             }
           dialMsg = AutoNATMessage
             { anMsgType = Just DIAL
@@ -189,7 +189,7 @@ spec = do
       (clientStream, serverStream) <- mkStreamPair
       let config = AutoNATConfig
             { natThreshold = 3
-            , natDialBack = \_pid _addrs -> pure (Right ())
+            , natDialBack = \_pid _addrs -> pure (Right publicAddr)
             }
           dialMsg = AutoNATMessage
             { anMsgType = Just DIAL
@@ -214,7 +214,7 @@ spec = do
             { natThreshold = 3
             , natDialBack = \_pid addrs -> do
                 modifyIORef' dialedRef (addrs :)
-                pure (Right ())
+                pure (Right publicAddr)
             }
           -- Provide both matching and non-matching addresses
           matchAddr = toBytes publicAddr           -- 203.0.113.5 matches remoteObservedAddr
@@ -248,7 +248,7 @@ spec = do
             { natThreshold = 3
             , natDialBack = \_pid addrs -> do
                 modifyIORef' dialedRef (addrs :)
-                pure (Right ())
+                pure (Right publicAddr)
             }
           -- Same IPv6 host, different IPv6 host, and an IPv4 address
           dialMsg = mkDialMsg remotePeerId [ipv6MatchAddr, ipv6OtherAddr, publicAddr]
@@ -267,7 +267,7 @@ spec = do
             { natThreshold = 3
             , natDialBack = \_pid addrs -> do
                 modifyIORef' dialedRef (addrs :)
-                pure (Right ())
+                pure (Right publicAddr)
             }
           -- Observed over IPv6, but only IPv4 candidates are offered
           dialMsg = mkDialMsg remotePeerId [publicAddr, privateAddr]
@@ -290,7 +290,7 @@ spec = do
             { natThreshold = 3
             , natDialBack = \_pid addrs -> do
                 modifyIORef' dialedRef (addrs :)
-                pure (Right ())
+                pure (Right publicAddr)
             }
           dialMsg = mkDialMsg remotePeerId [publicAddr, ipv6MatchAddr]
       writeAutoNATMessage clientStream dialMsg
@@ -314,7 +314,7 @@ spec = do
             { natThreshold = 3
             , natDialBack = \_pid addrs -> do
                 modifyIORef' dialedRef (addrs :)
-                pure (Right ())
+                pure (Right publicAddr)
             }
           -- Message claims testPeerId, but the connection is authenticated as remotePeerId
           dialMsg = mkDialMsg testPeerId [publicAddr]
@@ -337,7 +337,7 @@ spec = do
             { natThreshold = 3
             , natDialBack = \pid _addrs -> do
                 modifyIORef' dialedPidsRef (pid :)
-                pure (Right ())
+                pure (Right publicAddr)
             }
           dialMsg = mkDialMsg remotePeerId [publicAddr]
       writeAutoNATMessage clientStream dialMsg
@@ -353,7 +353,7 @@ spec = do
       (clientStream, serverStream) <- mkStreamPair
       let config = AutoNATConfig
             { natThreshold = 3
-            , natDialBack = \_pid _addrs -> pure (Right ())
+            , natDialBack = \_pid _addrs -> pure (Right publicAddr)
             }
           -- privateAddr fails the observed-IP filter; publicAddr passes
           dialMsg = mkDialMsg remotePeerId [privateAddr, publicAddr]
@@ -371,6 +371,30 @@ spec = do
             Nothing -> expectationFailure "Expected DialResponse"
         Left err -> expectationFailure $ "Read failed: " ++ err
 
+    it "puts the address that actually succeeded in the OK response" $ do
+      let secondAddr = Multiaddr [IP4 0xCB007105, TCP 4002]
+      (clientStream, serverStream) <- mkStreamPair
+      let config = AutoNATConfig
+            { natThreshold = 3
+            , natDialBack = \_pid addrs ->
+                case addrs of
+                  (_failed:worked:_) -> pure (Right worked)
+                  [only] -> pure (Right only)
+                  [] -> pure (Left "no addresses")
+            }
+          dialMsg = mkDialMsg remotePeerId [publicAddr, secondAddr]
+      writeAutoNATMessage clientStream dialMsg
+      handleAutoNAT config serverStream remotePeerId remoteObservedAddr
+      result <- readAutoNATMessage clientStream maxAutoNATMessageSize
+      case result of
+        Right resp ->
+          case anMsgDialResponse resp of
+            Just dr -> do
+              anRespStatus dr `shouldBe` Just StatusOK
+              anRespAddr dr `shouldBe` Just (toBytes secondAddr)
+            Nothing -> expectationFailure "Expected DialResponse"
+        Left err -> expectationFailure $ "Read failed: " ++ err
+
     it "rejects a relayed observed address with a trailing p2p-circuit component" $ do
       dialedRef <- newIORef ([] :: [[Multiaddr]])
       (clientStream, serverStream) <- mkStreamPair
@@ -378,7 +402,7 @@ spec = do
             { natThreshold = 3
             , natDialBack = \_pid addrs -> do
                 modifyIORef' dialedRef (addrs :)
-                pure (Right ())
+                pure (Right publicAddr)
             }
           -- P2PCircuit in the last position (the existing relayed-address
           -- test places it mid-list)
@@ -403,7 +427,7 @@ spec = do
             { natThreshold = 3
             , natDialBack = \_pid addrs -> do
                 modifyIORef' dialedRef (addrs :)
-                pure (Right ())
+                pure (Right publicAddr)
             }
           -- Many same-IP addresses on different ports; all pass the IP filter
           manyAddrs = [Multiaddr [IP4 0xCB007105, TCP p] | p <- [4001 .. 4064]]
@@ -420,7 +444,7 @@ spec = do
       (clientStream, serverStream) <- mkStreamPair
       let config = AutoNATConfig
             { natThreshold = 3
-            , natDialBack = \_pid _addrs -> pure (Right ())
+            , natDialBack = \_pid _addrs -> pure (Right publicAddr)
             }
           addrBytes = toBytes publicAddr
           dialMsg = AutoNATMessage
@@ -494,7 +518,7 @@ spec = do
       closed <- newIORef False
       let config = AutoNATConfig
             { natThreshold = 3
-            , natDialBack = \_pid _addrs -> pure (Right ())
+            , natDialBack = \_pid _addrs -> pure (Right publicAddr)
             }
           dialMsg = mkDialMsg remotePeerId [publicAddr]
       writeAutoNATMessage clientStream dialMsg
@@ -509,7 +533,7 @@ spec = do
       closed <- newIORef False
       let config = AutoNATConfig
             { natThreshold = 3
-            , natDialBack = \_pid _addrs -> pure (Right ())
+            , natDialBack = \_pid _addrs -> pure (Right publicAddr)
             }
           eofStream = recordClose closed $ mkByteStreamIO
             (\_ -> fail "write unused")
@@ -579,7 +603,7 @@ spec = do
           results = [okResult, errResult, okResult, errResult]
       probeNATStatusPure 3 results `shouldBe` NATUnknown
 
-    it "threshold=3 with 3 OK → NATPublic" $ do
+    it "three OK reports do not produce NATPublic under the spec default" $ do
       let okResult = Right AutoNATDialResponse
             { anRespStatus = Just StatusOK, anRespStatusText = Nothing
             , anRespAddr = Just (toBytes publicAddr) }
@@ -587,11 +611,20 @@ spec = do
             { anRespStatus = Just EDialError, anRespStatusText = Just "fail"
             , anRespAddr = Nothing }
           results = [okResult, okResult, okResult, errResult]
-      probeNATStatusPure 3 results `shouldBe` NATPublic
+      probeNATStatusPure 3 results `shouldBe` NATUnknown
 
-    it "transport errors count as failures" $ do
-      let results = replicate 4 (Left "stream closed" :: Either String AutoNATDialResponse)
-      probeNATStatusPure 3 results `shouldBe` NATPrivate
+    it "I/O errors, refusals, and malformed responses do not count as private votes" $ do
+      let results =
+            [ Left "stream closed"
+            , Left "timed out"
+            , Right AutoNATDialResponse
+                { anRespStatus = Just EDialRefused, anRespStatusText = Just "refused"
+                , anRespAddr = Nothing }
+            , Right AutoNATDialResponse
+                { anRespStatus = Just EBadRequest, anRespStatusText = Just "bad"
+                , anRespAddr = Nothing }
+            ] :: [Either String AutoNATDialResponse]
+      probeNATStatusPure 3 results `shouldBe` NATUnknown
 
     it "no results → NATUnknown" $ do
       probeNATStatusPure 3 [] `shouldBe` NATUnknown

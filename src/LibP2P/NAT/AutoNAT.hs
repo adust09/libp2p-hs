@@ -38,9 +38,10 @@ data NATStatus = NATPublic | NATPrivate | NATUnknown
 -- | AutoNAT configuration.
 data AutoNATConfig = AutoNATConfig
   { natThreshold :: !Int
-    -- ^ Number of peers that must agree for a definitive result
-  , natDialBack  :: !(PeerId -> [Multiaddr] -> IO (Either String ()))
-    -- ^ Injectable dial-back function (for testing)
+    -- ^ Need strictly more than this many agreeing votes (specs/autonat:
+    -- "more than 3"). Default 3 therefore requires four valid reports.
+  , natDialBack  :: !(PeerId -> [Multiaddr] -> IO (Either String Multiaddr))
+    -- ^ Injectable dial-back; on success returns the address that worked.
   }
 
 -- | Server handler: receive DIAL, validate, dial back, respond.
@@ -96,11 +97,8 @@ processDialRequest config msg remotePeerId remoteObservedAddr
               let peerId = PeerId (anPeerId peerInfo)
               dialResult <- natDialBack config peerId filteredAddrs
               case dialResult of
-                Right () ->
-                  let addrBytes = case filteredAddrs of
-                        (a:_) -> Just (toBytes a)
-                        []    -> Nothing
-                  in pure $ mkDialResponse StatusOK Nothing addrBytes
+                Right addr ->
+                  pure $ mkDialResponse StatusOK Nothing (Just (toBytes addr))
                 Left _err ->
                   pure $ mkDialResponse EDialError (Just "dial failed") Nothing
 
@@ -145,21 +143,27 @@ requestAutoNAT stream localPeerId localAddrs =
           Just dr -> pure (Right dr)
 
 -- | Pure aggregation of AutoNAT results into a NAT status.
--- Counts OK responses as "public" votes, all other results as "private" votes.
+--
+-- Only a remote dial report counts as a vote: 'StatusOK' is public,
+-- 'EDialError' is private. Local failures ('Left'), refusals, and
+-- malformed responses are abstentions (specs/autonat: infer from
+-- successful or unsuccessful *dial reports*). A decision requires
+-- strictly more than @threshold@ agreeing votes.
 probeNATStatusPure :: Int -> [Either String AutoNATDialResponse] -> NATStatus
 probeNATStatusPure _threshold [] = NATUnknown
 probeNATStatusPure threshold results =
   let (okCount, failCount) = foldl' countResult (0 :: Int, 0 :: Int) results
-  in if okCount >= threshold then NATPublic
-     else if failCount >= threshold then NATPrivate
+  in if okCount > threshold then NATPublic
+     else if failCount > threshold then NATPrivate
      else NATUnknown
   where
     countResult :: (Int, Int) -> Either String AutoNATDialResponse -> (Int, Int)
-    countResult (ok, fail') (Left _) = (ok, fail' + 1)
+    countResult acc (Left _) = acc
     countResult (ok, fail') (Right dr) =
       case anRespStatus dr of
-        Just StatusOK -> (ok + 1, fail')
-        _             -> (ok, fail' + 1)
+        Just StatusOK   -> (ok + 1, fail')
+        Just EDialError -> (ok, fail' + 1)
+        _               -> (ok, fail')
 
 -- Helpers
 

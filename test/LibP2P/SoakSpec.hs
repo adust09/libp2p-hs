@@ -204,7 +204,7 @@ spec = do
       withConnectedPair $ \(swA, pidA) (swB, _) conn -> do
         let config = AutoNATConfig
               { natThreshold = 3
-              , natDialBack = \_pid _addrs -> pure (Right ())
+              , natDialBack = \_pid _addrs -> pure (Right loopbackAddr)
               }
         setStreamHandler swB autoNATProtocolId $ \c stream ->
           handleAutoNAT config stream (connPeerId c) (connRemoteAddr c)
