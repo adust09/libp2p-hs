@@ -187,14 +187,15 @@ spec = do
         fmap psBehaviorPenalty (Map.lookup pid peersBack) `shouldBe` Just 5
 
       it "decays retained counters while the peer is disconnected" $ do
-        (router, _) <- mkTestRouter localPid
+        (router, _, timeRef) <- mkTestRouterWithTime localPid fixedTime
         let pid = mkPeerId 1
         addPeer router pid GossipSubPeer False fixedTime
         atomically $ modifyTVar' (gsPeers router) $
           Map.adjust (\ps -> ps { psBehaviorPenalty = 10 }) pid
         removePeer router pid
+        writeIORef timeRef (addUTCTime 1 fixedTime)
         heartbeatOnce router
-        addPeer router pid GossipSubPeer False fixedTime
+        addPeer router pid GossipSubPeer False (addUTCTime 1 fixedTime)
         peersBack <- readTVarIO (gsPeers router)
         -- default P7 decay is 0.99
         fmap psBehaviorPenalty (Map.lookup pid peersBack) `shouldBe` Just 9.9
@@ -1272,14 +1273,18 @@ spec = do
               { gsScoreParams = defaultPeerScoreParams
                   { pspTopicParams = Map.singleton "blocks" tsp }
               }
-        -- Set up peer in mesh with 0 deliveries
+        -- In-mesh past the 5s activation window, 0 deliveries.
         atomically $ do
           modifyTVar' (gsMesh routerWithParams) $
             Map.insert "blocks" (Set.singleton sender)
           modifyTVar' (gsPeers routerWithParams) $
             Map.adjust (\ps -> ps
               { psTopicState = Map.singleton "blocks"
-                  (defaultTopicPeerState { tpsMeshMessageDeliveries = 0 })
+                  defaultTopicPeerState
+                    { tpsMeshMessageDeliveries = 0
+                    , tpsInMesh = True
+                    , tpsGraftTime = Just (addUTCTime (-10) fixedTime)
+                    }
               }) sender
         handlePrune routerWithParams sender [Prune "blocks" [] (Just 60)]
         -- P3b should capture deficit^2 = (5-0)^2 = 25
@@ -1289,6 +1294,45 @@ spec = do
             Just tps -> tpsMeshFailurePenalty tps `shouldBe` 25
             Nothing -> expectationFailure "topic state not found"
           Nothing -> expectationFailure "peer not found"
+
+      it "does not add P3b for a PRUNE before activation" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            tsp = defaultTopicScoreParams { tspMeshMessageDeliveriesThreshold = 5 }
+            routerWithParams = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspTopicParams = Map.singleton "blocks" tsp }
+              }
+        addPeer routerWithParams sender GossipSubPeer False fixedTime
+        atomically $ do
+          modifyTVar' (gsMesh routerWithParams) $
+            Map.insert "blocks" (Set.singleton sender)
+          modifyTVar' (gsPeers routerWithParams) $
+            Map.adjust (\ps -> ps
+              { psTopicState = Map.singleton "blocks"
+                  defaultTopicPeerState
+                    { tpsInMesh = True
+                    , tpsGraftTime = Just fixedTime
+                    }
+              }) sender
+        handlePrune routerWithParams sender [Prune "blocks" [] Nothing]
+        peers <- readTVarIO (gsPeers routerWithParams)
+        fmap (fmap tpsMeshFailurePenalty . Map.lookup "blocks" . psTopicState)
+          (Map.lookup sender peers) `shouldBe` Just (Just 0)
+
+      it "does not add P3b for a PRUNE from a non-mesh peer" $ do
+        (router, _) <- mkTestRouter localPid
+        let sender = mkPeerId 1
+            tsp = defaultTopicScoreParams { tspMeshMessageDeliveriesThreshold = 5 }
+            routerWithParams = router
+              { gsScoreParams = defaultPeerScoreParams
+                  { pspTopicParams = Map.singleton "blocks" tsp }
+              }
+        addPeer routerWithParams sender GossipSubPeer False fixedTime
+        handlePrune routerWithParams sender [Prune "blocks" [] Nothing]
+        peers <- readTVarIO (gsPeers routerWithParams)
+        fmap (Map.lookup "blocks" . psTopicState) (Map.lookup sender peers)
+          `shouldBe` Just Nothing
 
     -- Issue #157 remainder: peers that negotiated /meshsub/1.0.0 must not
     -- receive v1.1 control extensions (PX records, backoff field).
