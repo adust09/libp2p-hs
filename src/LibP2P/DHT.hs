@@ -21,6 +21,7 @@ module LibP2P.DHT
   , newDHTNode
   , newPeerSession
   , stopDHTNode
+  , defaultQueryTimeoutMicros
     -- * Handler registration
   , registerDHTHandler
     -- * Inbound RPC handler
@@ -39,6 +40,7 @@ module LibP2P.DHT
   , providerRecordTTL
   ) where
 
+import Control.Concurrent.Async (Async, cancel)
 import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar, tryTakeMVar)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch, mask, onException, try)
@@ -143,7 +145,16 @@ data DHTNode = DHTNode
   , dhtDisconnectHook :: !(IORef (Maybe (Connection -> IO ())))
     -- ^ Disconnect notifier; 'stopDHTNode' clears it so a stopped node
     -- does not keep a callback alive on the Switch.
+  , dhtQueryTimeout :: !Int
+    -- ^ Deadline for one iterative lookup / bootstrap run, in microseconds.
+    -- Default 'defaultQueryTimeoutMicros' (10s, specs/kad-dht QueryTimeout).
+  , dhtBootstrapWorker :: !(TVar (Maybe (Async ())))
+    -- ^ Periodic bootstrap loop; cancelled by 'stopDHTNode'.
   }
+
+-- | Default query/bootstrap timeout: 10 seconds (specs/kad-dht).
+defaultQueryTimeoutMicros :: Int
+defaultQueryTimeoutMicros = 10000000
 
 -- | Create an empty or pre-loaded peer session (tests inject the latter).
 newPeerSession :: Maybe StreamIO -> IO PeerSession
@@ -161,18 +172,21 @@ newDHTNode sw mode = do
   providers <- newTVarIO Map.empty
   streams <- newTVarIO Map.empty
   hook <- newIORef Nothing
+  worker <- newTVarIO Nothing
   let node = DHTNode
-        { dhtSwitch         = sw
-        , dhtRoutingTable   = rt
-        , dhtRecordStore    = records
-        , dhtProviderStore  = providers
-        , dhtLocalKey       = peerIdToKey localPid
-        , dhtLocalPeerId    = localPid
-        , dhtMode           = mode
-        , dhtValidator      = defaultValidator
-        , dhtStreams        = streams
-        , dhtSendRequest    = sendRequestViaSwitch sw streams
-        , dhtDisconnectHook = hook
+        { dhtSwitch           = sw
+        , dhtRoutingTable     = rt
+        , dhtRecordStore      = records
+        , dhtProviderStore    = providers
+        , dhtLocalKey         = peerIdToKey localPid
+        , dhtLocalPeerId      = localPid
+        , dhtMode             = mode
+        , dhtValidator        = defaultValidator
+        , dhtStreams          = streams
+        , dhtSendRequest      = sendRequestViaSwitch sw streams
+        , dhtDisconnectHook   = hook
+        , dhtQueryTimeout     = defaultQueryTimeoutMicros
+        , dhtBootstrapWorker  = worker
         }
   writeIORef hook (Just (dropCachedSession sw streams))
   atomically $ modifyTVar' (swDisconnectNotifiers sw) (runDisconnectHook hook :)
@@ -183,6 +197,11 @@ newDHTNode sw mode = do
 stopDHTNode :: DHTNode -> IO ()
 stopDHTNode node = do
   writeIORef (dhtDisconnectHook node) Nothing
+  mWorker <- atomically $ do
+    w <- readTVar (dhtBootstrapWorker node)
+    writeTVar (dhtBootstrapWorker node) Nothing
+    pure w
+  mapM_ cancel mWorker
   sessions <- atomically $ do
     m <- readTVar (dhtStreams node)
     writeTVar (dhtStreams node) Map.empty

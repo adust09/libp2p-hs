@@ -13,6 +13,7 @@ module LibP2P.DHT.RoutingTable
   , closestPeers
   , bucketForPeer
   , bucketSize
+  , occupiedBuckets
   , allPeers
   ) where
 
@@ -128,6 +129,10 @@ bucketSize idx rt =
   case IntMap.lookup idx (rtBuckets rt) of
     Nothing -> 0
     Just bucket -> Seq.length (bucketEntries bucket)
+
+-- | Indices of non-empty k-buckets.
+occupiedBuckets :: RoutingTable -> [Int]
+occupiedBuckets = IntMap.keys . rtBuckets
 
 -- | Get all peers across all buckets.
 allPeers :: RoutingTable -> [BucketEntry]

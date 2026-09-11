@@ -41,8 +41,9 @@ mkAPITestNode pid sentLog = do
   rt    <- newTVarIO (newRoutingTable pid)
   recs  <- newTVarIO Map.empty
   provs <- newTVarIO Map.empty
-  ks    <- newTVarIO Map.empty
-  hook  <- newIORef Nothing
+  ks     <- newTVarIO Map.empty
+  hook   <- newIORef Nothing
+  worker <- newTVarIO Nothing
   let sendFunc target msg = do
         atomically $ modifyTVar' sentLog ((target, msg) :)
         -- Simulate successful FIND_NODE response returning ourselves
@@ -85,7 +86,9 @@ mkAPITestNode pid sentLog = do
         , dhtValidator     = defaultPermissiveValidator
         , dhtStreams        = ks
         , dhtSendRequest    = sendFunc
-        , dhtDisconnectHook = hook
+        , dhtDisconnectHook  = hook
+        , dhtQueryTimeout    = defaultQueryTimeoutMicros
+        , dhtBootstrapWorker = worker
         }
   pure node
 
