@@ -25,6 +25,7 @@ import LibP2P.NAT
   , NATConfig (..)
   , defaultDCUtRUpgradeConfig
   , defaultNATConfig
+  , dcutrOwnAddrs
   , holePunchTargets
   , registerNATHandlers
   , upgradeRelayedConnection
@@ -168,6 +169,33 @@ spec = do
         after' <- atomically $ lookupConn (swConnPool swA) pidB
         fmap (isRelayedAddr . connRemoteAddr) after' `shouldBe` Just False
 
+  describe "DCUtR CONNECT addresses" $ do
+    it "should include the relevant relay's Identify observed address" $
+      withCircuitTrio fastConfig $ \c -> do
+        (unrelatedId, _unrelatedKey) <- mkTestIdentity
+        let observed = Multiaddr [IP4 0xCB007101, TCP 4001]
+            stale = Multiaddr [IP4 0xCB007102, TCP 4002]
+        seedObservedAddr (cTargetSw c) (cRelayId c) observed
+        seedObservedAddr (cTargetSw c) unrelatedId stale
+        addrs <- dcutrOwnAddrs (cTargetSw c) (Just (cRelayId c))
+        addrs `shouldContain` [observed]
+        addrs `shouldNotContain` [stale]
+
+    it "should retain private listen addresses alongside an observation" $
+      withCircuitTrio fastConfig $ \c -> do
+        let observed = Multiaddr [IP4 0xCB007101, TCP 4001]
+        seedObservedAddr (cTargetSw c) (cRelayId c) observed
+        listen <- switchListenAddrsOf (cTargetSw c)
+        addrs <- dcutrOwnAddrs (cTargetSw c) (Just (cRelayId c))
+        addrs `shouldContain` listen
+
+    it "should fall back to listen addresses when no observed address is known" $ do
+      (sw, _pid) <- newNode fastConfig
+      bound <- switchListen sw defaultConnectionGater [loopbackAddr]
+      addrs <- dcutrOwnAddrs sw Nothing
+      addrs `shouldBe` bound
+      switchClose sw
+
   describe "hole punch target selection" $ do
     it "keeps only public, non-relayed advertised addresses" $
       withCircuitTrio fastConfig $ \c -> do
@@ -308,6 +336,21 @@ seedListenAddrs sw pid addrs = atomically $
       , idPublicKey        = Nothing
       , idListenAddrs      = map toBytes addrs
       , idObservedAddr     = Nothing
+      , idProtocols        = []
+      , idSignedPeerRecord = Nothing
+      }
+
+-- | Record how a peer has observed us (Identify observedAddr).
+seedObservedAddr :: Switch -> PeerId -> Multiaddr -> IO ()
+seedObservedAddr sw pid addr = atomically $
+  modifyTVar' (swPeerStore sw) (Map.insert pid info)
+  where
+    info = IdentifyInfo
+      { idProtocolVersion  = Nothing
+      , idAgentVersion     = Nothing
+      , idPublicKey        = Nothing
+      , idListenAddrs      = []
+      , idObservedAddr     = Just (toBytes addr)
       , idProtocols        = []
       , idSignedPeerRecord = Nothing
       }

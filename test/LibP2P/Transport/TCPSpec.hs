@@ -3,7 +3,7 @@ module LibP2P.Transport.TCPSpec (spec) where
 import Control.Concurrent.Async (concurrently)
 import Control.Exception (SomeException, try)
 import qualified Data.ByteString as BS
-import Data.Word (Word8)
+import Data.Word (Word8, Word16)
 import LibP2P.Multiaddr (Multiaddr (..), encapsulate, fromText)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
@@ -103,6 +103,37 @@ spec = do
       rcClose serverConn
       listenerClose listener
 
+  describe "Hole-punch dial" $ do
+    it "should bind the local socket to the listen port when dialing from it" $ do
+      transport <- newTCPTransport
+      let Right loopback = fromText "/ip4/127.0.0.1/tcp/0"
+      listener <- transportListen transport loopback
+      dest <- transportListen transport loopback
+      (serverConn, clientConn) <-
+        concurrently
+          (listenerAccept dest)
+          (transportDialFrom transport (Just (listenerAddr listener)) (listenerAddr dest))
+      tcpPortOf (rcLocalAddr clientConn) `shouldBe` tcpPortOf (listenerAddr listener)
+      rcClose clientConn
+      rcClose serverConn
+      listenerClose dest
+      listenerClose listener
+
+    it "should use an ephemeral local port for an ordinary dial" $ do
+      transport <- newTCPTransport
+      let Right loopback = fromText "/ip4/127.0.0.1/tcp/0"
+      listener <- transportListen transport loopback
+      dest <- transportListen transport loopback
+      (serverConn, clientConn) <-
+        concurrently
+          (listenerAccept dest)
+          (transportDial transport (listenerAddr dest))
+      tcpPortOf (rcLocalAddr clientConn) `shouldNotBe` tcpPortOf (listenerAddr listener)
+      rcClose clientConn
+      rcClose serverConn
+      listenerClose dest
+      listenerClose listener
+
   describe "Dial failure" $ do
     it "dial to refused port returns error" $ do
       -- Use a high port on loopback that's very unlikely to be listening.
@@ -119,4 +150,10 @@ spec = do
 -- | An Ed25519-shaped identity multihash usable as a /p2p component.
 testPeerIdMH :: BS.ByteString
 testPeerIdMH = BS.pack $ [0x00, 0x24, 0x08, 0x01, 0x12, 0x20] <> replicate 32 0xAB
+
+-- | The TCP port of a multiaddr, if it has one.
+tcpPortOf :: Multiaddr -> Maybe Word16
+tcpPortOf (Multiaddr ps) = case [p | TCP p <- ps] of
+  (p : _) -> Just p
+  [] -> Nothing
 

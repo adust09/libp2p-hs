@@ -97,7 +97,15 @@ mkDummyConnection pid openAction = do
 -- | Mock transport whose dialed connection records rcClose calls in an IORef.
 mkClosableMockTransport :: KeyPair -> IORef Bool -> IO Transport
 mkClosableMockTransport responderKP closedRef = pure Transport
-  { transportDial = \addr -> do
+  { transportDial = dialFn
+  , transportDialFrom = \_ -> dialFn
+  , transportListen = \_ -> error "mock: listen not supported"
+  , transportCanDial = \(Multiaddr ps) -> case ps of
+      (IP4 _ : TCP _ : _) -> True
+      _ -> False
+  }
+  where
+    dialFn addr = do
       (streamA, streamB) <- mkMemoryStreamPair
       let rawConnB = RawConnection
             { rcStreamIO   = streamB
@@ -114,11 +122,6 @@ mkClosableMockTransport responderKP closedRef = pure Transport
         , rcRemoteAddr = addr
         , rcClose      = writeIORef closedRef True
         }
-  , transportListen = \_ -> error "mock: listen not supported"
-  , transportCanDial = \(Multiaddr ps) -> case ps of
-      (IP4 _ : TCP _ : _) -> True
-      _ -> False
-  }
 
 -- | Build a TCP node with Switch.
 mkTCPNode :: IO (Switch, PeerId)
@@ -281,6 +284,7 @@ spec = do
       -- A transport whose canDial check blows up mid-dial
       addTransport sw Transport
         { transportDial = \_ -> fail "unreachable"
+        , transportDialFrom = \_ _ -> fail "unreachable"
         , transportListen = \_ -> error "mock: listen not supported"
         , transportCanDial = \_ -> error "boom: canDial exploded"
         }

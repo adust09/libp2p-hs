@@ -28,7 +28,7 @@ module LibP2P.Switch.Dial
   ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (Async, async, cancel, waitAnyCatch)
+import Control.Concurrent.Async (Async, async, cancel, waitAnyCatch, waitCatch)
 import Control.Concurrent.STM
   ( STM
   , TMVar
@@ -42,16 +42,17 @@ import Control.Concurrent.STM
   , writeTChan
   , writeTVar
   )
-import Control.Exception (SomeException, finally, onException)
-import Control.Monad (forM, when)
+import Control.Exception (SomeException, bracketOnError, catch, finally, onException)
+import Control.Monad (forM, forM_, when)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Time.Clock (NominalDiffTime, addUTCTime, getCurrentTime)
 import LibP2P.Crypto.PeerId (PeerId)
-import LibP2P.Multiaddr (Multiaddr)
+import LibP2P.Multiaddr (Multiaddr (..), isRelayedAddr)
+import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.Switch.ConnPool (addConn, lookupConn)
 import LibP2P.Switch.Connection (closeConnection)
-import LibP2P.Switch.Listen (streamAcceptLoop)
+import LibP2P.Switch.Listen (streamAcceptLoop, switchListenAddrs)
 import LibP2P.Switch.ResourceManager (Direction (..), releaseConnection, reserveConnection)
 import LibP2P.Switch.Types
   ( BackoffEntry (..)
@@ -62,7 +63,7 @@ import LibP2P.Switch.Types
   , SwitchEvent (..)
   )
 import LibP2P.Switch.Upgrade (upgradeAs)
-import LibP2P.Transport (Transport (..))
+import LibP2P.Transport (RawConnection (..), Transport (..))
 
 -- | Initial backoff duration after first failure: 5 seconds.
 initialBackoffSeconds :: NominalDiffTime
@@ -258,7 +259,8 @@ establishAndRegister sw opts remotePeerId addrs = do
   case resCheck of
     Left resErr -> pure (Left (DialResourceLimit resErr))
     Right () -> do
-      result <- dialNewInner sw dir addrs
+      result <- dialNewInner sw opts dir addrs
+        `onException` atomically (releaseConnection (swResourceMgr sw) remotePeerId dir)
       -- Verify remote PeerId matches expected target
       let verified = case result of
             Right conn
@@ -291,9 +293,9 @@ establishAndRegister sw opts remotePeerId addrs = do
           pure verified
 
 -- | Inner dial logic: transport selection and staggered parallel dial.
-dialNewInner :: Switch -> Direction -> [Multiaddr] -> IO (Either DialError Connection)
-dialNewInner _sw _dir [] = pure (Left DialNoAddresses)
-dialNewInner sw dir addrs = do
+dialNewInner :: Switch -> DialOpts -> Direction -> [Multiaddr] -> IO (Either DialError Connection)
+dialNewInner _sw _opts _dir [] = pure (Left DialNoAddresses)
+dialNewInner sw opts dir addrs = do
   transports <- atomically $ readTVar (swTransports sw)
   -- Find a transport for each address
   let dialable = filterMap (\addr ->
@@ -302,7 +304,7 @@ dialNewInner sw dir addrs = do
           Nothing -> Nothing) addrs
   case dialable of
     []    -> pure (Left (DialNoTransport (Prelude.head addrs)))
-    pairs -> staggeredDial sw dir pairs
+    pairs -> staggeredDial sw opts dir pairs
 
 -- | Filter and map a list, keeping only Just results.
 filterMap :: (a -> Maybe b) -> [a] -> [b]
@@ -315,16 +317,36 @@ filterMap f (x:xs) = case f x of
 --
 -- Addresses are tried with 250ms delay between each attempt.
 -- The first successful connection wins; remaining attempts are cancelled.
-staggeredDial :: Switch -> Direction -> [(Multiaddr, Transport)] -> IO (Either DialError Connection)
-staggeredDial sw dir pairs = do
-  -- Spawn workers with staggered delays: 0ms, 250ms, 500ms, ...
-  workers <- forM (zip [0 :: Int ..] pairs) $ \(i, (addr, transport)) ->
-    async $ do
-      when (i > 0) $ threadDelay (i * staggerDelayUs)
-      rawConn <- transportDial transport addr
-      upgradeAs dir (swIdentityKey sw) rawConn
-  -- Wait for first success or collect all failures
-  collectResults workers []
+staggeredDial
+  :: Switch -> DialOpts -> Direction -> [(Multiaddr, Transport)]
+  -> IO (Either DialError Connection)
+staggeredDial sw opts dir pairs =
+  bracketOnError spawnWorkers cancelAndCloseWorkers (`collectResults` [])
+  where
+    -- Spawn workers with staggered delays: 0ms, 250ms, 500ms, ...
+    spawnWorkers = forM (zip [0 :: Int ..] pairs) $ \(i, (addr, transport)) ->
+      async $ do
+        when (i > 0) $ threadDelay (i * staggerDelayUs)
+        localBind <- localBindFor sw (doForceDirect opts) addr
+        rawConn <- transportDialFrom transport localBind addr
+        upgradeAs dir (swIdentityKey sw) rawConn
+          `onException` rcClose rawConn
+
+-- | Hole-punch dials bind the outgoing socket to a same-family listen
+-- address so the SYN shares the listen port. Ordinary dials leave the
+-- source port ephemeral.
+localBindFor :: Switch -> Bool -> Multiaddr -> IO (Maybe Multiaddr)
+localBindFor _ False _ = pure Nothing
+localBindFor sw True remote = do
+  addrs <- switchListenAddrs sw
+  pure $ find (sameIpFamily remote) (filter (not . isRelayedAddr) addrs)
+
+sameIpFamily :: Multiaddr -> Multiaddr -> Bool
+sameIpFamily a b = ipKind a == ipKind b && ipKind a /= Nothing
+  where
+    ipKind (Multiaddr (IP4 _ : _)) = Just (0 :: Int)
+    ipKind (Multiaddr (IP6 _ : _)) = Just 1
+    ipKind _ = Nothing
 
 -- | Wait for the first successful async result, cancelling the rest.
 -- If all fail, return DialAllFailed with all error messages.
@@ -335,7 +357,19 @@ collectResults workers errs = do
   let remaining = filter (/= completed) workers
   case result of
     Right conn -> do
-      mapM_ cancel remaining
+      cancelAndCloseWorkers remaining
       pure (Right conn)
     Left (ex :: SomeException) ->
       collectResults remaining (show ex : errs)
+
+-- | Stop losing dial workers and close any connection that crossed the
+-- upgrade finish line before cancellation reached it.
+cancelAndCloseWorkers :: [Async Connection] -> IO ()
+cancelAndCloseWorkers workers = do
+  mapM_ cancel workers
+  forM_ workers $ \worker -> do
+    outcome <- waitCatch worker
+    case outcome of
+      Right conn -> muxClose (connSession conn)
+        `catch` \(_ :: SomeException) -> pure ()
+      Left _ -> pure ()

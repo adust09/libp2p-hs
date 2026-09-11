@@ -147,6 +147,21 @@ executable libp2p-perf
     libp2p-hs
   ghc-options: -threaded -rtsopts
 
+executable libp2p-hole-punch
+  import:          warnings, lang
+  hs-source-dirs:  interop/hole-punch
+  main-is:         Main.hs
+  build-depends:
+    base        >= 4.18 && < 5,
+    bytestring  >= 0.10 && < 0.13,
+    text        >= 1.2  && < 2.2,
+    time        >= 1.9  && < 2,
+    network     >= 3.1  && < 3.3,
+    hedis       >= 0.15 && < 0.16,
+    stm         >= 2.4  && < 2.6,
+    libp2p-hs
+  ghc-options: -threaded -rtsopts
+
 executable libp2p-kad-dht-node
   import:          warnings, lang
   hs-source-dirs:  interop/kad-dht-node

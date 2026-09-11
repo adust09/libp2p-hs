@@ -8,6 +8,7 @@ module LibP2P.Transport.TCP
   , socketToStreamIO
   ) where
 
+import Control.Exception (onException)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import qualified Data.ByteString as BS
 import Data.IP (IPv6, fromHostAddress6, toHostAddress6)
@@ -22,7 +23,8 @@ import qualified Network.Socket.ByteString as NSB
 -- | Create a new TCP transport.
 newTCPTransport :: IO Transport
 newTCPTransport = pure $ Transport
-  { transportDial = tcpDial
+  { transportDial = tcpDialFrom Nothing
+  , transportDialFrom = tcpDialFrom
   , transportListen = tcpListen
   , transportCanDial = canDialTCP
   }
@@ -54,22 +56,52 @@ multiaddrToHostPort addr = case stripP2P addr of
 -- | Dial a TCP address by directly constructing a SockAddr from the Multiaddr.
 -- A trailing /p2p/<peer-id> component is stripped before connecting; the
 -- original (unstripped) multiaddr is kept as the connection's remote address.
-tcpDial :: Multiaddr -> IO RawConnection
-tcpDial addr = case stripP2P addr of
-  Multiaddr [IP4 w, TCP port] -> do
-    let hostAddr = NS.tupleToHostAddress (octet 3 w, octet 2 w, octet 1 w, octet 0 w)
-        sockAddr = NS.SockAddrInet (fromIntegral port) hostAddr
-    sock <- NS.socket NS.AF_INET NS.Stream NS.defaultProtocol
-    NS.connect sock sockAddr
-    mkRawConnection sock addr
-  Multiaddr [IP6 bs, TCP port] -> do
-    let ipv6 = bytesToIPv6 bs
-        hostAddr6 = toHostAddress6 ipv6
-        sockAddr = NS.SockAddrInet6 (fromIntegral port) 0 hostAddr6 0
-    sock <- NS.socket NS.AF_INET6 NS.Stream NS.defaultProtocol
-    NS.connect sock sockAddr
-    mkRawConnection sock addr
+--
+-- When a local bind address is supplied the outgoing socket is bound to
+-- that address (with SO_REUSEADDR/SO_REUSEPORT) so a hole-punch SYN
+-- leaves from the listen port. Ordinary dials pass 'Nothing' and get an
+-- ephemeral source port.
+tcpDialFrom :: Maybe Multiaddr -> Multiaddr -> IO RawConnection
+tcpDialFrom mLocal addr = case stripP2P addr of
+  Multiaddr [IP4 w, TCP port] ->
+    connectFrom mLocal addr NS.AF_INET (ipv4SockAddr w port)
+  Multiaddr [IP6 bs, TCP port] ->
+    connectFrom mLocal addr NS.AF_INET6 (ipv6SockAddr bs port)
   _ -> fail "tcpDial: unsupported multiaddr"
+
+-- | Create, optionally bind, and connect a TCP socket.
+connectFrom :: Maybe Multiaddr -> Multiaddr -> NS.Family -> NS.SockAddr -> IO RawConnection
+connectFrom mLocal remoteAddr family sockAddr = do
+  sock <- NS.socket family NS.Stream NS.defaultProtocol
+  (do
+      enableAddrReuse sock
+      mapM_ (bindLocal sock) mLocal
+      NS.connect sock sockAddr
+      mkRawConnection sock remoteAddr
+    ) `onException` NS.close sock
+
+-- | Bind a dial socket to a TCP listen address so the SYN uses that port.
+bindLocal :: NS.Socket -> Multiaddr -> IO ()
+bindLocal sock local = case stripP2P local of
+  Multiaddr [IP4 w, TCP port] -> NS.bind sock (ipv4SockAddr w port)
+  Multiaddr [IP6 bs, TCP port] -> NS.bind sock (ipv6SockAddr bs port)
+  _ -> fail "tcpDialFrom: local bind address is not TCP"
+
+-- | SO_REUSEADDR + SO_REUSEPORT so a listen socket and a hole-punch
+-- dial socket can share the same local port.
+enableAddrReuse :: NS.Socket -> IO ()
+enableAddrReuse sock = do
+  NS.setSocketOption sock NS.ReuseAddr 1
+  NS.setSocketOption sock NS.ReusePort 1
+
+ipv4SockAddr :: Word32 -> Word16 -> NS.SockAddr
+ipv4SockAddr w port =
+  NS.SockAddrInet (fromIntegral port)
+    (NS.tupleToHostAddress (octet 3 w, octet 2 w, octet 1 w, octet 0 w))
+
+ipv6SockAddr :: BS.ByteString -> Word16 -> NS.SockAddr
+ipv6SockAddr bs port =
+  NS.SockAddrInet6 (fromIntegral port) 0 (toHostAddress6 (bytesToIPv6 bs)) 0
 
 -- | Create a RawConnection from a connected socket.
 --
@@ -97,7 +129,7 @@ tcpListen (Multiaddr [IP4 w, TCP port]) = do
   let hostAddr = NS.tupleToHostAddress (octet 3 w, octet 2 w, octet 1 w, octet 0 w)
       sockAddr = NS.SockAddrInet (fromIntegral port) hostAddr
   sock <- NS.socket NS.AF_INET NS.Stream NS.defaultProtocol
-  NS.setSocketOption sock NS.ReuseAddr 1
+  enableAddrReuse sock
   NS.bind sock sockAddr
   NS.listen sock 256
   boundSockAddr <- NS.getSocketName sock
@@ -115,7 +147,7 @@ tcpListen (Multiaddr [IP6 bs, TCP port]) = do
       hostAddr6 = toHostAddress6 ipv6
       sockAddr = NS.SockAddrInet6 (fromIntegral port) 0 hostAddr6 0
   sock <- NS.socket NS.AF_INET6 NS.Stream NS.defaultProtocol
-  NS.setSocketOption sock NS.ReuseAddr 1
+  enableAddrReuse sock
   NS.bind sock sockAddr
   NS.listen sock 256
   boundSockAddr <- NS.getSocketName sock

@@ -21,6 +21,11 @@ import LibP2P.Switch.Dial
   , recordBackoff
   )
 import LibP2P.Switch (addTransport, newSwitch, switchClose)
+import LibP2P.Switch.ResourceManager
+  ( ResourceManager (..)
+  , ResourceScope (..)
+  , emptyUsage
+  )
 import LibP2P.Switch.Types
   ( BackoffEntry (..)
   , ConnState (..)
@@ -69,7 +74,15 @@ mkDummyConnection pid = do
 -- the in-memory stream pair.
 mkMockDialTransport :: KeyPair -> IO Transport
 mkMockDialTransport responderKP = pure Transport
-  { transportDial = \addr -> do
+  { transportDial = dialFn
+  , transportDialFrom = \_ -> dialFn
+  , transportListen = \_ -> error "mock: listen not supported"
+  , transportCanDial = \(Multiaddr ps) -> case ps of
+      (IP4 _ : TCP _ : _) -> True
+      _ -> False
+  }
+  where
+    dialFn addr = do
       (streamA, streamB) <- mkMemoryStreamPair
       let rawConnB = RawConnection
             { rcStreamIO   = streamB
@@ -86,17 +99,20 @@ mkMockDialTransport responderKP = pure Transport
         , rcRemoteAddr = addr
         , rcClose      = pure ()
         }
-  , transportListen = \_ -> error "mock: listen not supported"
-  , transportCanDial = \(Multiaddr ps) -> case ps of
-      (IP4 _ : TCP _ : _) -> True
-      _ -> False
-  }
 
 -- | Create a counting mock transport to verify dial deduplication.
 -- Records the number of transportDial calls in the IORef.
 mkCountingMockTransport :: KeyPair -> IORef Int -> IO Transport
 mkCountingMockTransport responderKP counterRef = pure Transport
-  { transportDial = \addr -> do
+  { transportDial = dialFn
+  , transportDialFrom = \_ -> dialFn
+  , transportListen = \_ -> error "mock: listen not supported"
+  , transportCanDial = \(Multiaddr ps) -> case ps of
+      (IP4 _ : TCP _ : _) -> True
+      _ -> False
+  }
+  where
+    dialFn addr = do
       atomicModifyIORef' counterRef (\n -> (n + 1, ()))
       (streamA, streamB) <- mkMemoryStreamPair
       let rawConnB = RawConnection
@@ -114,19 +130,37 @@ mkCountingMockTransport responderKP counterRef = pure Transport
         , rcRemoteAddr = addr
         , rcClose      = pure ()
         }
-  , transportListen = \_ -> error "mock: listen not supported"
-  , transportCanDial = \(Multiaddr ps) -> case ps of
-      (IP4 _ : TCP _ : _) -> True
-      _ -> False
-  }
 
 -- | Create a mock transport that always fails to dial.
 mkFailingTransport :: IO Transport
 mkFailingTransport = pure Transport
   { transportDial = \_ -> fail "connection refused"
+  , transportDialFrom = \_ _ -> fail "connection refused"
   , transportListen = \_ -> error "mock: listen not supported"
   , transportCanDial = \_ -> True
   }
+
+-- | Create a raw connection whose upgrade fails, recording transport cleanup.
+mkUnupgradableTransport :: IORef Int -> IO Transport
+mkUnupgradableTransport closeCount = pure Transport
+  { transportDial = dialFn
+  , transportDialFrom = \_ -> dialFn
+  , transportListen = \_ -> error "mock: listen not supported"
+  , transportCanDial = \_ -> True
+  }
+  where
+    close = atomicModifyIORef' closeCount (\n -> (n + 1, ()))
+    dialFn addr = pure RawConnection
+      { rcStreamIO = StreamIO
+          { streamWrite = const (pure ())
+          , streamReadByte = fail "upgrade failed"
+          , streamReadChunk = const (fail "upgrade failed")
+          , streamClose = close
+          }
+      , rcLocalAddr = Multiaddr [IP4 0x7f000001, TCP 0]
+      , rcRemoteAddr = addr
+      , rcClose = close
+      }
 
 spec :: Spec
 spec = do
@@ -290,6 +324,23 @@ spec = do
       -- Backoff should now be active
       backoffResult <- checkBackoff (swDialBackoffs sw) remotePid
       backoffResult `shouldBe` Left DialBackoff
+
+    it "should close the raw connection and release resources when upgrade fails" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      closeCount <- newIORef (0 :: Int)
+      transport <- mkUnupgradableTransport closeCount
+      addTransport sw transport
+
+      result <- dial sw remotePid [testAddr]
+
+      case result of
+        Left _ -> pure ()
+        Right _ -> expectationFailure "expected upgrade to fail"
+      readIORef closeCount `shouldReturn` 1
+      usage <- atomically $ readTVar (rsUsage (rmSystemScope (swResourceMgr sw)))
+      usage `shouldBe` emptyUsage
 
     it "returns DialPeerIdMismatch when remote identity differs from target" $ do
       (localPid, localKP) <- mkTestIdentity
