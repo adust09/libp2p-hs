@@ -44,6 +44,8 @@ heartbeatOnce router = do
   emitGossip router
   expireIWantPromises router
   decayAllScores router
+  expireRetainedScores router
+  expireBackoff router
   cleanSeenCache router
   resetGossipBudgets router
   -- Increment heartbeat counter
@@ -315,8 +317,27 @@ resetGossipBudgets router = atomically $ do
 decayAllScores :: GossipSubRouter -> IO ()
 decayAllScores router = do
   now <- gsGetTime router
-  atomically $ modifyTVar' (gsPeers router) $
-    Map.map (decayPeerCounters (gsScoreParams router) . refreshMeshTime now)
+  let params = gsScoreParams router
+  atomically $ do
+    modifyTVar' (gsPeers router) $
+      Map.map (decayPeerCounters params . refreshMeshTime now)
+    -- Counters keep decaying while the score is retained (gossipsub-v1.1.md).
+    modifyTVar' (gsRetainedScores router) $
+      Map.map (\(ps, expiry) -> (decayPeerCounters params ps, expiry))
+
+-- | Drop retained scores whose RetainScore window has elapsed.
+expireRetainedScores :: GossipSubRouter -> IO ()
+expireRetainedScores router = do
+  now <- gsGetTime router
+  atomically $ modifyTVar' (gsRetainedScores router) $
+    Map.filter (\(_, expiry) -> now < expiry)
+
+-- | Physically remove expired (peer, topic) backoff entries.
+expireBackoff :: GossipSubRouter -> IO ()
+expireBackoff router = do
+  now <- gsGetTime router
+  atomically $ modifyTVar' (gsBackoff router) $
+    Map.filter (\expiry -> now < expiry)
 
 -- Seen cache cleanup
 

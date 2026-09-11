@@ -460,6 +460,8 @@ data GossipSubRouter = GossipSubRouter
   , gsSeen        :: !(TVar (Map MessageId UTCTime))
     -- Backoff state
   , gsBackoff     :: !(TVar (Map (PeerId, Topic) UTCTime))
+  , gsRetainedScores :: !(TVar (Map PeerId (PeerState, UTCTime)))
+    -- ^ Scoring snapshot + expiry for disconnected peers (pspRetainScore).
     -- Scoring (Phase 9b)
   , gsScoreParams :: !PeerScoreParams
     -- ^ Scoring parameters. A plain (immutable) field: configure it via

@@ -173,6 +173,56 @@ spec = do
         let topicPeers = Map.findWithDefault Set.empty "topic1" mesh
         Set.member pid topicPeers `shouldBe` False
 
+      it "retains a negative score across disconnect and reconnect" $ do
+        (router, _) <- mkTestRouter localPid
+        let pid = mkPeerId 1
+        addPeer router pid GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsPeers router) $
+          Map.adjust (\ps -> ps { psBehaviorPenalty = 5 }) pid
+        removePeer router pid
+        peersGone <- readTVarIO (gsPeers router)
+        Map.member pid peersGone `shouldBe` False
+        addPeer router pid GossipSubPeer False fixedTime
+        peersBack <- readTVarIO (gsPeers router)
+        fmap psBehaviorPenalty (Map.lookup pid peersBack) `shouldBe` Just 5
+
+      it "decays retained counters while the peer is disconnected" $ do
+        (router, _) <- mkTestRouter localPid
+        let pid = mkPeerId 1
+        addPeer router pid GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsPeers router) $
+          Map.adjust (\ps -> ps { psBehaviorPenalty = 10 }) pid
+        removePeer router pid
+        heartbeatOnce router
+        addPeer router pid GossipSubPeer False fixedTime
+        peersBack <- readTVarIO (gsPeers router)
+        -- default P7 decay is 0.99
+        fmap psBehaviorPenalty (Map.lookup pid peersBack) `shouldBe` Just 9.9
+
+      it "starts with fresh score state after RetainScore expires" $ do
+        (router0, _, timeRef) <- mkTestRouterWithTime localPid fixedTime
+        let router = router0 { gsScoreParams = (gsScoreParams router0) { pspRetainScore = 1 } }
+            pid = mkPeerId 1
+        addPeer router pid GossipSubPeer False fixedTime
+        atomically $ modifyTVar' (gsPeers router) $
+          Map.adjust (\ps -> ps { psBehaviorPenalty = 5 }) pid
+        removePeer router pid
+        writeIORef timeRef (addUTCTime 2 fixedTime)
+        heartbeatOnce router
+        addPeer router pid GossipSubPeer False (addUTCTime 2 fixedTime)
+        peersBack <- readTVarIO (gsPeers router)
+        fmap psBehaviorPenalty (Map.lookup pid peersBack) `shouldBe` Just 0
+
+      it "physically removes expired backoff entries during heartbeat" $ do
+        (router, _, timeRef) <- mkTestRouterWithTime localPid fixedTime
+        let pid = mkPeerId 1
+        atomically $ modifyTVar' (gsBackoff router) $
+          Map.insert (pid, "topic1") (addUTCTime 1 fixedTime)
+        writeIORef timeRef (addUTCTime 2 fixedTime)
+        heartbeatOnce router
+        backoff <- readTVarIO (gsBackoff router)
+        Map.member (pid, "topic1") backoff `shouldBe` False
+
     describe "join" $ do
       it "announces subscription to all peers" $ do
         (router, logRef) <- mkTestRouter localPid
