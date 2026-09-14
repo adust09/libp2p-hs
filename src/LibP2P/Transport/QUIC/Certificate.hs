@@ -89,9 +89,8 @@ verifyCertificate signedCertificate = do
   case verifySignedSignature signedCertificate (certPubKey certificate) of
     SignaturePass -> pure ()
     SignatureFailed _ -> Left "QUIC certificate self-signature verification failed"
+  -- The TLS spec permits this extension to be critical or non-critical.
   extension <- findIdentityExtension (certExtensions certificate)
-  require (extRawCritical extension)
-    "QUIC certificate libp2p identity extension is not critical"
   (encodedHostKey, identitySignature) <- decodeSignedKey (extRawContent extension)
   hostKey <- Protobuf.decodePublicKey encodedHostKey
   let spki = encodeASN1' DER (toASN1 (certPubKey certificate) [])
