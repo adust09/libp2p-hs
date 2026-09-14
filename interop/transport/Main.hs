@@ -10,9 +10,9 @@
 --   IS_DIALER      - "true" or "false"
 --   REDIS_ADDR     - Redis host:port (default: "redis:6379")
 --   TEST_KEY       - hex key namespacing Redis coordination keys
---   TRANSPORT      - must be "tcp"
---   SECURE_CHANNEL - must be "noise"
---   MUXER          - must be "yamux"
+--   TRANSPORT      - "tcp" or "quic-v1"
+--   SECURE_CHANNEL - "noise" for TCP; unset for QUIC
+--   MUXER          - "yamux" for TCP; unset for QUIC
 --   LISTENER_IP    - bind address (default: "0.0.0.0")
 --   DEBUG          - accepted but ignored; all logging goes to stderr
 --
@@ -52,6 +52,7 @@ import LibP2P
   , newGossipSubNode
   , newSwitch
   , newTCPTransport
+  , newQUICTransport
   , peerIdBytes
   , registerPingHandler
   , sendPing
@@ -118,8 +119,11 @@ main = do
 
       -- Create Switch
       sw <- newSwitch pid kp
-      tcp <- newTCPTransport
-      addTransport sw tcp
+      selectedTransport <- case transport of
+        "tcp" -> newTCPTransport
+        "quic-v1" -> newQUICTransport kp
+        _ -> fail "validated transport is unavailable"
+      addTransport sw selectedTransport
 
       -- Connect to Redis
       let (redisHost, redisPort) = parseHostPort redisAddr
@@ -138,16 +142,16 @@ main = do
           exitFailure
 
       case (testMode, dialer) of
-        ("gossipsub", False) -> runGossipSubListener sw pid ip redisConn addrKey
+        ("gossipsub", False) -> runGossipSubListener sw pid transport ip redisConn addrKey
         ("gossipsub", True)  -> runGossipSubDialer sw pid redisConn addrKey
-        (_, False) -> registerPingHandler sw >> runListener sw pid ip redisConn addrKey
+        (_, False) -> registerPingHandler sw >> runListener sw pid transport ip redisConn addrKey
         (_, True)  -> registerPingHandler sw >> runDialer sw pid redisConn addrKey
 
 -- | Listener mode: bind, publish address to Redis, run until Docker
 -- shuts the container down (transport contract, Listener step 5).
-runListener :: Switch -> PeerId -> String -> Redis.Connection -> BS8.ByteString -> IO ()
-runListener sw pid ip redisConn addrKey = do
-  addrText <- listenAndResolve sw pid ip
+runListener :: Switch -> PeerId -> String -> String -> Redis.Connection -> BS8.ByteString -> IO ()
+runListener sw pid transportName ip redisConn addrKey = do
+  addrText <- listenAndResolve sw pid transportName ip
 
   logInfo $ "Listening on: " ++ T.unpack addrText
 
@@ -219,8 +223,8 @@ runDialer sw _pid redisConn addrKey = do
                     exitSuccess
 
 -- | GossipSub listener: join topic, wait for message, reply, report to Redis.
-runGossipSubListener :: Switch -> PeerId -> String -> Redis.Connection -> BS8.ByteString -> IO ()
-runGossipSubListener sw pid ip redisConn addrKey = do
+runGossipSubListener :: Switch -> PeerId -> String -> String -> Redis.Connection -> BS8.ByteString -> IO ()
+runGossipSubListener sw pid transportName ip redisConn addrKey = do
   let gsParams = defaultGossipSubParams { paramHeartbeatInterval = 60.0 }
   gsNode <- newGossipSubNode sw gsParams
   startGossipSub gsNode
@@ -230,7 +234,7 @@ runGossipSubListener sw pid ip redisConn addrKey = do
   atomically $ writeTVar (gsOnMessage (gsnRouter gsNode))
     (\topic msg -> putMVar msgMVar (topic, msgData msg))
 
-  addrText <- listenAndResolve sw pid ip
+  addrText <- listenAndResolve sw pid transportName ip
   logInfo $ "GossipSub listener on: " ++ T.unpack addrText
 
   publishListenerAddr redisConn addrKey addrText
@@ -389,9 +393,10 @@ runGossipSubDialer sw _pid redisConn addrKey = do
 
 -- | Bind, resolve the non-localhost address, and return the full
 -- multiaddr (with /p2p/ suffix) as text.
-listenAndResolve :: Switch -> PeerId -> String -> IO T.Text
-listenAndResolve sw pid ip = do
-  let bindAddr = case fromText (T.pack ("/ip4/" ++ ip ++ "/tcp/0")) of
+listenAndResolve :: Switch -> PeerId -> String -> String -> IO T.Text
+listenAndResolve sw pid transportName ip = do
+  let suffix = if transportName == "quic-v1" then "/udp/0/quic-v1" else "/tcp/0"
+      bindAddr = case fromText (T.pack ("/ip4/" ++ ip ++ suffix)) of
         Right ma -> ma
         Left err -> error $ "Invalid bind address: " ++ err
 
@@ -452,14 +457,9 @@ reannounceLoop gsNode topic iterations = go iterations
       gossipJoin gsNode topic
       go (n - 1)
 
--- | Validate that we support the requested protocol combination.
--- SECURE_CHANNEL and MUXER are only set for non-standalone transports,
--- which tcp is, so both are required here.
+-- | Validate supported standalone and upgraded transport combinations.
 validateProtocols :: String -> Maybe String -> Maybe String -> Either String ()
-validateProtocols transport security muxer = do
-  case transport of
-    "tcp" -> pure ()
-    other -> Left $ "transport " ++ other ++ " not supported (only tcp)"
+validateProtocols "tcp" security muxer = do
   case security of
     Just "noise" -> pure ()
     Just other -> Left $ "secure channel " ++ other ++ " not supported (only noise)"
@@ -468,6 +468,11 @@ validateProtocols transport security muxer = do
     Just "yamux" -> pure ()
     Just other -> Left $ "muxer " ++ other ++ " not supported (only yamux)"
     Nothing -> Left "MUXER not set (required for tcp)"
+validateProtocols "quic-v1" Nothing Nothing = Right ()
+validateProtocols "quic-v1" _ _ =
+  Left "SECURE_CHANNEL and MUXER must be unset for quic-v1"
+validateProtocols other _ _ =
+  Left $ "transport " ++ other ++ " not supported (expected tcp or quic-v1)"
 
 -- | Parse "host:port" string.
 parseHostPort :: String -> (String, Int)

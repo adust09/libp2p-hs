@@ -11,6 +11,11 @@ import LibP2P.Transport.TCP (multiaddrToHostPort, newTCPTransport)
 import LibP2P.Transport
 import Test.Hspec
 
+expectByteStream :: RawConnection -> IO StreamIO
+expectByteStream raw = case rcEndpoint raw of
+  ByteStreamEndpoint stream -> pure stream
+  NativeMuxerEndpoint _ -> fail "expected TCP byte-stream endpoint"
+
 spec :: Spec
 spec = do
   describe "multiaddrToHostPort" $ do
@@ -54,8 +59,8 @@ spec = do
           (listenerAccept listener)
           (transportDial transport boundAddr)
       -- Exchange data
-      let clientIO = rcStreamIO clientConn
-          serverIO = rcStreamIO serverConn
+      clientIO <- expectByteStream clientConn
+      serverIO <- expectByteStream serverConn
       streamWrite clientIO "hello"
       received <- BS.pack <$> mapM (const (streamReadByte serverIO)) [1 :: Int .. 5]
       received `shouldBe` "hello"
@@ -77,8 +82,10 @@ spec = do
           (listenerAccept listener)
           (transportDial transport dialAddr)
       -- The connection works and the remote addr keeps the /p2p suffix
-      streamWrite (rcStreamIO clientConn) "x"
-      b <- streamReadByte (rcStreamIO serverConn)
+      clientIO <- expectByteStream clientConn
+      serverIO <- expectByteStream serverConn
+      streamWrite clientIO "x"
+      b <- streamReadByte serverIO
       BS.singleton b `shouldBe` "x"
       rcRemoteAddr clientConn `shouldBe` dialAddr
       rcClose clientConn
@@ -95,8 +102,9 @@ spec = do
         concurrently
           (listenerAccept listener)
           (transportDial transport boundAddr)
+      serverIO <- expectByteStream serverConn
       rcClose clientConn
-      result <- try (streamReadByte (rcStreamIO serverConn)) :: IO (Either SomeException Word8)
+      result <- try (streamReadByte serverIO) :: IO (Either SomeException Word8)
       case result of
         Left _ -> pure () -- expected: connection closed
         Right _ -> expectationFailure "Expected read to fail after close"

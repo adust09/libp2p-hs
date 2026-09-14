@@ -1,6 +1,6 @@
 ---
 title: Transport-Interop Results
-last_updated: 2026-08-06
+last_updated: 2026-09-14
 tags:
   - interop
   - transport
@@ -14,7 +14,32 @@ This document records reproducible evidence that the `libp2p-interop` binary
 (`interop/Main.hs`) passes the upstream
 [libp2p/test-plans](https://github.com/libp2p/test-plans/tree/master/transport-interop)
 **ping** contract against go-libp2p, in both dialer and listener roles, over
-**TCP + Noise + Yamux**.
+**TCP + Noise + Yamux** and native **QUIC v1**.
+
+## QUIC v1 interoperability (2026-09-14)
+
+The QUIC transport passed the same ping contract in both directions against
+`go-libp2p v0.48.0`. QUIC performs TLS 1.3 peer authentication and stream
+multiplexing natively, so `SECURE_CHANNEL` and `MUXER` are unset.
+
+```bash
+# go-libp2p listener, libp2p-hs dialer
+docker compose -f docker-compose.cross.yml \
+  -f docker-compose.quic-cross.yml up --build \
+  --exit-code-from hs-dialer redis go-listener hs-dialer
+
+# libp2p-hs listener, go-libp2p dialer
+docker compose -f docker-compose.cross.yml \
+  -f docker-compose.quic-cross.yml up --build \
+  --exit-code-from go-dialer redis hs-listener go-dialer
+```
+
+Both dialer containers completed one libp2p Ping and exited 0. The QUIC source
+dependency is pinned in `cabal.project`; that revision includes client
+certificate requests and correct `RESET_STREAM` final-size handling needed for
+go-libp2p interoperability. CI runs these two commands after the TCP matrix.
+
+## Historical TCP results
 
 > **Update (2026-08-06, issue #129):** `interop/Main.hs` has since been migrated
 > to the [libp2p/unified-testing](https://github.com/libp2p/unified-testing)
@@ -23,7 +48,7 @@ This document records reproducible evidence that the `libp2p-interop` binary
 > a historical record of the original test-plans runs; the go-libp2p cross
 > tests now go through the key-translation shims in `docker-compose.cross.yml`.
 
-## Environment
+### Environment
 
 | Item | Value |
 |------|-------|
@@ -34,7 +59,7 @@ This document records reproducible evidence that the `libp2p-interop` binary
 | Docker | 29.3.0, Compose v5.1.0 |
 | Date | 2026-05-27 |
 
-## Conformance fixes applied (verified against the upstream README)
+### Conformance fixes applied (verified against the upstream README)
 
 - **Listener timeout exit code.** Per the README ("Listener", step 5), a listener that
   reaches `test_timeout_seconds` must exit with a non-zero code. `runListener` previously
@@ -45,12 +70,12 @@ This document records reproducible evidence that the `libp2p-interop` binary
   previously sent a *second* ping to measure `pingRTT`; it now uses the single ping for
   both metrics. The upstream-mandated key spelling `pingRTTMilllis` (triple L) is preserved.
 
-## Results
+### Results
 
 Both directions exit 0 on the process whose exit code the framework keys on (the dialer),
 asserted explicitly via `docker compose up --exit-code-from <dialer-service>`.
 
-### Direction 1 — go-libp2p listener, libp2p-hs dialer
+#### Direction 1 — go-libp2p listener, libp2p-hs dialer
 
 Command:
 
@@ -69,7 +94,7 @@ docker compose -f docker-compose.cross.yml up --build \
 - **hs-dialer exited 0.** (go-listener exited 2 because `--exit-code-from` aborts the
   remaining services once the dialer finishes — expected, not a failure.)
 
-### Direction 2 — libp2p-hs listener, go-libp2p dialer
+#### Direction 2 — libp2p-hs listener, go-libp2p dialer
 
 Command:
 
@@ -88,7 +113,7 @@ docker compose -f docker-compose.cross.yml up --build \
 - **go-dialer exited 0.** (hs-listener exited 137 = SIGKILL by the runner after the dialer
   finished — the normal flow described by the README.)
 
-### Listener timeout behavior
+#### Listener timeout behavior
 
 Running the listener with a short timeout and no dialer confirms the conformance fix:
 
@@ -98,7 +123,7 @@ docker compose -f docker-compose.cross.yml run --rm \
 # -> logs "Listener timed out waiting to be dialed", exit code 1
 ```
 
-## Reproducing
+### Reproducing
 
 1. Clone go-libp2p at the pinned commit into `./go-libp2p`:
 
@@ -111,7 +136,7 @@ docker compose -f docker-compose.cross.yml run --rm \
    (note: the Makefile uses `--abort-on-container-exit`; prefer `--exit-code-from` to
    assert the dialer's exit code explicitly, as shown above).
 
-## Scope notes
+### Scope notes
 
 - This validates the upstream transport-interop **ping** contract against go-libp2p.
   Continuous proof in CI and upstream registration in `libp2p/test-plans` are tracked

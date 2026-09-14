@@ -36,7 +36,7 @@ import LibP2P.Switch.Types
   , Switch (..)
   )
 import LibP2P.Switch.Upgrade (upgradeInbound)
-import LibP2P.Transport (RawConnection (..), Transport (..))
+import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..), Transport (..))
 import Test.Hspec
 
 -- | Generate a test identity (PeerId, KeyPair).
@@ -85,7 +85,7 @@ mkMockDialTransport responderKP = pure Transport
     dialFn addr = do
       (streamA, streamB) <- mkMemoryStreamPair
       let rawConnB = RawConnection
-            { rcStreamIO   = streamB
+            { rcEndpoint   = ByteStreamEndpoint streamB
             , rcLocalAddr  = addr
             , rcRemoteAddr = Multiaddr [IP4 0x7f000001, TCP 0]
             , rcClose      = pure ()
@@ -94,7 +94,7 @@ mkMockDialTransport responderKP = pure Transport
         _ <- upgradeInbound responderKP rawConnB
         pure ()
       pure RawConnection
-        { rcStreamIO   = streamA
+        { rcEndpoint   = ByteStreamEndpoint streamA
         , rcLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
         , rcRemoteAddr = addr
         , rcClose      = pure ()
@@ -116,7 +116,7 @@ mkCountingMockTransport responderKP counterRef = pure Transport
       atomicModifyIORef' counterRef (\n -> (n + 1, ()))
       (streamA, streamB) <- mkMemoryStreamPair
       let rawConnB = RawConnection
-            { rcStreamIO   = streamB
+            { rcEndpoint   = ByteStreamEndpoint streamB
             , rcLocalAddr  = addr
             , rcRemoteAddr = Multiaddr [IP4 0x7f000001, TCP 0]
             , rcClose      = pure ()
@@ -125,7 +125,7 @@ mkCountingMockTransport responderKP counterRef = pure Transport
         _ <- upgradeInbound responderKP rawConnB
         pure ()
       pure RawConnection
-        { rcStreamIO   = streamA
+        { rcEndpoint   = ByteStreamEndpoint streamA
         , rcLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
         , rcRemoteAddr = addr
         , rcClose      = pure ()
@@ -151,7 +151,7 @@ mkUnupgradableTransport closeCount = pure Transport
   where
     close = atomicModifyIORef' closeCount (\n -> (n + 1, ()))
     dialFn addr = pure RawConnection
-      { rcStreamIO = StreamIO
+      { rcEndpoint = ByteStreamEndpoint StreamIO
           { streamWrite = const (pure ())
           , streamReadByte = fail "upgrade failed"
           , streamReadChunk = const (fail "upgrade failed")

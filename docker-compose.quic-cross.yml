@@ -1,0 +1,18 @@
+# Override docker-compose.cross.yml to exercise the standalone QUIC v1 transport.
+services:
+  hs-dialer:
+    environment:
+      TRANSPORT: quic-v1
+      SECURE_CHANNEL: null
+      MUXER: null
+  hs-listener:
+    environment:
+      TRANSPORT: quic-v1
+      SECURE_CHANNEL: null
+      MUXER: null
+  go-listener:
+    environment:
+      transport: quic-v1
+  go-dialer:
+    environment:
+      transport: quic-v1

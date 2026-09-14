@@ -60,6 +60,7 @@ module LibP2P
     -- * Transport
   , Transport (..)
   , newTCPTransport
+  , newQUICTransport
 
     -- * Connection gating
   , ConnectionGater (..)
@@ -184,4 +185,5 @@ import LibP2P.Switch.Listen (ConnectionGater (..), defaultConnectionGater, switc
 import LibP2P.Switch (addTransport, newSwitch, removeStreamHandler, setStreamHandler, switchClose)
 import LibP2P.Switch.Types (Connection (..), DialError (..), ResourceError (..), StreamHandler, Switch)
 import LibP2P.Transport.TCP (newTCPTransport)
+import LibP2P.Transport.QUIC (newQUICTransport)
 import LibP2P.Transport (Transport (..))

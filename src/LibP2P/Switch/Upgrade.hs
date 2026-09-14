@@ -74,7 +74,11 @@ import LibP2P.Switch.Types
   , Direction (..)
   , MuxerSession (..)
   )
-import LibP2P.Transport (RawConnection (..))
+import LibP2P.Transport
+  ( ConnectionEndpoint (..)
+  , NativeMuxer (..)
+  , RawConnection (..)
+  )
 import System.Timeout (timeout)
 import qualified LibP2P.Crypto.Protobuf as Proto
 import qualified LibP2P.Noise.Handshake as HS
@@ -369,9 +373,13 @@ yamuxStreamToStreamIO yamuxStream = do
 -- what lets a TCP simultaneous connect flip roles: the peer that must
 -- act as the server passes 'Inbound' even though it called connect().
 upgradeAs :: Direction -> KeyPair -> RawConnection -> IO Connection
-upgradeAs dir identityKP rawConn = do
-  let rawIO = rcStreamIO rawConn
-      isServer = dir == Inbound
+upgradeAs dir identityKP rawConn = case rcEndpoint rawConn of
+  ByteStreamEndpoint rawIO -> upgradeByteStream dir identityKP rawConn rawIO
+  NativeMuxerEndpoint native -> nativeToConnection dir rawConn native
+
+upgradeByteStream :: Direction -> KeyPair -> RawConnection -> StreamIO -> IO Connection
+upgradeByteStream dir identityKP rawConn rawIO = do
+  let isServer = dir == Inbound
       negotiate = if isServer then negotiateResponder else negotiateInitiator
       role = if isServer then "upgradeInbound" else "upgradeOutbound"
 
@@ -413,6 +421,25 @@ upgradeAs dir identityKP rawConn = do
     , connMuxer      = "/yamux/1.0.0"
     , connSession    = muxer
     , connState      = stateVar
+    }
+
+nativeToConnection :: Direction -> RawConnection -> NativeMuxer -> IO Connection
+nativeToConnection dir rawConn native = do
+  stateVar <- newTVarIO ConnOpen
+  let muxer = MuxerSession
+        { muxOpenStream = nativeOpenStream native
+        , muxAcceptStream = nativeAcceptStream native
+        , muxClose = nativeClose native
+        }
+  pure Connection
+    { connPeerId = nativePeerId native
+    , connDirection = dir
+    , connLocalAddr = rcLocalAddr rawConn
+    , connRemoteAddr = rcRemoteAddr rawConn
+    , connSecurity = nativeSecurity native
+    , connMuxer = nativeMuxerProtocol native
+    , connSession = muxer
+    , connState = stateVar
     }
 
 -- | Upgrade an outbound (dialer) raw connection.

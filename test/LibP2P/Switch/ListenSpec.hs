@@ -30,7 +30,7 @@ import LibP2P.Switch.Types
   , Switch (..)
   )
 import LibP2P.Switch.Upgrade (upgradeInbound, upgradeOutbound)
-import LibP2P.Transport (RawConnection (..))
+import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..))
 import System.Timeout (timeout)
 import Test.Hspec
 
@@ -50,7 +50,7 @@ remoteAddr = Multiaddr [IP4 0x7f000001, TCP 54321]
 -- | Create a mock RawConnection from a StreamIO.
 mkMockRawConn :: StreamIO -> Multiaddr -> Multiaddr -> RawConnection
 mkMockRawConn sio local remote = RawConnection
-  { rcStreamIO   = sio
+  { rcEndpoint   = ByteStreamEndpoint sio
   , rcLocalAddr  = local
   , rcRemoteAddr = remote
   , rcClose      = pure ()
@@ -90,7 +90,7 @@ spec = do
       closeRef <- newIORef False
       (_streamA, streamB) <- mkMemoryStreamPair
       let rawConnB = RawConnection
-            { rcStreamIO   = streamB
+            { rcEndpoint   = ByteStreamEndpoint streamB
             , rcLocalAddr  = remoteAddr
             , rcRemoteAddr = localAddr
             , rcClose      = writeIORef closeRef True

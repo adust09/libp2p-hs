@@ -13,7 +13,7 @@ import LibP2P.Noise.Framing (maxNoisePlaintextSize)
 import LibP2P.Noise.Handshake (HandshakeResult (..))
 import LibP2P.Switch.Types (Connection (..), Direction (..), MuxerSession (..))
 import LibP2P.Switch.Upgrade
-import LibP2P.Transport (RawConnection (..))
+import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..))
 import Test.Hspec
 
 -- | Generate a test identity (PeerId, KeyPair).
@@ -26,7 +26,7 @@ mkTestIdentity = do
 -- | Create a mock RawConnection from a StreamIO and addresses.
 mkMockRawConn :: StreamIO -> Multiaddr -> Multiaddr -> IO RawConnection
 mkMockRawConn sio local remote = pure RawConnection
-  { rcStreamIO   = sio
+  { rcEndpoint   = ByteStreamEndpoint sio
   , rcLocalAddr  = local
   , rcRemoteAddr = remote
   , rcClose      = pure ()

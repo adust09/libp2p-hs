@@ -16,7 +16,12 @@ import Data.Word (Word16, Word32, Word8)
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import LibP2P.Transport (Listener (..), RawConnection (..), Transport (..))
+import LibP2P.Transport
+  ( ConnectionEndpoint (..)
+  , Listener (..)
+  , RawConnection (..)
+  , Transport (..)
+  )
 import qualified Network.Socket as NS
 import qualified Network.Socket.ByteString as NSB
 
@@ -117,7 +122,7 @@ mkRawConnection sock remoteAddr = do
   localSockAddr <- NS.getSocketName sock
   localAddr <- sockAddrToMultiaddr localSockAddr
   pure RawConnection
-    { rcStreamIO = socketToStreamIO sock
+    { rcEndpoint = ByteStreamEndpoint (socketToStreamIO sock)
     , rcLocalAddr = localAddr
     , rcRemoteAddr = remoteAddr
     , rcClose = NS.close sock
