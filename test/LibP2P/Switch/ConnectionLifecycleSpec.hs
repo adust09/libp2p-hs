@@ -43,7 +43,7 @@ import LibP2P.Switch.Types
   , Switch (..)
   )
 import LibP2P.Switch.Upgrade (upgradeInbound)
-import LibP2P.Transport (RawConnection (..), Transport (..))
+import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..), Transport (..))
 import LibP2P.Transport.TCP (newTCPTransport)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -113,7 +113,7 @@ mkClosableMockTransport responderKP closedRef = pure Transport
     dialFn addr = do
       (streamA, streamB) <- mkMemoryStreamPair
       let rawConnB = RawConnection
-            { rcStreamIO   = streamB
+            { rcEndpoint   = ByteStreamEndpoint streamB
             , rcLocalAddr  = addr
             , rcRemoteAddr = Multiaddr [IP4 0x7f000001, TCP 0]
             , rcClose      = pure ()
@@ -122,7 +122,7 @@ mkClosableMockTransport responderKP closedRef = pure Transport
         _ <- upgradeInbound responderKP rawConnB
         pure ()
       pure RawConnection
-        { rcStreamIO   = streamA
+        { rcEndpoint   = ByteStreamEndpoint streamA
         , rcLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
         , rcRemoteAddr = addr
         , rcClose      = writeIORef closedRef True

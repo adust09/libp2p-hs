@@ -1,5 +1,10 @@
 packages: .
 
+source-repository-package
+  type: git
+  location: https://github.com/adust09/quic.git
+  tag: 7dff140ed6c8b4ea07dcdc330b5a52ff7164f651
+
 -- Always enable test suites in solver plans (fixes cabal 3.12 Cabal-7043 error)
 tests: True
 

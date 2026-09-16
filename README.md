@@ -18,7 +18,8 @@ The project is part of the [libp2p/unified-testing](https://github.com/libp2p/un
 cross-implementation interop effort, joined at the invitation of a libp2p
 maintainer. The codebase receives code review from libp2p maintainers, and
 official integration into the unified testing suite is planned within 2027.
-Local interop evidence (hs ↔ go over tcp+noise+yamux) lives in `interop/RESULTS.md`.
+CI exercises hs ↔ go interoperability over TCP+Noise+Yamux and native QUIC v1.
+Local interop evidence lives in `interop/RESULTS.md`.
 
 ## Quickstart
 
@@ -35,13 +36,17 @@ main = do
   -- Create and configure switch
   sw <- newSwitch pid kp
   tcp <- newTCPTransport
+  quic <- newQUICTransport kp
   addTransport sw tcp
+  addTransport sw quic
   registerIdentifyHandlers sw
   registerPingHandler sw
 
   -- Start listening
   addrs <- switchListen sw defaultConnectionGater
-    [Multiaddr [IP4 0x7f000001, TCP 0]]
+    [ Multiaddr [IP4 0x7f000001, TCP 0]
+    , Multiaddr [IP4 0x7f000001, UDP 0, QuicV1]
+    ]
   putStrLn $ "Listening on: " ++ show addrs
 
   -- Dial a remote peer
@@ -68,8 +73,8 @@ cabal haddock
 
 ## Tests
 
-547 tests covering all components: unit tests, property tests, and end-to-end
-integration tests over real TCP connections.
+1262 tests cover all components, including unit tests, property tests, and
+TCP/QUIC loopback tests. CI additionally runs bidirectional go-libp2p interop.
 
 ```bash
 # Run all tests

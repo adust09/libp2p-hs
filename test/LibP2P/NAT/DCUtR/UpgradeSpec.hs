@@ -46,7 +46,7 @@ import LibP2P.Switch.Types
   , Switch (..)
   )
 import LibP2P.Switch.Upgrade (readExact, upgradeAs)
-import LibP2P.Transport (RawConnection (..))
+import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..))
 import LibP2P.Transport.TCP (newTCPTransport)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -378,7 +378,7 @@ remoteAddr = Multiaddr [IP4 0x7f000001, TCP 2222]
 -- | A mock RawConnection over a memory stream.
 mkMockRawConn :: StreamIO -> Multiaddr -> Multiaddr -> IO RawConnection
 mkMockRawConn sio local remote = pure RawConnection
-  { rcStreamIO   = sio
+  { rcEndpoint   = ByteStreamEndpoint sio
   , rcLocalAddr  = local
   , rcRemoteAddr = remote
   , rcClose      = pure ()

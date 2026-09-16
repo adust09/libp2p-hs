@@ -25,7 +25,8 @@ import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (defaultConnectionGater, switchListen)
 import LibP2P.Switch.Types (Switch)
 import LibP2P.Transport
-  ( Listener (..)
+  ( ConnectionEndpoint (..)
+  , Listener (..)
   , RawConnection (..)
   , Transport (..)
   )
@@ -93,6 +94,11 @@ withRawDial addr action = do
   tcp <- newTCPTransport
   bracket (transportDial tcp addr) rcClose action
 
+writeRaw :: RawConnection -> BS.ByteString -> IO ()
+writeRaw raw bytes = case rcEndpoint raw of
+  ByteStreamEndpoint stream -> streamWrite stream bytes
+  NativeMuxerEndpoint _ -> fail "expected TCP byte-stream endpoint"
+
 -- | The multistream-select header bytes:
 -- varint(19) "/multistream/1.0.0\n" (hand-written, not via our encoder).
 mssHeaderBytes :: BS.ByteString
@@ -105,7 +111,7 @@ spec = do
       withListeningNode $ \(_sw, pid, listenAddr) -> do
         withRawDial listenAddr $ \raw -> do
           -- 0xff bytes are a hostile varint: continuation bit forever.
-          streamWrite (rcStreamIO raw) (BS.replicate 1024 0xff)
+          writeRaw raw (BS.replicate 1024 0xff)
         expectHealthyListener pid listenAddr
 
     it "survives a peer that disconnects mid multistream-select" $ do
@@ -113,7 +119,7 @@ spec = do
         withRawDial listenAddr $ \raw ->
           -- Valid mss header, then the peer vanishes before proposing
           -- a security protocol.
-          streamWrite (rcStreamIO raw) mssHeaderBytes
+          writeRaw raw mssHeaderBytes
         expectHealthyListener pid listenAddr
 
     it "survives a peer that connects and immediately disconnects" $ do
@@ -127,7 +133,7 @@ spec = do
       bracket (transportListen tcp loopbackAddr) listenerClose $ \listener -> do
         let serveGarbage = do
               result <- try $ bracket (listenerAccept listener) rcClose $
-                \raw -> streamWrite (rcStreamIO raw) (BS.replicate 4096 0xff)
+                \raw -> writeRaw raw (BS.replicate 4096 0xff)
               case result of
                 Left (_ :: SomeException) -> pure ()
                 Right () -> pure ()

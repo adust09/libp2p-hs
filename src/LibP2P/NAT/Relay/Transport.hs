@@ -76,7 +76,12 @@ import LibP2P.Switch.Connection (newStream)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (switchWithdrawListener)
 import LibP2P.Switch.Types (Connection (..), Switch (..))
-import LibP2P.Transport (Listener (..), RawConnection (..), Transport (..))
+import LibP2P.Transport
+  ( ConnectionEndpoint (..)
+  , Listener (..)
+  , RawConnection (..)
+  , Transport (..)
+  )
 
 -- | A parsed circuit multiaddr.
 --
@@ -188,7 +193,7 @@ dialCircuit sw addr = do
   unless (hopStatus resp == Just RelayOK) $
     failClosing stream ("relay refused CONNECT: " ++ show (hopStatus resp))
   pure RawConnection
-    { rcStreamIO   = stream
+    { rcEndpoint   = ByteStreamEndpoint stream
     , rcLocalAddr  = connLocalAddr relayConn
     , rcRemoteAddr = circuitAddrOf (caRelayAddr circuit) (caRelayId circuit) (Just target)
     , rcClose      = closeQuietly stream
@@ -328,7 +333,7 @@ acceptStopStream (CircuitState var) relayConn source stream = do
   unless enqueued (closeQuietly stream)
   where
     rawConn = RawConnection
-      { rcStreamIO   = stream
+      { rcEndpoint   = ByteStreamEndpoint stream
       , rcLocalAddr  = connLocalAddr relayConn
       , rcRemoteAddr =
           circuitAddrOf (connRemoteAddr relayConn) (connPeerId relayConn) (Just source)
