@@ -284,6 +284,7 @@ test-suite libp2p-hs-test
     crypton-asn1-types >= 0.4 && < 0.5,
     crypton-x509 >= 1.8 && < 1.9,
     tls        >= 2.2 && < 2.3,
+    time-hourglass >= 0.3 && < 0.4,
     ppad-base58 >= 0.2 && < 0.3,
     hspec      >= 2.11 && < 2.12,
     QuickCheck >= 2.14 && < 2.16

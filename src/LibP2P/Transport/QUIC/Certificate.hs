@@ -2,6 +2,7 @@
 module LibP2P.Transport.QUIC.Certificate
   ( newQUICCredential
   , verifyQUICCertificate
+  , verifyQUICCertificateAt
   , libp2pExtensionOID
   ) where
 
@@ -13,7 +14,7 @@ import Data.ASN1.Encoding (decodeASN1', encodeASN1')
 import Data.ASN1.Types (ASN1 (..), ASN1ConstructionType (..), OID, toASN1)
 import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
-import Data.Hourglass (Date (..), DateTime (..), Month (..), TimeOfDay (..))
+import Data.Hourglass (Date (..), DateTime (..), Month (..), TimeOfDay (..), timeConvert)
 import Data.X509
   ( Certificate (..)
   , CertificateChain (..)
@@ -37,6 +38,7 @@ import LibP2P.Crypto.Key (KeyPair (..), sign, verify)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import qualified LibP2P.Crypto.Protobuf as Protobuf
 import Network.TLS (Credential)
+import Time.System (timeCurrent)
 
 -- | IANA private enterprise extension assigned to libp2p.
 libp2pExtensionOID :: OID
@@ -74,21 +76,32 @@ newQUICCredential identity = do
       (signedCertificate, ()) = objectToSignedExact signCertificate certificate
   pure (CertificateChain [signedCertificate], PrivKeyEd25519 tlsSecret)
 
--- | Verify a peer's one-certificate chain and recover its authenticated Peer ID.
+-- | Verify a peer's one-certificate chain against the current time and
+-- recover its authenticated Peer ID.
 verifyQUICCertificate :: CertificateChain -> IO (Either String PeerId)
-verifyQUICCertificate (CertificateChain [signedCertificate]) =
-  pure $ verifyCertificate signedCertificate
-verifyQUICCertificate _ =
-  pure $ Left "QUIC certificate chain must contain exactly one certificate"
+verifyQUICCertificate chain = do
+  now <- timeCurrent
+  pure $ verifyQUICCertificateAt (timeConvert now) chain
 
-verifyCertificate :: SignedCertificate -> Either String PeerId
-verifyCertificate signedCertificate = do
+-- | Verify a peer's one-certificate chain as of the given UTC time.
+verifyQUICCertificateAt :: DateTime -> CertificateChain -> Either String PeerId
+verifyQUICCertificateAt now (CertificateChain [signedCertificate]) =
+  verifyCertificate now signedCertificate
+verifyQUICCertificateAt _ _ =
+  Left "QUIC certificate chain must contain exactly one certificate"
+
+verifyCertificate :: DateTime -> SignedCertificate -> Either String PeerId
+verifyCertificate now signedCertificate = do
   let certificate = signedObject (getSigned signedCertificate)
   require (certIssuerDN certificate == certSubjectDN certificate)
     "QUIC certificate is not self-signed"
   case verifySignedSignature signedCertificate (certPubKey certificate) of
     SignaturePass -> pure ()
     SignatureFailed _ -> Left "QUIC certificate self-signature verification failed"
+  -- The TLS spec requires the certificate to be valid when it is received.
+  let (notBefore, notAfter) = certValidity certificate
+  require (now >= notBefore) "QUIC certificate is not yet valid"
+  require (now <= notAfter) "QUIC certificate has expired"
   -- The TLS spec permits this extension to be critical or non-critical.
   extension <- findIdentityExtension (certExtensions certificate)
   (encodedHostKey, identitySignature) <- decodeSignedKey (extRawContent extension)

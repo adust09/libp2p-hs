@@ -7,7 +7,9 @@ import LibP2P.Transport.QUIC.Certificate
   ( libp2pExtensionOID
   , newQUICCredential
   , verifyQUICCertificate
+  , verifyQUICCertificateAt
   )
+import Data.Hourglass (Date (..), DateTime (..), Month (..), TimeOfDay (..))
 import Network.TLS (Credential)
 import Data.X509
   ( Certificate (..)
@@ -47,6 +49,30 @@ spec = do
       let CertificateChain certificates = credentialChain credential
       verifyQUICCertificate (CertificateChain (certificates <> certificates))
         `shouldReturn` Left "QUIC certificate chain must contain exactly one certificate"
+
+    it "rejects a certificate that is not yet valid" $ do
+      identity <- generateIdentity
+      credential <- newQUICCredential identity
+      verifyQUICCertificateAt (midnight 1969 December 31) (credentialChain credential)
+        `shouldBe` Left "QUIC certificate is not yet valid"
+
+    it "rejects an expired certificate" $ do
+      identity <- generateIdentity
+      credential <- newQUICCredential identity
+      verifyQUICCertificateAt (midnight 4097 January 1) (credentialChain credential)
+        `shouldBe` Left "QUIC certificate has expired"
+
+    it "accepts a certificate at the edges of its validity window" $ do
+      identity <- generateIdentity
+      let expectedPeerId = fromPublicKey (kpPublic identity)
+      credential <- newQUICCredential identity
+      verifyQUICCertificateAt (midnight 1970 January 1) (credentialChain credential)
+        `shouldBe` Right expectedPeerId
+      verifyQUICCertificateAt (midnight 4096 January 1) (credentialChain credential)
+        `shouldBe` Right expectedPeerId
+
+midnight :: Int -> Month -> Int -> DateTime
+midnight year month day = DateTime (Date year month day) (TimeOfDay 0 0 0 0)
 
 generateIdentity :: IO KeyPair
 generateIdentity = do
