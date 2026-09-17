@@ -5,6 +5,7 @@
 -- protocol handler registration, and shutdown.
 module LibP2P.Switch
   ( newSwitch
+  , subscribeSwitchEvents
   , addTransport
   , selectTransport
   , setStreamHandler
@@ -14,7 +15,7 @@ module LibP2P.Switch
   ) where
 
 import Control.Concurrent.Async (async, cancel)
-import Control.Concurrent.STM (atomically, newBroadcastTChanIO, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (TChan, atomically, dupTChan, newBroadcastTChanIO, newTVarIO, readTVar, writeTVar)
 import Control.Exception (SomeException, catch)
 import Control.Monad (void)
 import Data.List (find)
@@ -26,7 +27,7 @@ import LibP2P.MultistreamSelect.Negotiation (ProtocolId)
 import LibP2P.Protocol.Identify (pushIdentify)
 import LibP2P.Switch.Connection (closeAllConnections)
 import LibP2P.Switch.ResourceManager (DefaultLimits (..), defaultPeerLimits, defaultSystemLimits, newResourceManager)
-import LibP2P.Switch.Types (ActiveListener (..), StreamHandler, Switch (..))
+import LibP2P.Switch.Types (ActiveListener (..), StreamHandler, Switch (..), SwitchEvent)
 import LibP2P.Transport (Listener (..), Transport (..))
 
 -- | Create a new Switch with the given local identity.
@@ -66,6 +67,12 @@ newSwitch pid kp = do
     , swDisconnectNotifiers = disconnectNotifiersVar
     , swListeners    = listenersVar
     }
+
+-- | Subscribe independently to future per-connection events (no replay).
+-- Drop the channel to unsubscribe; unread channels retain queued events.
+-- Shutdown neither waits for subscribers nor signals end-of-stream.
+subscribeSwitchEvents :: Switch -> IO (TChan SwitchEvent)
+subscribeSwitchEvents sw = atomically $ dupTChan (swEvents sw)
 
 -- | Register a transport with the switch.
 -- Appends to the list of transports; order matters for selectTransport.

@@ -8,11 +8,12 @@ module LibP2P.Switch.ConnectionLifecycleSpec (spec) where
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically, newTVarIO, readTVar)
-import Control.Exception (SomeException, try)
+import Control.Concurrent.STM (TChan, atomically, newTVarIO, readTChan, readTVar, tryReadTChan)
+import Control.Exception (SomeException, bracket, try)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Map.Strict as Map
+import qualified LibP2P as Public
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair, publicKey)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
@@ -137,8 +138,81 @@ mkTCPNode = do
   addTransport sw tcp
   pure (sw, pid)
 
+-- | Fail with a label if an event test operation times out.
+withinEventTest :: String -> IO a -> IO a
+withinEventTest label action = do
+  result <- timeout 5000000 action
+  maybe (fail $ label ++ " timed out") pure result
+
+-- | Run with two TCP nodes and guaranteed cleanup.
+withEventPeers :: (Switch -> PeerId -> Multiaddr -> IO ()) -> IO ()
+withEventPeers action =
+  bracket mkTCPNode closeNode $ \(swA, _) ->
+    bracket mkTCPNode closeNode $ \(swB, pidB) -> do
+      addrs <- withinEventTest "listen" $
+        Public.switchListen swB Public.defaultConnectionGater [loopbackAddr]
+      case addrs of
+        addr : _ -> action swA pidB addr
+        [] -> expectationFailure "listen returned no addresses"
+  where
+    closeNode (sw, _) = withinEventTest "cleanup" $ Public.switchClose sw
+
+dialEventConnection :: Switch -> PeerId -> Multiaddr -> IO Connection
+dialEventConnection sw pid addr = do
+  result <- withinEventTest "dial" $ Public.dial sw pid [addr]
+  either (fail . ("dial failed: " ++) . show) pure result
+
+readSwitchEvent :: TChan Public.SwitchEvent -> IO Public.SwitchEvent
+readSwitchEvent events = withinEventTest "read event" $ atomically $ readTChan events
+
 spec :: Spec
 spec = do
+  describe "Switch event subscriptions" $ do
+    it "delivers the same Connected event to two independent subscribers" $
+      withEventPeers $ \sw pid addr -> do
+        first <- Public.subscribeSwitchEvents sw
+        second <- Public.subscribeSwitchEvents sw
+        conn <- dialEventConnection sw pid addr
+        let expected = Public.Connected pid Outbound (connRemoteAddr conn)
+        readSwitchEvent first `shouldReturn` expected
+        readSwitchEvent second `shouldReturn` expected
+
+    it "delivers Disconnected to both subscribers when a connection closes" $
+      withEventPeers $ \sw pid addr -> do
+        first <- Public.subscribeSwitchEvents sw
+        second <- Public.subscribeSwitchEvents sw
+        conn <- dialEventConnection sw pid addr
+        let connected = Public.Connected pid Outbound (connRemoteAddr conn)
+        readSwitchEvent first `shouldReturn` connected
+        readSwitchEvent second `shouldReturn` connected
+        withinEventTest "close connection" $ Public.closeConnection sw conn
+        let disconnected = Public.Disconnected pid Outbound (connRemoteAddr conn)
+        readSwitchEvent first `shouldReturn` disconnected
+        readSwitchEvent second `shouldReturn` disconnected
+
+    it "starts later subscribers at future events without draining earlier subscribers" $
+      withEventPeers $ \sw pid addr -> do
+        first <- Public.subscribeSwitchEvents sw
+        conn <- dialEventConnection sw pid addr
+        later <- Public.subscribeSwitchEvents sw
+        atomically (tryReadTChan later) `shouldReturn` Nothing
+        readSwitchEvent first `shouldReturn`
+          Public.Connected pid Outbound (connRemoteAddr conn)
+        withinEventTest "close connection" $ Public.closeConnection sw conn
+        let disconnected = Public.Disconnected pid Outbound (connRemoteAddr conn)
+        readSwitchEvent first `shouldReturn` disconnected
+        readSwitchEvent later `shouldReturn` disconnected
+
+    it "shuts down with an unread subscriber and leaves its events readable" $
+      withEventPeers $ \sw pid addr -> do
+        events <- Public.subscribeSwitchEvents sw
+        conn <- dialEventConnection sw pid addr
+        withinEventTest "shutdown" $ Public.switchClose sw
+        readSwitchEvent events `shouldReturn`
+          Public.Connected pid Outbound (connRemoteAddr conn)
+        readSwitchEvent events `shouldReturn`
+          Public.Disconnected pid Outbound (connRemoteAddr conn)
+
   describe "closeConnection" $ do
     it "removes the connection from the pool, closes the transport, and releases the reservation" $ do
       (localPid, localKP) <- mkTestIdentity
