@@ -1,0 +1,41 @@
+name: PR Labeler
+
+# Maps the Conventional Commits prefix of a PR title to a repository label so
+# that release notes (.github/release.yml) can group PRs by kind. This is the
+# only place the prefix -> label mapping lives.
+#
+# Uses pull_request_target so it can label PRs from forks. It never checks out
+# or executes PR code; it only reads the title and calls the GitHub API.
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  label:
+    # On "edited", only run when the title changed; body/base edits cannot
+    # affect the label.
+    if: github.event.action != 'edited' || github.event.changes.title != null
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply label from title prefix
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          REPO: ${{ github.repository }}
+        run: |
+          prefix=$(printf '%s' "$PR_TITLE" | sed -nE 's/^([a-z]+)(\([^)]*\))?!?:.*/\1/p')
+          # test, chore, perf and ci are intentionally unmapped: they fall
+          # into the "Other Changes" bucket of the release notes.
+          case "$prefix" in
+            feat)     label=enhancement ;;
+            fix)      label=bug ;;
+            refactor) label=refactor ;;
+            docs)     label=documentation ;;
+            *)        echo "No label for prefix '${prefix:-<none>}'"; exit 0 ;;
+          esac
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$label"

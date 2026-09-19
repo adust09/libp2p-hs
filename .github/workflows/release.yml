@@ -1,0 +1,53 @@
+name: Release
+
+# Cuts a release whenever the version in libp2p-hs.cabal lands on main
+# without a matching tag. The tag and the GitHub Release are created
+# together via `gh release create`; release notes are generated from
+# merged PRs using the categories in .github/release.yml.
+#
+# The job is idempotent: pushes whose version already has a tag are no-ops.
+# Use "Run workflow" (workflow_dispatch) to tag the current main when the
+# version was bumped without going through a libp2p-hs.cabal change on main
+# (for example, the very first tag).
+
+on:
+  push:
+    branches: [main]
+    paths: ['libp2p-hs.cabal']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: libp2p-hs.cabal
+          sparse-checkout-cone-mode: false
+
+      - name: Tag and release the version in libp2p-hs.cabal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -nE 's/^version:[[:space:]]+([0-9]+(\.[0-9]+)*)[[:space:]]*$/\1/p' libp2p-hs.cabal)
+          if [ -z "$version" ]; then
+            echo "::error::could not parse 'version:' from libp2p-hs.cabal"
+            exit 1
+          fi
+          tag="v${version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists; nothing to release."
+            exit 0
+          fi
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --generate-notes \
+            --latest
