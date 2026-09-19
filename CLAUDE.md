@@ -98,13 +98,6 @@ Reference implementations for cross-checking: [go-libp2p](https://github.com/lib
 
 ## Branch Conventions
 
-- `main` — protected, no direct commits
-- `docs/*` — documentation branches
-- `feat/*` — feature implementation branches
-- `fix/*` — bug fix branches
-
-Create branches matching the GitHub Issue tag. Use worktrees for parallel work.
-
-### Avoid Stacked PRs
-
-When working on sequential sub-phases, **merge each PR into main before creating the next branch**. Do not branch from a feature branch — this creates stacked PRs where deleting a base branch auto-closes downstream PRs. Always branch from the latest `main`.
+Branching, PR titles, review requirements, and the release process are defined in
+[CONTRIBUTING.md](CONTRIBUTING.md). Read it before opening a PR or cutting a release.
+Agent-specific addition: use git worktrees for parallel work, one branch per worktree.

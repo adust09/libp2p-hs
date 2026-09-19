@@ -1,0 +1,24 @@
+# Categories for auto-generated release notes (`gh release create --generate-notes`).
+# Labels are applied by .github/workflows/pr-labeler.yml.
+changelog:
+  exclude:
+    labels:
+      - duplicate
+      - invalid
+      - wontfix
+  categories:
+    - title: Features
+      labels:
+        - enhancement
+    - title: Bug Fixes
+      labels:
+        - bug
+    - title: Refactoring
+      labels:
+        - refactor
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Other Changes
+      labels:
+        - "*"

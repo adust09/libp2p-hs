@@ -94,6 +94,11 @@ Based on the [libp2p specification](https://github.com/libp2p/specs).
 Reference implementations: [go-libp2p](https://github.com/libp2p/go-libp2p),
 [rust-libp2p](https://github.com/libp2p/rust-libp2p).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch, review, and release
+process. Issues labeled `good first issue` are a good place to start.
+
 ## License
 
 MIT
