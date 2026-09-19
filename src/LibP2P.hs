@@ -40,6 +40,7 @@ module LibP2P
 
     -- * Switch (central coordinator)
   , Switch
+  , Direction (..)
   , newSwitch
   , subscribeSwitchEvents
   , SwitchEvent (..)
@@ -185,7 +186,7 @@ import LibP2P.Switch.Connection (closeConnection, newStream)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (ConnectionGater (..), defaultConnectionGater, switchListen, switchListenAddrs)
 import LibP2P.Switch (addTransport, newSwitch, removeStreamHandler, setStreamHandler, subscribeSwitchEvents, switchClose)
-import LibP2P.Switch.Types (Connection (..), DialError (..), ResourceError (..), StreamHandler, Switch, SwitchEvent (..))
+import LibP2P.Switch.Types (Connection (..), DialError (..), Direction (..), ResourceError (..), StreamHandler, Switch, SwitchEvent (..))
 import LibP2P.Transport.TCP (newTCPTransport)
 import LibP2P.Transport.QUIC (newQUICTransport)
 import LibP2P.Transport (Transport (..))

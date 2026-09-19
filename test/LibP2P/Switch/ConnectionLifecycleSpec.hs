@@ -173,7 +173,7 @@ spec = do
         first <- Public.subscribeSwitchEvents sw
         second <- Public.subscribeSwitchEvents sw
         conn <- dialEventConnection sw pid addr
-        let expected = Public.Connected pid Outbound (connRemoteAddr conn)
+        let expected = Public.Connected pid Public.Outbound (connRemoteAddr conn)
         readSwitchEvent first `shouldReturn` expected
         readSwitchEvent second `shouldReturn` expected
 
@@ -182,11 +182,11 @@ spec = do
         first <- Public.subscribeSwitchEvents sw
         second <- Public.subscribeSwitchEvents sw
         conn <- dialEventConnection sw pid addr
-        let connected = Public.Connected pid Outbound (connRemoteAddr conn)
+        let connected = Public.Connected pid Public.Outbound (connRemoteAddr conn)
         readSwitchEvent first `shouldReturn` connected
         readSwitchEvent second `shouldReturn` connected
         withinEventTest "close connection" $ Public.closeConnection sw conn
-        let disconnected = Public.Disconnected pid Outbound (connRemoteAddr conn)
+        let disconnected = Public.Disconnected pid Public.Outbound (connRemoteAddr conn)
         readSwitchEvent first `shouldReturn` disconnected
         readSwitchEvent second `shouldReturn` disconnected
 
@@ -197,9 +197,9 @@ spec = do
         later <- Public.subscribeSwitchEvents sw
         atomically (tryReadTChan later) `shouldReturn` Nothing
         readSwitchEvent first `shouldReturn`
-          Public.Connected pid Outbound (connRemoteAddr conn)
+          Public.Connected pid Public.Outbound (connRemoteAddr conn)
         withinEventTest "close connection" $ Public.closeConnection sw conn
-        let disconnected = Public.Disconnected pid Outbound (connRemoteAddr conn)
+        let disconnected = Public.Disconnected pid Public.Outbound (connRemoteAddr conn)
         readSwitchEvent first `shouldReturn` disconnected
         readSwitchEvent later `shouldReturn` disconnected
 
@@ -209,9 +209,9 @@ spec = do
         conn <- dialEventConnection sw pid addr
         withinEventTest "shutdown" $ Public.switchClose sw
         readSwitchEvent events `shouldReturn`
-          Public.Connected pid Outbound (connRemoteAddr conn)
+          Public.Connected pid Public.Outbound (connRemoteAddr conn)
         readSwitchEvent events `shouldReturn`
-          Public.Disconnected pid Outbound (connRemoteAddr conn)
+          Public.Disconnected pid Public.Outbound (connRemoteAddr conn)
 
   describe "closeConnection" $ do
     it "removes the connection from the pool, closes the transport, and releases the reservation" $ do
