@@ -1,14 +1,16 @@
 -- | High-level DHT API for content publishing and retrieval.
 --
 -- Provides the user-facing operations that libp2p applications use:
--- 'provide', 'putValue', and 'findProviders'. These compose the lower-level
--- iterative lookups ('iterativeFindNode', 'iterativeGetProviders') with
--- direct RPC sending to the closest peers found.
+-- 'provide', 'putValue', 'getValue', 'findProviders', and 'findPeer'.
+-- These compose the lower-level iterative lookups with direct RPC sending
+-- to the closest peers found.
 module LibP2P.DHT.API
   ( -- * Content provider operations
     provide
   , putValue
+  , getValue
   , findProviders
+  , findPeer
   ) where
 
 import Control.Concurrent.Async (mapConcurrently)
@@ -26,7 +28,7 @@ import LibP2P.DHT
   , addProvider
   , storeRecord
   )
-import LibP2P.DHT.Lookup (iterativeFindNode, iterativeGetProviders)
+import LibP2P.DHT.Lookup (iterativeFindNode, iterativeGetProviders, iterativeGetValue)
 import LibP2P.DHT.Message
 import LibP2P.DHT.Types (BucketEntry (..), ConnectionType (..), entryPeerId, kValue)
 import LibP2P.Multiaddr (Multiaddr, toBytes)
@@ -98,8 +100,20 @@ putValue node validator key value = do
       storeRecord node record
       pure (Right ())
 
+-- | Retrieve a value from the DHT.
+--
+-- Convenience wrapper around 'iterativeGetValue'.
+getValue :: DHTNode -> Validator -> ByteString -> IO (Either String DHTRecord)
+getValue node validator key = iterativeGetValue node validator key
+
 -- | Find providers for a content key.
 --
 -- Convenience wrapper around 'iterativeGetProviders'.
 findProviders :: DHTNode -> ByteString -> IO [ProviderEntry]
 findProviders node key = iterativeGetProviders node key
+
+-- | Find the closest known peers to a target peer ID.
+--
+-- Convenience wrapper around 'iterativeFindNode'.
+findPeer :: DHTNode -> PeerId -> IO [BucketEntry]
+findPeer node target = iterativeFindNode node target
