@@ -12,7 +12,13 @@ import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT
 import LibP2P.DHT.API
 import LibP2P.DHT.Distance (peerIdToKey)
-import LibP2P.DHT.Message (DHTMessage (..), DHTPeer (..), MessageType (..), emptyDHTMessage)
+import LibP2P.DHT.Message
+  ( DHTMessage (..)
+  , DHTPeer (..)
+  , DHTRecord (..)
+  , MessageType (..)
+  , emptyDHTMessage
+  )
 import LibP2P.DHT.Types (BucketEntry (..), ConnectionType (..))
 import LibP2P.DHT.RoutingTable (insertPeer, newRoutingTable)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
@@ -177,6 +183,21 @@ spec = describe "LibP2P.DHT.API" $ do
       result <- putValue node validator key val
       result `shouldSatisfy` isLeft
 
+  describe "getValue" $ do
+    it "retrieves a record stored via putValue" $ do
+      sentLog <- newTVarIO []
+      node <- mkAPITestNodeWithPeers localPid sentLog [peerA]
+      let validator = namespacedValidator (Map.fromList
+            [(BSC.pack "example", defaultPermissiveValidator)])
+          key = BSC.pack "/example/data/test-key"
+          val = BSC.pack "test-value"
+
+      putResult <- putValue node validator key val
+      putResult `shouldBe` Right ()
+
+      getResult <- getValue node validator key
+      fmap recValue getResult `shouldBe` Right val
+
   describe "findProviders" $ do
     it "returns providers found by iterative lookup" $ do
       sentLog <- newTVarIO []
@@ -190,6 +211,15 @@ spec = describe "LibP2P.DHT.API" $ do
       -- error and returns a proper type; provider discovery is tested
       -- in LookupSpec.hs.
       length providers `shouldBe` 0
+
+  describe "findPeer" $ do
+    it "returns the closest known peers for a target peer ID" $ do
+      sentLog <- newTVarIO []
+      node <- mkAPITestNodeWithPeers localPid sentLog [peerA]
+
+      peers <- findPeer node peerA
+
+      map entryPeerId peers `shouldContain` [peerA]
 
 -- | Create a mock Switch with just a local peer ID.
 mkMockSwitch :: PeerId -> IO Switch

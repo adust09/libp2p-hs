@@ -94,6 +94,30 @@ module LibP2P
   , PerfResult (..)
   , PerfError (..)
 
+    -- * Kademlia DHT
+  , DHTNode
+  , DHTMode (..)
+  , Validator (..)
+  , defaultValidator
+  , DHTRecord
+  , recValue
+  , ProviderEntry
+  , peProvider
+  , peAddrs
+  , BucketEntry
+  , entryPeerId
+  , entryAddrs
+  , newDHTNode
+  , stopDHTNode
+  , registerDHTHandler
+  , bootstrap
+  , startBootstrap
+  , provide
+  , putValue
+  , getValue
+  , findProviders
+  , findPeer
+
     -- * NAT traversal (AutoNAT, Circuit Relay v2, DCUtR)
   , NATConfig (..)
   , defaultNATConfig
@@ -127,6 +151,29 @@ module LibP2P
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes, toBase58, parsePeerId, toCIDv1)
+import LibP2P.DHT
+  ( DHTMode (..)
+  , DHTNode
+  , ProviderEntry
+  , Validator (..)
+  , defaultValidator
+  , newDHTNode
+  , peAddrs
+  , peProvider
+  , registerDHTHandler
+  , stopDHTNode
+  )
+import LibP2P.DHT.API (findPeer, findProviders, getValue, provide, putValue)
+import LibP2P.DHT.Lookup
+  ( bootstrap
+  , startBootstrap
+  )
+import LibP2P.DHT.Message (DHTRecord, recValue)
+import LibP2P.DHT.Types
+  ( BucketEntry
+  , entryAddrs
+  , entryPeerId
+  )
 import LibP2P.Multiaddr (Multiaddr (..), fromText, splitP2P, toText)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO (..))
